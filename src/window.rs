@@ -8,8 +8,8 @@ use desktop_assistant_client_common::{
 };
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, Entry, Label, Orientation,
-    Paned, Separator, Window, gdk, glib,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, Entry, Label,
+    MenuButton, Orientation, Paned, Popover, Separator, Window, gdk, glib,
 };
 use tokio::sync::mpsc;
 
@@ -68,6 +68,46 @@ impl AdelieWindow {
         let right_box = GtkBox::new(Orientation::Vertical, 0);
         right_box.set_hexpand(true);
         right_box.set_vexpand(true);
+
+        // Header bar with hamburger menu
+        let header_bar = GtkBox::new(Orientation::Horizontal, 0);
+        header_bar.set_margin_start(8);
+        header_bar.set_margin_end(8);
+        header_bar.set_margin_top(4);
+        header_bar.set_margin_bottom(4);
+
+        // Spacer to push menu button to the right
+        let spacer = GtkBox::new(Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        header_bar.append(&spacer);
+
+        // Hamburger menu button
+        let menu_button = MenuButton::new();
+        menu_button.set_icon_name("open-menu-symbolic");
+        menu_button.add_css_class("flat");
+
+        let menu_popover = Popover::new();
+        menu_popover.add_css_class("context-popover");
+        let menu_box = GtkBox::new(Orientation::Vertical, 0);
+
+        let new_conn_btn = Button::with_label("New Connection");
+        new_conn_btn.add_css_class("context-button");
+        new_conn_btn.set_halign(Align::Fill);
+        menu_box.append(&new_conn_btn);
+
+        let disconnect_btn = Button::with_label("Disconnect");
+        disconnect_btn.add_css_class("context-button");
+        disconnect_btn.set_halign(Align::Fill);
+        menu_box.append(&disconnect_btn);
+
+        menu_popover.set_child(Some(&menu_box));
+        menu_button.set_popover(Some(&menu_popover));
+        header_bar.append(&menu_button);
+
+        right_box.append(&header_bar);
+
+        let header_sep = Separator::new(Orientation::Horizontal);
+        right_box.append(&header_sep);
 
         let chat_view = ChatView::new();
         right_box.append(&chat_view.container);
@@ -426,6 +466,30 @@ impl AdelieWindow {
             input_bar.text_view.add_controller(key_controller);
         }
 
+        // Hamburger menu: New Connection → open login screen in a new window
+        {
+            let app_ref = app.clone();
+            let popover_ref = menu_popover.clone();
+            new_conn_btn.connect_clicked(move |_| {
+                popover_ref.popdown();
+                let login = crate::widgets::login_screen::LoginScreen::new(&app_ref);
+                login.present();
+            });
+        }
+
+        // Hamburger menu: Disconnect → close this window, show login screen
+        {
+            let app_ref = app.clone();
+            let window_ref = window.clone();
+            let popover_ref = menu_popover.clone();
+            disconnect_btn.connect_clicked(move |_| {
+                popover_ref.popdown();
+                let login = crate::widgets::login_screen::LoginScreen::new(&app_ref);
+                login.present();
+                window_ref.close();
+            });
+        }
+
         // Debug checkbox toggle → re-fetch conversation with filtering
         {
             let client_ref = Rc::clone(&client);
@@ -646,7 +710,7 @@ fn handle_ui_message(
 /// Writes the embedded PNG to a temporary hicolor icon theme directory and adds
 /// it to the display's icon search path. Uses the app ID as the icon name so
 /// the desktop environment can match it to the window.
-fn install_app_icon() {
+pub fn install_app_icon() {
     const ICON_BYTES: &[u8] = include_bytes!("../assets/adele.png");
     const ICON_NAME: &str = "org.adelie.DesktopAssistant";
 

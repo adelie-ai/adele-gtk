@@ -95,3 +95,17 @@ paned > separator {
 .context-button:hover {
     background-color: #3a3f5c;
 }
+
+/* Login screen & setup dialog */
+entry {
+    background-color: #232740;
+    color: #e0e0e0;
+    border: 1px solid #3a3f5c;
+    border-radius: 6px;
+    padding: 6px 10px;
+    caret-color: #84dac1;
+}
+
+entry:focus {
+    border-color: #4866b4;
+}

@@ -1,5 +1,8 @@
 mod async_bridge;
+mod credential_store;
 mod markdown;
+mod oauth;
+mod profile;
 #[cfg(feature = "linux")]
 mod webview;
 mod widgets;
@@ -110,6 +113,14 @@ impl From<CliArgs> for ConnectionConfig {
     }
 }
 
+/// Returns true if the user explicitly provided auth credentials via CLI/env,
+/// meaning we should skip the login screen and connect directly.
+fn cli_has_explicit_auth(config: &ConnectionConfig) -> bool {
+    config.ws_jwt.is_some()
+        || config.ws_login_username.is_some()
+        || config.ws_login_password.is_some()
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -121,8 +132,15 @@ fn main() -> Result<()> {
     let app = Application::builder().application_id(APP_ID).build();
 
     app.connect_activate(move |app| {
-        let win = window::AdelieWindow::new(app, config.clone());
-        win.present();
+        if cli_has_explicit_auth(&config) {
+            // Direct connection — backward compatible with CLI args / env vars
+            let win = window::AdelieWindow::new(app, config.clone());
+            win.present();
+        } else {
+            // Show login/connection selection screen
+            let login = widgets::login_screen::LoginScreen::new(app);
+            login.present();
+        }
     });
 
     // GTK expects command-line args but we've already parsed them with clap.

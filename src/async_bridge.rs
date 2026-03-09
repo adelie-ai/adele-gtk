@@ -115,6 +115,14 @@ impl AsyncBridge {
     }
 }
 
+/// Spawn an async task on the shared tokio runtime (usable without an AsyncBridge instance).
+pub fn spawn_on_runtime<F>(future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    runtime().spawn(future);
+}
+
 /// Persistent connection lifecycle: connect → forward signals → detect
 /// disconnect → reconnect with exponential backoff.
 ///
