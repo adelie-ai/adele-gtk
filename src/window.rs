@@ -228,9 +228,8 @@ impl AdelieWindow {
                                     let _ = tx.send(UiMessage::ConversationLoaded(detail));
                                 }
                                 Err(e) => {
-                                    let _ = tx.send(UiMessage::Error(format!(
-                                        "Load conversation: {e}"
-                                    )));
+                                    let _ = tx
+                                        .send(UiMessage::Error(format!("Load conversation: {e}")));
                                 }
                             }
                         });
@@ -260,8 +259,8 @@ impl AdelieWindow {
                                 }
                             }
                             Err(e) => {
-                                let _ = tx
-                                    .send(UiMessage::Error(format!("Create conversation: {e}")));
+                                let _ =
+                                    tx.send(UiMessage::Error(format!("Create conversation: {e}")));
                             }
                         }
                     });
@@ -291,8 +290,8 @@ impl AdelieWindow {
                                 let _ = tx.send(UiMessage::ConversationDeleted { id });
                             }
                             Err(e) => {
-                                let _ = tx
-                                    .send(UiMessage::Error(format!("Delete conversation: {e}")));
+                                let _ =
+                                    tx.send(UiMessage::Error(format!("Delete conversation: {e}")));
                             }
                         }
                     });
@@ -364,10 +363,7 @@ impl AdelieWindow {
                         bridge_inner.spawn(async move {
                             match client.rename_conversation(&id, &title).await {
                                 Ok(()) => {
-                                    let _ = tx.send(UiMessage::ConversationRenamed {
-                                        id,
-                                        title,
-                                    });
+                                    let _ = tx.send(UiMessage::ConversationRenamed { id, title });
                                 }
                                 Err(e) => {
                                     let _ = tx.send(UiMessage::Error(format!(
@@ -389,6 +385,72 @@ impl AdelieWindow {
                 vbox.append(&btn_box);
                 dialog.set_child(Some(&vbox));
                 dialog.present();
+            });
+        }
+
+        // Context menu: Archive/unarchive conversation
+        {
+            let client_ref = Rc::clone(&client);
+            let bridge = Rc::clone(&bridge);
+            let state = Rc::clone(&state);
+            sidebar.connect_archive(move |idx| {
+                let (id, archived) = {
+                    let s = state.borrow();
+                    match s.conversations.get(idx) {
+                        Some(conv) => (conv.id.clone(), conv.archived),
+                        None => return,
+                    }
+                };
+                if let Some(client) = client_ref.borrow().clone() {
+                    let tx = bridge.ui_sender();
+                    let id = id.clone();
+                    bridge.spawn(async move {
+                        let result = if archived {
+                            client.unarchive_conversation(&id).await
+                        } else {
+                            client.archive_conversation(&id).await
+                        };
+                        match result {
+                            Ok(()) => {
+                                // Refresh conversation list
+                                if let Ok(convs) = client.list_conversations().await {
+                                    let _ = tx.send(UiMessage::ConversationsLoaded(convs));
+                                }
+                            }
+                            Err(e) => {
+                                let _ =
+                                    tx.send(UiMessage::Error(format!("Archive conversation: {e}")));
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        // Show archived checkbox toggle
+        {
+            let client_ref = Rc::clone(&client);
+            let bridge = Rc::clone(&bridge);
+            sidebar.connect_show_archived_toggled(move |include_archived| {
+                if let Some(client) = client_ref.borrow().clone() {
+                    let tx = bridge.ui_sender();
+                    bridge.spawn(async move {
+                        let result = if include_archived {
+                            client.list_conversations_with_archived().await
+                        } else {
+                            client.list_conversations().await
+                        };
+                        match result {
+                            Ok(convs) => {
+                                let _ = tx.send(UiMessage::ConversationsLoaded(convs));
+                            }
+                            Err(e) => {
+                                let _ =
+                                    tx.send(UiMessage::Error(format!("Load conversations: {e}")));
+                            }
+                        }
+                    });
+                }
             });
         }
 
