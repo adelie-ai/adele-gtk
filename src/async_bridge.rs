@@ -202,9 +202,7 @@ pub async fn connection_manager(
                             conversation_id,
                             title,
                         },
-                        SignalEvent::Disconnected { reason } => {
-                            UiMessage::Disconnected { reason }
-                        }
+                        SignalEvent::Disconnected { reason } => UiMessage::Disconnected { reason },
                     };
                     if ui_tx.send(msg).is_err() {
                         return;

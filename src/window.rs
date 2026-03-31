@@ -776,28 +776,42 @@ pub fn install_app_icon() {
     const ICON_BYTES: &[u8] = include_bytes!("../assets/adele.png");
     const ICON_NAME: &str = "org.adelie.DesktopAssistant";
 
-    let icon_dir = std::env::temp_dir()
-        .join("adelie-gtk-icons")
+    let cache_root = dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("adelie-gtk-icons");
+    let icon_dir = cache_root
         .join("hicolor")
         .join("512x512")
         .join("apps");
     let icon_path = icon_dir.join(format!("{ICON_NAME}.png"));
 
-    if !icon_path.exists() {
-        if let Err(e) = std::fs::create_dir_all(&icon_dir) {
-            tracing::warn!("Failed to create icon dir: {e}");
-            return;
+    if let Err(e) = std::fs::create_dir_all(&icon_dir) {
+        tracing::warn!("Failed to create icon dir: {e}");
+        return;
+    }
+    // Use create_new to avoid TOCTOU: the write either atomically creates the
+    // file or harmlessly fails because it already exists.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&icon_path)
+    {
+        Ok(mut file) => {
+            if let Err(e) = std::io::Write::write_all(&mut file, ICON_BYTES) {
+                tracing::warn!("Failed to write icon: {e}");
+                return;
+            }
         }
-        if let Err(e) = std::fs::write(&icon_path, ICON_BYTES) {
-            tracing::warn!("Failed to write icon: {e}");
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            tracing::warn!("Failed to create icon file: {e}");
             return;
         }
     }
 
-    let theme_root = std::env::temp_dir().join("adelie-gtk-icons");
     let display = gdk::Display::default().expect("display");
     let icon_theme = gtk4::IconTheme::for_display(&display);
-    icon_theme.add_search_path(theme_root.to_str().unwrap_or_default());
+    icon_theme.add_search_path(cache_root.to_str().unwrap_or_default());
 
     gtk4::Window::set_default_icon_name(ICON_NAME);
 }

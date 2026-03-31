@@ -1,7 +1,5 @@
 use gtk4::prelude::*;
-use gtk4::{
-    Align, Box as GtkBox, Button, Entry, Label, Orientation, Window,
-};
+use gtk4::{Align, Box as GtkBox, Button, Entry, Label, Orientation, Window};
 
 use crate::credential_store::CredentialStore;
 use crate::profile::ConnectionProfile;
@@ -142,8 +140,7 @@ pub fn show_setup_dialog<F: Fn(ConnectionProfile) + 'static>(
 
             // Store credentials in keyring
             if !username.is_empty() {
-                let _ =
-                    CredentialStore::store_password(&format!("{id}-username"), &username);
+                let _ = CredentialStore::store_password(&format!("{id}-username"), &username);
             }
             if !password.is_empty() {
                 let _ = CredentialStore::store_password(&id, &password);

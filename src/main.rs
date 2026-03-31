@@ -1,4 +1,5 @@
 mod async_bridge;
+mod avatars;
 mod credential_store;
 mod markdown;
 mod oauth;
@@ -11,8 +12,8 @@ mod window;
 use anyhow::Result;
 use clap::Parser;
 use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
-use gtk4::prelude::*;
 use gtk4::Application;
+use gtk4::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 const APP_ID: &str = "org.adelie.DesktopAssistant";
@@ -42,18 +43,6 @@ struct CliArgs {
         default_value = DEFAULT_WS_URL
     )]
     ws_url: String,
-    #[arg(long = "ws-jwt", env = "ADELIE_GTK_WS_JWT")]
-    ws_jwt: Option<String>,
-    #[arg(
-        long = "ws-login-username",
-        env = "ADELIE_GTK_WS_LOGIN_USERNAME"
-    )]
-    ws_login_username: Option<String>,
-    #[arg(
-        long = "ws-login-password",
-        env = "ADELIE_GTK_WS_LOGIN_PASSWORD"
-    )]
-    ws_login_password: Option<String>,
     #[arg(
         long = "ws-subject",
         env = "ADELIE_GTK_WS_SUBJECT",
@@ -73,21 +62,6 @@ impl From<CliArgs> for ConnectionConfig {
             }
         };
 
-        let ws_jwt = cli
-            .ws_jwt
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-
-        let ws_login_username = cli
-            .ws_login_username
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-
-        let ws_login_password = cli
-            .ws_login_password
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-
         let ws_subject = {
             let trimmed = cli.ws_subject.trim();
             if trimmed.is_empty() {
@@ -105,20 +79,12 @@ impl From<CliArgs> for ConnectionConfig {
         Self {
             transport_mode,
             ws_url,
-            ws_jwt,
-            ws_login_username,
-            ws_login_password,
+            ws_jwt: None,
+            ws_login_username: None,
+            ws_login_password: None,
             ws_subject,
         }
     }
-}
-
-/// Returns true if the user explicitly provided auth credentials via CLI/env,
-/// meaning we should skip the login screen and connect directly.
-fn cli_has_explicit_auth(config: &ConnectionConfig) -> bool {
-    config.ws_jwt.is_some()
-        || config.ws_login_username.is_some()
-        || config.ws_login_password.is_some()
 }
 
 fn main() -> Result<()> {
@@ -127,20 +93,15 @@ fn main() -> Result<()> {
         .init();
 
     let cli = CliArgs::parse();
-    let config = ConnectionConfig::from(cli);
+    let _config = ConnectionConfig::from(cli);
 
     let app = Application::builder().application_id(APP_ID).build();
 
     app.connect_activate(move |app| {
-        if cli_has_explicit_auth(&config) {
-            // Direct connection — backward compatible with CLI args / env vars
-            let win = window::AdelieWindow::new(app, config.clone());
-            win.present();
-        } else {
-            // Show login/connection selection screen
-            let login = widgets::login_screen::LoginScreen::new(app);
-            login.present();
-        }
+        // Always show the login/connection selection screen.
+        // Credentials are obtained interactively and stored in the system keyring.
+        let login = widgets::login_screen::LoginScreen::new(app);
+        login.present();
     });
 
     // GTK expects command-line args but we've already parsed them with clap.

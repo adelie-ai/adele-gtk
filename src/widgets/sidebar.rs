@@ -36,9 +36,18 @@ impl Sidebar {
         brand_box.set_margin_bottom(4);
 
         const ICON_BYTES: &[u8] = include_bytes!("../../assets/adele_communicating.png");
-        let icon_path = std::env::temp_dir().join("adelie-gtk-brand-icon.png");
-        if !icon_path.exists() {
-            let _ = std::fs::write(&icon_path, ICON_BYTES);
+        let icon_path = dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("adelie-gtk-brand-icon.png");
+        if let Err(e) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&icon_path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, ICON_BYTES))
+        {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                tracing::warn!("Failed to write brand icon: {e}");
+            }
         }
         let icon = Image::from_file(icon_path.to_str().unwrap_or_default());
         icon.set_pixel_size(44);

@@ -60,8 +60,8 @@ pub async fn discover_auth_config(ws_url: &str) -> Result<AuthDiscovery> {
 /// 5. Exchange the code for tokens
 pub async fn run_oauth_flow(oidc: &OidcDiscovery) -> Result<TokenResponse> {
     use oauth2::{
-        basic::BasicClient, AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge,
-        RedirectUrl, Scope, TokenResponse as _, TokenUrl,
+        AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl, Scope,
+        TokenResponse as _, TokenUrl, basic::BasicClient,
     };
 
     let http_client = reqwest::ClientBuilder::new()
@@ -132,7 +132,7 @@ pub async fn refresh_access_token(
     refresh_token: &str,
 ) -> Result<TokenResponse> {
     use oauth2::{
-        basic::BasicClient, AuthUrl, ClientId, RefreshToken, TokenResponse as _, TokenUrl,
+        AuthUrl, ClientId, RefreshToken, TokenResponse as _, TokenUrl, basic::BasicClient,
     };
 
     let http_client = reqwest::ClientBuilder::new()
@@ -225,10 +225,7 @@ fn ws_url_to_http_base(ws_url: &str) -> String {
             "{}://{}{}",
             parsed.scheme(),
             parsed.host_str().unwrap_or("localhost"),
-            parsed
-                .port()
-                .map(|p| format!(":{p}"))
-                .unwrap_or_default()
+            parsed.port().map(|p| format!(":{p}")).unwrap_or_default()
         )
     } else {
         http_url

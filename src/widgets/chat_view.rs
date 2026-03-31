@@ -23,6 +23,8 @@ pub struct ChatView {
     /// Messages stored for re-rendering.
     messages: Vec<(String, String)>,
     streaming_buffer: String,
+    #[cfg(feature = "linux")]
+    avatars: markdown::AvatarUrls,
 }
 
 impl ChatView {
@@ -30,6 +32,12 @@ impl ChatView {
         let container = GtkBox::new(Orientation::Vertical, 0);
         container.set_hexpand(true);
         container.set_vexpand(true);
+
+        #[cfg(feature = "linux")]
+        let avatars = markdown::AvatarUrls {
+            adele: crate::avatars::adele_avatar_data_uri(),
+            user: crate::avatars::user_avatar_data_uri(),
+        };
 
         #[cfg(feature = "linux")]
         let webview = {
@@ -68,6 +76,8 @@ impl ChatView {
             scrolled,
             messages: Vec::new(),
             streaming_buffer: String::new(),
+            #[cfg(feature = "linux")]
+            avatars,
         }
     }
 
@@ -138,7 +148,7 @@ impl ChatView {
 
         #[cfg(feature = "linux")]
         {
-            let html = markdown::render_messages_html(&self.messages, streaming);
+            let html = markdown::render_messages_html(&self.messages, streaming, &self.avatars);
             crate::webview::update_messages(&self.webview, &html);
         }
 

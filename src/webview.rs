@@ -45,33 +45,29 @@ pub fn create_chat_webview() -> WebView {
     webview
 }
 
+/// JSON-encode a string so it is safe to interpolate into JavaScript.
+/// `serde_json::to_string` produces a quoted, properly escaped JSON string
+/// literal which is also a valid JavaScript string literal — no manual
+/// escaping of backticks, backslashes, or template expressions needed.
+fn js_safe_string(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
 /// Update the webview with rendered messages HTML.
 pub fn update_messages(webview: &WebView, messages_html: &str) {
-    let escaped = messages_html
-        .replace('\\', "\\\\")
-        .replace('`', "\\`")
-        .replace("${", "\\${");
-    let js = format!("updateMessages(`{escaped}`);");
+    let js = format!("updateMessages({});", js_safe_string(messages_html));
     webview.evaluate_javascript(&js, None, None, None::<&gtk4::gio::Cancellable>, |_| {});
 }
 
 /// Append a streaming chunk to the webview.
 pub fn append_chunk(webview: &WebView, chunk: &str) {
-    let escaped = chunk
-        .replace('\\', "\\\\")
-        .replace('`', "\\`")
-        .replace("${", "\\${");
-    let js = format!("appendChunk(`{escaped}`);");
+    let js = format!("appendChunk({});", js_safe_string(chunk));
     webview.evaluate_javascript(&js, None, None, None::<&gtk4::gio::Cancellable>, |_| {});
 }
 
 /// Show a transient status message below the chat (e.g. "Searching knowledge base...").
 pub fn set_status(webview: &WebView, message: &str) {
-    let escaped = message
-        .replace('\\', "\\\\")
-        .replace('`', "\\`")
-        .replace("${", "\\${");
-    let js = format!("setStatus(`{escaped}`);");
+    let js = format!("setStatus({});", js_safe_string(message));
     webview.evaluate_javascript(&js, None, None, None::<&gtk4::gio::Cancellable>, |_| {});
 }
 

@@ -51,9 +51,18 @@ impl LoginScreen {
         brand_box.set_margin_bottom(16);
 
         const ICON_BYTES: &[u8] = include_bytes!("../../assets/adele_communicating.png");
-        let icon_path = std::env::temp_dir().join("adelie-gtk-brand-icon.png");
-        if !icon_path.exists() {
-            let _ = std::fs::write(&icon_path, ICON_BYTES);
+        let icon_path = dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("adelie-gtk-brand-icon.png");
+        if let Err(e) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&icon_path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, ICON_BYTES))
+        {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                tracing::warn!("Failed to write brand icon: {e}");
+            }
         }
         let icon = Image::from_file(icon_path.to_str().unwrap_or_default());
         icon.set_pixel_size(56);
@@ -249,16 +258,12 @@ impl LoginScreen {
             add_btn.connect_clicked(move |_| {
                 let profiles = Rc::clone(&profiles);
                 let populate = Rc::clone(&populate);
-                super::setup_dialog::show_setup_dialog(
-                    &window_ref,
-                    None,
-                    move |profile| {
-                        let store = ProfileStore::new();
-                        let _ = store.add(profile);
-                        *profiles.borrow_mut() = store.load().unwrap_or_default();
-                        (populate)();
-                    },
-                );
+                super::setup_dialog::show_setup_dialog(&window_ref, None, move |profile| {
+                    let store = ProfileStore::new();
+                    let _ = store.add(profile);
+                    *profiles.borrow_mut() = store.load().unwrap_or_default();
+                    (populate)();
+                });
             });
         }
 
@@ -354,8 +359,7 @@ async fn connect_to_profile(
                     Ok(tokens) => {
                         // Store new refresh token if provided
                         if let Some(ref new_refresh) = tokens.refresh_token {
-                            let _ =
-                                CredentialStore::store_refresh_token(&profile.id, new_refresh);
+                            let _ = CredentialStore::store_refresh_token(&profile.id, new_refresh);
                         }
                         return Ok(ConnectionConfig {
                             transport_mode: TransportMode::Ws,

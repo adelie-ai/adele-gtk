@@ -14,6 +14,7 @@ linux = ["dep:webkit6", "desktop-assistant-client-common/dbus"]
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 dirs = "6"
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 oauth2 = "5"
