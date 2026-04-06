@@ -11,6 +11,7 @@ use crate::async_bridge;
 use crate::credential_store::CredentialStore;
 use crate::oauth;
 use crate::profile::{ConnectionProfile, ProfileStore};
+use crate::widgets::setup_dialog;
 use crate::window;
 
 /// Login/connection selection screen shown at startup.
@@ -119,14 +120,20 @@ impl LoginScreen {
         let connect_btn = Rc::new(connect_btn);
         let window_ref = window.clone();
 
-        // Populate list
-        let populate = {
+        // Use a shared flag so `populate` can schedule itself after a popover closes.
+        // The Rc<dyn Fn()> is built in two steps because the closure references itself.
+        let populate: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+
+        {
             let profiles = Rc::clone(&profiles);
             let list_box = Rc::clone(&list_box);
             let empty_label = Rc::clone(&empty_label);
             let connect_btn = Rc::clone(&connect_btn);
             let status_label = Rc::clone(&status_label);
-            move || {
+            let window_ref = window_ref.clone();
+            let populate_self = Rc::clone(&populate);
+
+            let f: Rc<dyn Fn()> = Rc::new(move || {
                 // Clear existing rows
                 while let Some(child) = list_box.first_child() {
                     list_box.remove(&child);
@@ -162,6 +169,8 @@ impl LoginScreen {
                     gesture.set_button(3);
                     let profiles_ref = Rc::clone(&profiles);
                     let status_ref = Rc::clone(&status_label);
+                    let window_inner = window_ref.clone();
+                    let populate_inner = Rc::clone(&populate_self);
                     gesture.connect_pressed(move |gesture, _n, x, y| {
                         let Some(widget) = gesture.widget() else {
                             return;
@@ -182,15 +191,30 @@ impl LoginScreen {
                         edit_btn.add_css_class("context-button");
                         let profiles_inner = Rc::clone(&profiles_ref);
                         let popover_ref = popover.clone();
-                        let status_inner = Rc::clone(&status_ref);
+                        let window_edit = window_inner.clone();
+                        let populate_edit = Rc::clone(&populate_inner);
                         edit_btn.connect_clicked(move |_| {
                             popover_ref.popdown();
-                            let profs = profiles_inner.borrow();
-                            if let Some(profile) = profs.get(idx) {
-                                status_inner.set_text(&format!(
-                                    "Edit '{}' — use Add Connection to re-create",
-                                    profile.name
-                                ));
+                            let profile = {
+                                let profs = profiles_inner.borrow();
+                                profs.get(idx).cloned()
+                            };
+                            if let Some(profile) = profile {
+                                let profiles_save = Rc::clone(&profiles_inner);
+                                let populate_save = Rc::clone(&populate_edit);
+                                setup_dialog::show_setup_dialog(
+                                    &window_edit,
+                                    Some(&profile),
+                                    move |updated| {
+                                        let store = ProfileStore::new();
+                                        let _ = store.update(&updated);
+                                        *profiles_save.borrow_mut() =
+                                            store.load().unwrap_or_default();
+                                        if let Some(ref f) = *populate_save.borrow() {
+                                            f();
+                                        }
+                                    },
+                                );
                             }
                         });
                         menu_box.append(&edit_btn);
@@ -202,6 +226,7 @@ impl LoginScreen {
                         let profiles_inner = Rc::clone(&profiles_ref);
                         let popover_ref = popover.clone();
                         let status_inner = Rc::clone(&status_ref);
+                        let populate_del = Rc::clone(&populate_inner);
                         delete_btn.connect_clicked(move |_| {
                             popover_ref.popdown();
                             let profile_id = {
@@ -215,6 +240,9 @@ impl LoginScreen {
                                 let new_profiles = store.load().unwrap_or_default();
                                 *profiles_inner.borrow_mut() = new_profiles;
                                 status_inner.set_text("Connection deleted");
+                                if let Some(ref f) = *populate_del.borrow() {
+                                    f();
+                                }
                             }
                         });
                         menu_box.append(&delete_btn);
@@ -233,14 +261,17 @@ impl LoginScreen {
                         list_box.select_row(Some(&first_row));
                     }
                 }
-            }
-        };
+            });
 
-        // Wrap populate in Rc so we can call it from multiple closures
-        let populate = Rc::new(populate);
+            *populate.borrow_mut() = Some(Rc::clone(&f));
+        }
+
+        let populate = Rc::clone(&populate);
 
         // Initial population
-        (populate)();
+        if let Some(ref f) = *populate.borrow() {
+            f();
+        }
 
         // Enable connect button when a row is selected
         {
@@ -258,11 +289,13 @@ impl LoginScreen {
             add_btn.connect_clicked(move |_| {
                 let profiles = Rc::clone(&profiles);
                 let populate = Rc::clone(&populate);
-                super::setup_dialog::show_setup_dialog(&window_ref, None, move |profile| {
+                setup_dialog::show_setup_dialog(&window_ref, None, move |profile| {
                     let store = ProfileStore::new();
                     let _ = store.add(profile);
                     *profiles.borrow_mut() = store.load().unwrap_or_default();
-                    (populate)();
+                    if let Some(ref f) = *populate.borrow() {
+                        f();
+                    }
                 });
             });
         }
@@ -335,7 +368,9 @@ async fn connect_to_profile(
     use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
 
     // Try to discover auth config from server
-    let discovery = match oauth::discover_auth_config(&profile.ws_url).await {
+    let ca_cert = desktop_assistant_client_common::config::default_ca_cert_path();
+    let ca_cert_ref = ca_cert.as_path();
+    let discovery = match oauth::discover_auth_config(&profile.ws_url, Some(ca_cert_ref)).await {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!("auth discovery failed, assuming password-only: {e}");

@@ -26,11 +26,26 @@ pub struct TokenResponse {
 /// Discover auth configuration from the server.
 ///
 /// Derives the HTTP base URL from the WebSocket URL (ws:// -> http://, wss:// -> https://).
-pub async fn discover_auth_config(ws_url: &str) -> Result<AuthDiscovery> {
+/// When the server uses a self-signed certificate (e.g. local daemon), pass the
+/// CA certificate path so the HTTPS request can verify it.
+pub async fn discover_auth_config(
+    ws_url: &str,
+    tls_ca_cert: Option<&std::path::Path>,
+) -> Result<AuthDiscovery> {
     let base_url = ws_url_to_http_base(ws_url);
     let url = format!("{base_url}/auth/config");
 
-    let client = reqwest::Client::new();
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10));
+    if let Some(ca_path) = tls_ca_cert {
+        if let Ok(pem_bytes) = std::fs::read(ca_path) {
+            if let Ok(cert) = reqwest::tls::Certificate::from_pem(&pem_bytes) {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+    }
+    let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
+
     let response = client
         .get(&url)
         .send()

@@ -52,11 +52,11 @@ pub fn show_setup_dialog<F: Fn(ConnectionProfile) + 'static>(
     content.append(&url_label);
 
     let url_entry = Entry::new();
-    url_entry.set_placeholder_text(Some("ws://127.0.0.1:11339/ws"));
+    url_entry.set_placeholder_text(Some("wss://127.0.0.1:11339/ws"));
     if let Some(profile) = existing {
         url_entry.set_text(&profile.ws_url);
     } else {
-        url_entry.set_text("ws://127.0.0.1:11339/ws");
+        url_entry.set_text("wss://127.0.0.1:11339/ws");
     }
     content.append(&url_entry);
 

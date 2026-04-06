@@ -89,6 +89,10 @@ impl From<CliArgs> for ConnectionConfig {
 }
 
 fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install default rustls CryptoProvider");
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
