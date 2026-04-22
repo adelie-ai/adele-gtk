@@ -5,5 +5,6 @@ pub mod input_bar;
 pub mod login_screen;
 pub mod model_selector;
 pub mod purposes_tab;
+pub mod settings_dialog;
 pub mod setup_dialog;
 pub mod sidebar;
