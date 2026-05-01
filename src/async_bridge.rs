@@ -2,6 +2,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use desktop_assistant_api_model as api;
 use desktop_assistant_client_common::SignalEvent;
 use desktop_assistant_client_common::{
     AssistantClient, ConnectionConfig, TransportClient, connect_transport,
@@ -60,6 +61,9 @@ pub enum UiMessage {
     PromptSent {
         request_id: String,
     },
+    /// Available (connection, model) pairs, fetched once on connect.
+    /// Empty list means the picker should hide (e.g. D-Bus transport).
+    ModelsLoaded(Vec<api::ModelListing>),
     Connected {
         label: String,
     },
@@ -170,6 +174,21 @@ pub async fn connection_manager(
                             return;
                         }
                     }
+                }
+
+                // Fetch available models when the transport supports it
+                // (WS only — the D-Bus interface doesn't expose this command).
+                let listings = match transport.as_ws() {
+                    Some(ws) => ws.list_available_models(None, false).await.unwrap_or_else(
+                        |e| {
+                            tracing::warn!("list_available_models failed: {e}");
+                            Vec::new()
+                        },
+                    ),
+                    None => Vec::new(),
+                };
+                if ui_tx.send(UiMessage::ModelsLoaded(listings)).is_err() {
+                    return;
                 }
 
                 // Forward signals until disconnect

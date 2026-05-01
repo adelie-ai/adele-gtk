@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use crate::async_bridge::{AsyncBridge, InternalMsg, UiMessage, connection_manager};
 use crate::widgets::chat_view::ChatView;
 use crate::widgets::input_bar::InputBar;
+use crate::widgets::model_picker::ModelPicker;
 use crate::widgets::sidebar::Sidebar;
 
 /// Shared mutable state for the window.
@@ -70,11 +71,16 @@ impl AdelieWindow {
         right_box.set_vexpand(true);
 
         // Header bar with hamburger menu
-        let header_bar = GtkBox::new(Orientation::Horizontal, 0);
+        let header_bar = GtkBox::new(Orientation::Horizontal, 8);
         header_bar.set_margin_start(8);
         header_bar.set_margin_end(8);
         header_bar.set_margin_top(4);
         header_bar.set_margin_bottom(4);
+
+        // Per-conversation model picker — populated on connect, selection
+        // tracks `ConversationView.model_selection` after each load.
+        let model_picker = ModelPicker::new();
+        header_bar.append(&model_picker.container);
 
         // Spacer to push menu button to the right
         let spacer = GtkBox::new(Orientation::Horizontal, 0);
@@ -158,6 +164,7 @@ impl AdelieWindow {
         let chat_view = Rc::new(RefCell::new(chat_view));
         let input_bar = Rc::new(input_bar);
         let status_label = Rc::new(status_label);
+        let model_picker = Rc::new(model_picker);
 
         // Client wrapped in Arc for async tasks, Rc<RefCell<>> for GTK thread
         let client: Rc<RefCell<Option<Arc<TransportClient>>>> = Rc::new(RefCell::new(None));
@@ -173,6 +180,7 @@ impl AdelieWindow {
             let status_label = Rc::clone(&status_label);
             let client = Rc::clone(&client);
             let input_bar = Rc::clone(&input_bar);
+            let model_picker = Rc::clone(&model_picker);
 
             AsyncBridge::new(move |msg| {
                 handle_ui_message(
@@ -183,6 +191,7 @@ impl AdelieWindow {
                     &status_label,
                     &client,
                     &input_bar,
+                    &model_picker,
                 );
             })
         };
@@ -461,6 +470,7 @@ impl AdelieWindow {
             let state = Rc::clone(&state);
             let input_bar_ref = Rc::clone(&input_bar);
             let chat_view_ref = Rc::clone(&chat_view);
+            let model_picker_ref = Rc::clone(&model_picker);
 
             let send_action = Rc::new(move || {
                 let text = input_bar_ref.take_text();
@@ -489,11 +499,24 @@ impl AdelieWindow {
                     }
                 }
 
+                let override_selection = model_picker_ref.current_override();
+
                 if let Some(client) = client_ref.borrow().clone() {
                     let tx = bridge_ref.ui_sender();
                     let text = text.clone();
                     bridge_ref.spawn(async move {
-                        match client.send_prompt(&conv_id, &text).await {
+                        // Use the WS-specific override path when available so
+                        // the picker's selection is honoured. The shared
+                        // AssistantClient trait can't carry the override
+                        // because the D-Bus surface doesn't expose it; on
+                        // D-Bus we fall through to the plain send_prompt.
+                        let result = match (client.as_ws(), override_selection) {
+                            (Some(ws), Some(over)) => {
+                                ws.send_prompt_with_override(&conv_id, &text, Some(over)).await
+                            }
+                            _ => client.send_prompt(&conv_id, &text).await,
+                        };
+                        match result {
                             Ok(request_id) => {
                                 let _ = tx.send(UiMessage::PromptSent { request_id });
                             }
@@ -596,6 +619,7 @@ fn handle_ui_message(
     status_label: &Rc<Label>,
     client: &Rc<RefCell<Option<Arc<TransportClient>>>>,
     input_bar: &Rc<InputBar>,
+    model_picker: &Rc<ModelPicker>,
 ) {
     match msg {
         UiMessage::ConversationsLoaded(convs) => {
@@ -606,6 +630,7 @@ fn handle_ui_message(
             let id = detail.id.clone();
             let debug = state.borrow().debug_enabled;
             let filtered = filter_messages(&detail, debug);
+            model_picker.set_selection(detail.model_selection.as_ref());
             let mut s = state.borrow_mut();
             s.current_conversation = Some(detail);
             s.current_conversation_id = Some(id);
@@ -736,6 +761,16 @@ fn handle_ui_message(
         UiMessage::Error(text) => {
             status_label.set_text(&format!("Error: {text}"));
         }
+        UiMessage::ModelsLoaded(listings) => {
+            let visible = !listings.is_empty();
+            model_picker.set_models(&listings);
+            // Re-apply the active conversation's stored selection (if any)
+            // since `set_models` resets the dropdown.
+            if let Some(ref detail) = state.borrow().current_conversation {
+                model_picker.set_selection(detail.model_selection.as_ref());
+            }
+            model_picker.set_visible(visible);
+        }
         UiMessage::Connected { label } => {
             status_label.set_text(&label);
             input_bar.send_button.set_sensitive(true);
@@ -840,5 +875,6 @@ fn filter_messages(detail: &ConversationDetail, debug: bool) -> ConversationDeta
             })
             .cloned()
             .collect(),
+        model_selection: detail.model_selection.clone(),
     }
 }
