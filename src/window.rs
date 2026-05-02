@@ -101,6 +101,11 @@ impl AdelieWindow {
         new_conn_btn.set_halign(Align::Fill);
         menu_box.append(&new_conn_btn);
 
+        let knowledge_btn = Button::with_label("Knowledge Base");
+        knowledge_btn.add_css_class("context-button");
+        knowledge_btn.set_halign(Align::Fill);
+        menu_box.append(&knowledge_btn);
+
         let disconnect_btn = Button::with_label("Disconnect");
         disconnect_btn.add_css_class("context-button");
         disconnect_btn.set_halign(Align::Fill);
@@ -559,6 +564,29 @@ impl AdelieWindow {
                 popover_ref.popdown();
                 let login = crate::widgets::login_screen::LoginScreen::new(&app_ref);
                 login.present();
+            });
+        }
+
+        // Hamburger menu: Knowledge Base → open the KB browser/editor (#74)
+        {
+            let popover_ref = menu_popover.clone();
+            let window_ref = window.clone();
+            let client_ref = Rc::clone(&client);
+            let bridge_ref = Rc::clone(&bridge);
+            let status_label_ref = Rc::clone(&status_label);
+            knowledge_btn.connect_clicked(move |_| {
+                popover_ref.popdown();
+                let Some(transport) = client_ref.borrow().clone() else {
+                    status_label_ref
+                        .set_text("Not connected — knowledge base unavailable");
+                    return;
+                };
+                let browser = crate::widgets::knowledge_browser::KnowledgeBrowser::new(
+                    &window_ref,
+                    transport,
+                    Rc::clone(&bridge_ref),
+                );
+                browser.present();
             });
         }
 
