@@ -14,7 +14,12 @@ use clap::Parser;
 use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
 use gtk4::Application;
 use gtk4::prelude::*;
+use gtk4::glib;
 use tracing_subscriber::EnvFilter;
+
+use crate::async_bridge::spawn_on_runtime;
+use crate::profile::{LastConnectionStore, ProfileStore};
+use crate::widgets::login_screen::{LoginScreen, connect_to_profile};
 
 const APP_ID: &str = "org.adelie.DesktopAssistant";
 const DEFAULT_WS_URL: &str = desktop_assistant_client_common::config::DEFAULT_WS_URL;
@@ -103,10 +108,37 @@ fn main() -> Result<()> {
     let app = Application::builder().application_id(APP_ID).build();
 
     app.connect_activate(move |app| {
-        // Always show the login/connection selection screen.
-        // Credentials are obtained interactively and stored in the system keyring.
-        let login = widgets::login_screen::LoginScreen::new(app);
-        login.present();
+        // If a profile was used last time and is still configured, attempt to
+        // silently re-establish that connection. On any failure, fall back to
+        // the connection picker.
+        let app_clone = app.clone();
+        glib::spawn_future_local(async move {
+            if let Some(profile) = last_active_profile() {
+                let profile_id = profile.id.clone();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                spawn_on_runtime(async move {
+                    let _ = tx.send(connect_to_profile(&profile).await);
+                });
+                match rx.await {
+                    Ok(Ok(config)) => {
+                        if let Err(e) = LastConnectionStore::new().set(&profile_id) {
+                            tracing::warn!("Failed to refresh last-connection marker: {e}");
+                        }
+                        let main_win = window::AdelieWindow::new(&app_clone, config);
+                        main_win.present();
+                        return;
+                    }
+                    Ok(Err(e)) => {
+                        tracing::info!("auto-reconnect failed, showing picker: {e}");
+                    }
+                    Err(_) => {
+                        tracing::info!("auto-reconnect channel dropped, showing picker");
+                    }
+                }
+            }
+            let login = LoginScreen::new(&app_clone);
+            login.present();
+        });
     });
 
     // GTK expects command-line args but we've already parsed them with clap.
@@ -114,4 +146,12 @@ fn main() -> Result<()> {
     app.run_with_args(&empty);
 
     Ok(())
+}
+
+/// Look up the connection profile recorded as the most recently active.
+/// Returns `None` if no marker exists or the profile has since been deleted.
+fn last_active_profile() -> Option<profile::ConnectionProfile> {
+    let id = LastConnectionStore::new().get()?;
+    let profiles = ProfileStore::new().load().ok()?;
+    profiles.into_iter().find(|p| p.id == id)
 }

@@ -10,7 +10,7 @@ use gtk4::{
 use crate::async_bridge;
 use crate::credential_store::CredentialStore;
 use crate::oauth;
-use crate::profile::{ConnectionProfile, ProfileStore};
+use crate::profile::{ConnectionProfile, LastConnectionStore, ProfileStore};
 use crate::widgets::setup_dialog;
 use crate::window;
 
@@ -330,12 +330,17 @@ impl LoginScreen {
                 // (reqwest needs tokio), then handle the result on the GTK main thread.
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 async_bridge::spawn_on_runtime(async move {
-                    let result = connect_to_profile(&profile).await;
+                    let result = connect_to_profile(&profile)
+                        .await
+                        .map(|config| (profile.id.clone(), config));
                     let _ = tx.send(result);
                 });
                 glib::spawn_future_local(async move {
                     match rx.await {
-                        Ok(Ok(config)) => {
+                        Ok(Ok((profile_id, config))) => {
+                            if let Err(e) = LastConnectionStore::new().set(&profile_id) {
+                                tracing::warn!("Failed to persist last connection: {e}");
+                            }
                             let main_win = window::AdelieWindow::new(&app, config);
                             main_win.present();
                             win.close();
@@ -362,7 +367,7 @@ impl LoginScreen {
 }
 
 /// Attempt to connect to a profile by discovering auth method and obtaining credentials.
-async fn connect_to_profile(
+pub async fn connect_to_profile(
     profile: &ConnectionProfile,
 ) -> anyhow::Result<desktop_assistant_client_common::ConnectionConfig> {
     use desktop_assistant_client_common::{ConnectionConfig, TransportMode};

@@ -96,10 +96,10 @@ impl AdelieWindow {
         menu_popover.add_css_class("context-popover");
         let menu_box = GtkBox::new(Orientation::Vertical, 0);
 
-        let new_conn_btn = Button::with_label("New Connection");
-        new_conn_btn.add_css_class("context-button");
-        new_conn_btn.set_halign(Align::Fill);
-        menu_box.append(&new_conn_btn);
+        let switch_conn_btn = Button::with_label("Switch Connection…");
+        switch_conn_btn.add_css_class("context-button");
+        switch_conn_btn.set_halign(Align::Fill);
+        menu_box.append(&switch_conn_btn);
 
         let knowledge_btn = Button::with_label("Knowledge Base");
         knowledge_btn.add_css_class("context-button");
@@ -556,11 +556,13 @@ impl AdelieWindow {
             input_bar.text_view.add_controller(key_controller);
         }
 
-        // Hamburger menu: New Connection → open login screen in a new window
+        // Hamburger menu: Switch Connection → open the picker in a new
+        // window. The current connection's window is intentionally left open;
+        // selecting a profile spawns a fresh AdelieWindow alongside it.
         {
             let app_ref = app.clone();
             let popover_ref = menu_popover.clone();
-            new_conn_btn.connect_clicked(move |_| {
+            switch_conn_btn.connect_clicked(move |_| {
                 popover_ref.popdown();
                 let login = crate::widgets::login_screen::LoginScreen::new(&app_ref);
                 login.present();
