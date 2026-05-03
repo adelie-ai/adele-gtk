@@ -112,7 +112,11 @@ fn main() -> Result<()> {
         // silently re-establish that connection. On any failure, fall back to
         // the connection picker.
         let app_clone = app.clone();
+        // Hold the application active across the async reconnect so it does
+        // not shut down before the future creates its first window.
+        let hold = app.hold();
         glib::spawn_future_local(async move {
+            let _hold = hold;
             if let Some(profile) = last_active_profile() {
                 let profile_id = profile.id.clone();
                 let (tx, rx) = tokio::sync::oneshot::channel();
