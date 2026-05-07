@@ -4,6 +4,7 @@ mod credential_store;
 mod markdown;
 mod oauth;
 mod profile;
+mod selected_models;
 #[cfg(feature = "linux")]
 mod webview;
 mod widgets;
