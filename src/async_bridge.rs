@@ -88,17 +88,21 @@ pub struct AsyncBridge {
 }
 
 impl AsyncBridge {
-    /// Create a new bridge. `handler` is called on the GTK main thread for each UiMessage.
+    /// Create a new bridge. `handler` is called on the GTK main thread for
+    /// each UiMessage and receives a clone of the sender so it can fire
+    /// follow-up async work (e.g. auto-loading a conversation when the list
+    /// arrives) and feed the results back through the same channel.
     pub fn new<F>(handler: F) -> Self
     where
-        F: Fn(UiMessage) + 'static,
+        F: Fn(UiMessage, &mpsc::UnboundedSender<UiMessage>) + 'static,
     {
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMessage>();
+        let handler_tx = ui_tx.clone();
 
         // Spawn a local future on the GLib main context to receive messages
         glib::spawn_future_local(async move {
             while let Some(msg) = ui_rx.recv().await {
-                handler(msg);
+                handler(msg, &handler_tx);
             }
         });
 
