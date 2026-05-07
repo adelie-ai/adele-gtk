@@ -76,8 +76,41 @@ paned > separator {
     min-width: 2px;
 }
 
-.context-popover {
+/* Popovers: GTK4 paints both `popover` and `popover > contents`, plus a
+   separate `> arrow` node. Style all three so the dark window background
+   doesn't leave us with light text on the default white popover surface. */
+popover > contents,
+popover.menu > contents {
     background-color: #232740;
+    color: #e0e0e0;
+    border: 1px solid #3a3f5c;
+    border-radius: 6px;
+    padding: 4px;
+}
+
+popover > arrow {
+    background-color: #232740;
+    border: 1px solid #3a3f5c;
+}
+
+popover modelbutton,
+popover modelbutton label {
+    color: #e0e0e0;
+}
+
+popover modelbutton:hover {
+    background-color: #3a3f5c;
+    color: #f5f8ff;
+}
+
+popover modelbutton:disabled,
+popover modelbutton:disabled label {
+    color: #7c8494;
+}
+
+.context-popover > contents {
+    background-color: #232740;
+    color: #e0e0e0;
     border: 1px solid #3a3f5c;
     border-radius: 6px;
     padding: 4px;
@@ -94,6 +127,43 @@ paned > separator {
 
 .context-button:hover {
     background-color: #3a3f5c;
+    color: #f5f8ff;
+}
+
+.context-button:disabled,
+.context-button:disabled label {
+    color: #7c8494;
+}
+
+/* DropDown popup: rendered as a popover containing a ListView. Without
+   these rules the rows inherit the window's light foreground but render on
+   the default white popover surface — the gray-on-white contrast bug. */
+dropdown > popover > contents {
+    background-color: #232740;
+    border: 1px solid #3a3f5c;
+    border-radius: 6px;
+    padding: 4px;
+}
+
+dropdown listview > row {
+    background-color: transparent;
+    color: #e0e0e0;
+    border-radius: 4px;
+    padding: 4px 8px;
+}
+
+dropdown listview > row:hover {
+    background-color: #3a3f5c;
+    color: #f5f8ff;
+}
+
+dropdown listview > row:selected {
+    background-color: #4866b4;
+    color: #f5f8ff;
+}
+
+dropdown > button {
+    color: #e0e0e0;
 }
 
 /* Login screen & setup dialog */
