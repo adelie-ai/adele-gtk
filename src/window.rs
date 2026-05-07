@@ -187,7 +187,7 @@ impl AdelieWindow {
             let input_bar = Rc::clone(&input_bar);
             let model_picker = Rc::clone(&model_picker);
 
-            AsyncBridge::new(move |msg| {
+            AsyncBridge::new(move |msg, ui_tx| {
                 handle_ui_message(
                     msg,
                     &state,
@@ -197,6 +197,7 @@ impl AdelieWindow {
                     &client,
                     &input_bar,
                     &model_picker,
+                    ui_tx,
                 );
             })
         };
@@ -650,11 +651,13 @@ fn handle_ui_message(
     client: &Rc<RefCell<Option<Arc<TransportClient>>>>,
     input_bar: &Rc<InputBar>,
     model_picker: &Rc<ModelPicker>,
+    ui_tx: &mpsc::UnboundedSender<UiMessage>,
 ) {
     match msg {
         UiMessage::ConversationsLoaded(convs) => {
             sidebar.set_conversations(&convs);
             state.borrow_mut().conversations = convs;
+            ensure_active_conversation(state, sidebar, client, ui_tx);
         }
         UiMessage::ConversationLoaded(detail) => {
             let id = detail.id.clone();
@@ -683,6 +686,7 @@ fn handle_ui_message(
             sidebar.set_conversations(&convs);
             if is_active {
                 chat_view.borrow_mut().clear();
+                ensure_active_conversation(state, sidebar, client, ui_tx);
             }
         }
         UiMessage::ConversationRenamed { id, title } => {
@@ -828,6 +832,82 @@ fn handle_ui_message(
                     chat_view.borrow_mut().complete_streaming(&full);
                 }
             }
+        }
+    }
+}
+
+/// Make sure the window has an active conversation. The daemon returns the
+/// conversation list sorted by `updated_at` desc, so picking index 0 yields
+/// the most-recently-used conversation. When the list is empty we ask the
+/// daemon to create a new one and load it.
+///
+/// No-op when an active conversation is already set and still present in the
+/// list — this lets the function be called freely from `ConversationsLoaded`
+/// (which fires on every reconnect) without disturbing in-progress work.
+fn ensure_active_conversation(
+    state: &Rc<RefCell<WindowState>>,
+    sidebar: &Rc<Sidebar>,
+    client: &Rc<RefCell<Option<Arc<TransportClient>>>>,
+    ui_tx: &mpsc::UnboundedSender<UiMessage>,
+) {
+    let (target_id, target_index) = {
+        let s = state.borrow();
+
+        // Already-active and still present → just sync the sidebar selection.
+        if let Some(active_id) = s.current_conversation_id.as_deref() {
+            if let Some(idx) = s.conversations.iter().position(|c| c.id == active_id) {
+                drop(s);
+                sidebar.select_index(idx);
+                return;
+            }
+        }
+
+        match s.conversations.first() {
+            Some(conv) => (Some(conv.id.clone()), Some(0usize)),
+            None => (None, None),
+        }
+    };
+
+    let Some(transport) = client.borrow().clone() else {
+        // Not connected yet — connection_manager will resend
+        // ConversationsLoaded once the transport is up, and we'll re-run.
+        return;
+    };
+
+    let tx = ui_tx.clone();
+    match (target_id, target_index) {
+        (Some(id), Some(idx)) => {
+            sidebar.select_index(idx);
+            crate::async_bridge::spawn_on_runtime(async move {
+                match transport.get_conversation(&id).await {
+                    Ok(detail) => {
+                        let _ = tx.send(UiMessage::ConversationLoaded(detail));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(UiMessage::Error(format!("Load conversation: {e}")));
+                    }
+                }
+            });
+        }
+        _ => {
+            crate::async_bridge::spawn_on_runtime(async move {
+                match transport.create_conversation("New Conversation").await {
+                    Ok(id) => {
+                        let _ = tx.send(UiMessage::ConversationCreated { id: id.clone() });
+                        if let Ok(convs) = transport.list_conversations().await {
+                            let _ = tx.send(UiMessage::ConversationsLoaded(convs));
+                        }
+                        if let Ok(detail) = transport.get_conversation(&id).await {
+                            let _ = tx.send(UiMessage::ConversationLoaded(detail));
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(UiMessage::Error(format!(
+                            "Auto-create conversation: {e}"
+                        )));
+                    }
+                }
+            });
         }
     }
 }
