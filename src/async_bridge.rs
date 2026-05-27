@@ -81,24 +81,18 @@ pub enum UiMessage {
     // produced by the initial `ListBackgroundTasks` snapshot taken on
     // connect (and on reconnect — see `connection_manager`).
     TasksLoaded(Vec<api::TaskView>),
-    // The four streaming variants below are populated by
-    // `connection_manager` once `client-common::SignalEvent::Task*` ships
-    // (tracked on the `feat/client-common-task-signals` branch in the
-    // desktop-assistant repo). Until then, the polling fallback in
-    // `connection_manager` keeps the panel live via `TasksLoaded`.
-    #[allow(dead_code)]
+    // The four streaming variants below carry the daemon's
+    // `Event::Task*` frames into the GTK main thread via the
+    // `SignalEvent::Task*` family on `client-common` (issue #22).
     TaskStarted(api::TaskView),
-    #[allow(dead_code)]
     TaskProgress {
         id: String,
         progress_hint: Option<String>,
     },
-    #[allow(dead_code)]
     TaskLogAppended {
         id: String,
         entry: api::TaskLogEntry,
     },
-    #[allow(dead_code)]
     TaskCompleted {
         id: String,
         status: api::TaskStatus,
@@ -261,90 +255,15 @@ pub async fn connection_manager(
                     }
                 }
 
-                // Background-task polling fallback.
-                //
-                // The streaming `Event::Task*` frames already arrive on the
-                // WebSocket (the daemon emits them in response to
-                // `SubscribeBackgroundTasks`), but `client-common`'s
-                // `SignalEvent` does not yet surface them — that extension is
-                // tracked separately on `feat/client-common-task-signals`. To
-                // keep the panel live in the meantime, the connection manager
-                // polls `ListBackgroundTasks` on a slow cadence. Polling is
-                // additive: when the SignalEvent extension lands, the
-                // streaming path will populate the same `UiMessage::Task*`
-                // variants and the poller becomes redundant (left in place
-                // as a defensive refresh against missed events).
-                let poll_tx = ui_tx.clone();
-                let poll_transport = Arc::clone(&transport);
-                tokio::spawn(async move {
-                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
-                    ticker.tick().await; // first tick is immediate; skip it
-                    loop {
-                        ticker.tick().await;
-                        let Some(ws) = poll_transport.as_ws() else {
-                            return;
-                        };
-                        match ws
-                            .send_command(api::Command::ListBackgroundTasks {
-                                include_finished: false,
-                                limit: None,
-                            })
-                            .await
-                        {
-                            Ok(api::CommandResult::BackgroundTasks(tasks)) => {
-                                if poll_tx.send(UiMessage::TasksLoaded(tasks)).is_err() {
-                                    return;
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                // Transient errors during reconnect are expected.
-                                tracing::debug!("ListBackgroundTasks poll: {e}");
-                                return;
-                            }
-                        }
-                    }
-                });
+                // Background-task updates now arrive via the streaming
+                // `SignalEvent::Task*` family below (issue #22 — replaces the
+                // earlier 5 s `ListBackgroundTasks` poll). The initial
+                // `ListBackgroundTasks` snapshot above seeds the panel; the
+                // streaming arms in `match signal` keep it live.
 
                 // Forward signals until disconnect
                 while let Some(signal) = signal_rx.recv().await {
-                    let msg = match signal {
-                        SignalEvent::Chunk { request_id, chunk } => {
-                            UiMessage::StreamChunk { request_id, chunk }
-                        }
-                        SignalEvent::Complete {
-                            request_id,
-                            full_response,
-                        } => UiMessage::StreamComplete {
-                            request_id,
-                            full_response,
-                        },
-                        SignalEvent::Error { request_id, error } => {
-                            UiMessage::StreamError { request_id, error }
-                        }
-                        SignalEvent::Status {
-                            request_id,
-                            message,
-                        } => UiMessage::AssistantStatus {
-                            request_id,
-                            message,
-                        },
-                        SignalEvent::TitleChanged {
-                            conversation_id,
-                            title,
-                        } => UiMessage::TitleChanged {
-                            conversation_id,
-                            title,
-                        },
-                        SignalEvent::ConversationWarning {
-                            conversation_id,
-                            warning,
-                        } => UiMessage::StatusUpdate(format!(
-                            "Conversation {conversation_id}: {warning:?}"
-                        )),
-                        SignalEvent::Disconnected { reason } => UiMessage::Disconnected { reason },
-                    };
-                    if ui_tx.send(msg).is_err() {
+                    if ui_tx.send(signal_to_ui_message(signal)).is_err() {
                         return;
                     }
                 }
@@ -379,5 +298,173 @@ pub async fn connection_manager(
 
         tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+    }
+}
+
+/// Translate a `SignalEvent` from `client-common` into the corresponding
+/// `UiMessage` the GTK main thread consumes. Pure mapping; tested below.
+fn signal_to_ui_message(signal: SignalEvent) -> UiMessage {
+    match signal {
+        SignalEvent::Chunk { request_id, chunk } => UiMessage::StreamChunk { request_id, chunk },
+        SignalEvent::Complete {
+            request_id,
+            full_response,
+        } => UiMessage::StreamComplete {
+            request_id,
+            full_response,
+        },
+        SignalEvent::Error { request_id, error } => UiMessage::StreamError { request_id, error },
+        SignalEvent::Status {
+            request_id,
+            message,
+        } => UiMessage::AssistantStatus {
+            request_id,
+            message,
+        },
+        SignalEvent::TitleChanged {
+            conversation_id,
+            title,
+        } => UiMessage::TitleChanged {
+            conversation_id,
+            title,
+        },
+        SignalEvent::ConversationWarning {
+            conversation_id,
+            warning,
+        } => UiMessage::StatusUpdate(format!("Conversation {conversation_id}: {warning:?}")),
+        SignalEvent::TaskStarted { task } => UiMessage::TaskStarted(task),
+        SignalEvent::TaskProgress { id, progress_hint } => {
+            UiMessage::TaskProgress { id, progress_hint }
+        }
+        SignalEvent::TaskLogAppended { id, entry } => UiMessage::TaskLogAppended { id, entry },
+        SignalEvent::TaskCompleted {
+            id,
+            status,
+            last_error,
+        } => UiMessage::TaskCompleted {
+            id,
+            status,
+            last_error,
+        },
+        SignalEvent::Disconnected { reason } => UiMessage::Disconnected { reason },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_task() -> api::TaskView {
+        api::TaskView {
+            id: api::TaskId("task-1".to_string()),
+            kind: api::TaskKind::Standalone {
+                name: "demo".to_string(),
+                conversation_id: "conv-1".to_string(),
+            },
+            status: api::TaskStatus::Running,
+            started_at: 0,
+            ended_at: None,
+            last_error: None,
+            parent: None,
+            children: Vec::new(),
+            title: "demo".to_string(),
+            progress_hint: None,
+        }
+    }
+
+    #[test]
+    fn signal_task_started_routes_to_ui_task_started() {
+        let task = sample_task();
+        let msg = signal_to_ui_message(SignalEvent::TaskStarted { task: task.clone() });
+        match msg {
+            UiMessage::TaskStarted(got) => assert_eq!(got.id, task.id),
+            other => panic!("expected TaskStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signal_task_progress_routes_to_ui_task_progress_preserving_hint() {
+        let msg = signal_to_ui_message(SignalEvent::TaskProgress {
+            id: "task-1".to_string(),
+            progress_hint: Some("phase 2".to_string()),
+        });
+        match msg {
+            UiMessage::TaskProgress { id, progress_hint } => {
+                assert_eq!(id, "task-1");
+                assert_eq!(progress_hint.as_deref(), Some("phase 2"));
+            }
+            other => panic!("expected TaskProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signal_task_log_appended_routes_with_entry_intact() {
+        let entry = api::TaskLogEntry {
+            seq: 7,
+            timestamp: 1234,
+            level: api::LogLevel::Info,
+            category: api::LogCategory::Status,
+            message: "hi".to_string(),
+            data: None,
+        };
+        let msg = signal_to_ui_message(SignalEvent::TaskLogAppended {
+            id: "task-1".to_string(),
+            entry: entry.clone(),
+        });
+        match msg {
+            UiMessage::TaskLogAppended { id, entry: got } => {
+                assert_eq!(id, "task-1");
+                assert_eq!(got.seq, entry.seq);
+                assert_eq!(got.message, entry.message);
+            }
+            other => panic!("expected TaskLogAppended, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signal_task_completed_routes_with_status_and_last_error() {
+        let msg = signal_to_ui_message(SignalEvent::TaskCompleted {
+            id: "task-1".to_string(),
+            status: api::TaskStatus::Failed,
+            last_error: Some("boom".to_string()),
+        });
+        match msg {
+            UiMessage::TaskCompleted {
+                id,
+                status,
+                last_error,
+            } => {
+                assert_eq!(id, "task-1");
+                assert!(matches!(status, api::TaskStatus::Failed));
+                assert_eq!(last_error.as_deref(), Some("boom"));
+            }
+            other => panic!("expected TaskCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signal_chunk_still_routes_to_stream_chunk_regression() {
+        let msg = signal_to_ui_message(SignalEvent::Chunk {
+            request_id: "r1".to_string(),
+            chunk: "hello".to_string(),
+        });
+        match msg {
+            UiMessage::StreamChunk { request_id, chunk } => {
+                assert_eq!(request_id, "r1");
+                assert_eq!(chunk, "hello");
+            }
+            other => panic!("expected StreamChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signal_disconnected_still_routes_to_ui_disconnected_regression() {
+        let msg = signal_to_ui_message(SignalEvent::Disconnected {
+            reason: "lost".to_string(),
+        });
+        match msg {
+            UiMessage::Disconnected { reason } => assert_eq!(reason, "lost"),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
     }
 }
