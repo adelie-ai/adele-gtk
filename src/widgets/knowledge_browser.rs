@@ -17,9 +17,9 @@ use desktop_assistant_api_model as api;
 use desktop_assistant_client_common::{AssistantClient, TransportClient};
 use gtk4::prelude::*;
 use gtk4::{
-    Align, ApplicationWindow, Box as GtkBox, Button, Entry, HeaderBar, Label, ListBox,
-    ListBoxRow, Orientation, Paned, ScrolledWindow, SearchEntry, SelectionMode, TextView,
-    Window, WrapMode, glib,
+    Align, ApplicationWindow, Box as GtkBox, Button, Entry, HeaderBar, Label, ListBox, ListBoxRow,
+    Orientation, Paned, ScrolledWindow, SearchEntry, SelectionMode, TextView, Window, WrapMode,
+    glib,
 };
 use tokio::sync::mpsc;
 
@@ -240,9 +240,7 @@ impl KnowledgeBrowser {
                 let msg_tx = msg_tx.clone();
                 bridge.spawn(async move {
                     let result = if query.trim().is_empty() {
-                        transport
-                            .list_knowledge_entries(LIST_LIMIT, 0, None)
-                            .await
+                        transport.list_knowledge_entries(LIST_LIMIT, 0, None).await
                     } else {
                         transport
                             .search_knowledge_entries(&query, None, SEARCH_LIMIT)
@@ -548,9 +546,9 @@ impl KnowledgeBrowser {
                         bridge.spawn(async move {
                             let result = transport.delete_knowledge_entry(&id_for_async).await;
                             let _ = match result {
-                                Ok(()) => msg_tx.send(BrowserMsg::EntryDeleted {
-                                    id: id_for_async,
-                                }),
+                                Ok(()) => {
+                                    msg_tx.send(BrowserMsg::EntryDeleted { id: id_for_async })
+                                }
                                 Err(e) => msg_tx.send(BrowserMsg::Error(e.to_string())),
                             };
                         });

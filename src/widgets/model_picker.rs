@@ -3,7 +3,9 @@ use std::rc::Rc;
 
 use desktop_assistant_api_model as api;
 use gtk4::prelude::*;
-use gtk4::{Align, Box as GtkBox, Button, Label, MenuButton, Orientation, Popover, Separator, Window};
+use gtk4::{
+    Align, Box as GtkBox, Button, Label, MenuButton, Orientation, Popover, Separator, Window,
+};
 
 use crate::selected_models::{SelectedModel, SelectedModelsStore};
 use crate::widgets::select_models_dialog::show_select_models_dialog;
@@ -135,11 +137,14 @@ impl ModelPicker {
     /// model is actively selected (the daemon then falls back to the
     /// conversation's stored selection or the interactive purpose).
     pub fn current_override(&self) -> Option<api::SendPromptOverride> {
-        self.active.borrow().as_ref().map(|sel| api::SendPromptOverride {
-            connection_id: sel.connection_id.clone(),
-            model_id: sel.model_id.clone(),
-            effort: None,
-        })
+        self.active
+            .borrow()
+            .as_ref()
+            .map(|sel| api::SendPromptOverride {
+                connection_id: sel.connection_id.clone(),
+                model_id: sel.model_id.clone(),
+                effort: None,
+            })
     }
 
     /// Hide the entire picker — used when the active transport doesn't

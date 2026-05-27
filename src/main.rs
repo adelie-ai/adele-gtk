@@ -14,8 +14,8 @@ use anyhow::Result;
 use clap::Parser;
 use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
 use gtk4::Application;
-use gtk4::prelude::*;
 use gtk4::glib;
+use gtk4::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 use crate::async_bridge::spawn_on_runtime;

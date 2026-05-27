@@ -72,6 +72,38 @@ pub enum UiMessage {
     },
     StatusUpdate(String),
     Error(String),
+
+    // --- Background tasks (issue #19) -------------------------------------
+    //
+    // The connection manager forwards `Event::Task*` frames into these
+    // variants so the GTK main thread can update the process-manager panel
+    // without touching tokio or the WebSocket directly. `TasksLoaded` is
+    // produced by the initial `ListBackgroundTasks` snapshot taken on
+    // connect (and on reconnect — see `connection_manager`).
+    TasksLoaded(Vec<api::TaskView>),
+    // The four streaming variants below are populated by
+    // `connection_manager` once `client-common::SignalEvent::Task*` ships
+    // (tracked on the `feat/client-common-task-signals` branch in the
+    // desktop-assistant repo). Until then, the polling fallback in
+    // `connection_manager` keeps the panel live via `TasksLoaded`.
+    #[allow(dead_code)]
+    TaskStarted(api::TaskView),
+    #[allow(dead_code)]
+    TaskProgress {
+        id: String,
+        progress_hint: Option<String>,
+    },
+    #[allow(dead_code)]
+    TaskLogAppended {
+        id: String,
+        entry: api::TaskLogEntry,
+    },
+    #[allow(dead_code)]
+    TaskCompleted {
+        id: String,
+        status: api::TaskStatus,
+        last_error: Option<String>,
+    },
 }
 
 /// Internal message for delivering a new client to the GTK main thread.
@@ -183,17 +215,96 @@ pub async fn connection_manager(
                 // Fetch available models when the transport supports it
                 // (WS only — the D-Bus interface doesn't expose this command).
                 let listings = match transport.as_ws() {
-                    Some(ws) => ws.list_available_models(None, false).await.unwrap_or_else(
-                        |e| {
+                    Some(ws) => ws
+                        .list_available_models(None, false)
+                        .await
+                        .unwrap_or_else(|e| {
                             tracing::warn!("list_available_models failed: {e}");
                             Vec::new()
-                        },
-                    ),
+                        }),
                     None => Vec::new(),
                 };
                 if ui_tx.send(UiMessage::ModelsLoaded(listings)).is_err() {
                     return;
                 }
+
+                // Subscribe to background-task events and fetch the initial
+                // snapshot. WS-only: the D-Bus surface does not expose
+                // background tasks (issue #116 covers that path).
+                if let Some(ws) = transport.as_ws() {
+                    if let Err(e) = ws
+                        .send_command(api::Command::SubscribeBackgroundTasks)
+                        .await
+                    {
+                        tracing::warn!("SubscribeBackgroundTasks failed: {e}");
+                    }
+                    match ws
+                        .send_command(api::Command::ListBackgroundTasks {
+                            include_finished: false,
+                            limit: None,
+                        })
+                        .await
+                    {
+                        Ok(api::CommandResult::BackgroundTasks(tasks)) => {
+                            if ui_tx.send(UiMessage::TasksLoaded(tasks)).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(other) => {
+                            tracing::warn!(
+                                "unexpected response for ListBackgroundTasks: {other:?}"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("ListBackgroundTasks failed: {e}");
+                        }
+                    }
+                }
+
+                // Background-task polling fallback.
+                //
+                // The streaming `Event::Task*` frames already arrive on the
+                // WebSocket (the daemon emits them in response to
+                // `SubscribeBackgroundTasks`), but `client-common`'s
+                // `SignalEvent` does not yet surface them — that extension is
+                // tracked separately on `feat/client-common-task-signals`. To
+                // keep the panel live in the meantime, the connection manager
+                // polls `ListBackgroundTasks` on a slow cadence. Polling is
+                // additive: when the SignalEvent extension lands, the
+                // streaming path will populate the same `UiMessage::Task*`
+                // variants and the poller becomes redundant (left in place
+                // as a defensive refresh against missed events).
+                let poll_tx = ui_tx.clone();
+                let poll_transport = Arc::clone(&transport);
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+                    ticker.tick().await; // first tick is immediate; skip it
+                    loop {
+                        ticker.tick().await;
+                        let Some(ws) = poll_transport.as_ws() else {
+                            return;
+                        };
+                        match ws
+                            .send_command(api::Command::ListBackgroundTasks {
+                                include_finished: false,
+                                limit: None,
+                            })
+                            .await
+                        {
+                            Ok(api::CommandResult::BackgroundTasks(tasks)) => {
+                                if poll_tx.send(UiMessage::TasksLoaded(tasks)).is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                // Transient errors during reconnect are expected.
+                                tracing::debug!("ListBackgroundTasks poll: {e}");
+                                return;
+                            }
+                        }
+                    }
+                });
 
                 // Forward signals until disconnect
                 while let Some(signal) = signal_rx.recv().await {

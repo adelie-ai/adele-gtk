@@ -35,8 +35,7 @@ pub async fn discover_auth_config(
     let base_url = ws_url_to_http_base(ws_url);
     let url = format!("{base_url}/auth/config");
 
-    let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10));
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
     if let Some(ca_path) = tls_ca_cert {
         if let Ok(pem_bytes) = std::fs::read(ca_path) {
             if let Ok(cert) = reqwest::tls::Certificate::from_pem(&pem_bytes) {
