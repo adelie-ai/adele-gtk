@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use desktop_assistant_api_model as api;
 use desktop_assistant_client_common::{
     AssistantClient, ChatMessage, ConnectionConfig, ConversationDetail, ConversationSummary,
     TransportClient,
@@ -9,7 +10,7 @@ use desktop_assistant_client_common::{
 use gtk4::prelude::*;
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, Entry, Label,
-    MenuButton, Orientation, Paned, Popover, Separator, Window, gdk, glib,
+    MenuButton, Orientation, Paned, Popover, Separator, Stack, StackSwitcher, Window, gdk, glib,
 };
 use tokio::sync::mpsc;
 
@@ -18,6 +19,7 @@ use crate::widgets::chat_view::ChatView;
 use crate::widgets::input_bar::InputBar;
 use crate::widgets::model_picker::ModelPicker;
 use crate::widgets::sidebar::Sidebar;
+use crate::widgets::tasks_panel::TasksPanel;
 
 /// Shared mutable state for the window.
 struct WindowState {
@@ -56,12 +58,33 @@ impl AdelieWindow {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
-        // Layout: resizable paned split between sidebar and chat
+        // Layout: resizable paned split between sidebar and chat. The left
+        // pane is a `Stack` that swaps between the conversation list and the
+        // process-manager view (issue #19) — minimal disruption to the
+        // existing sidebar widget, the Tasks page just becomes a sibling.
         let paned = Paned::new(Orientation::Horizontal);
 
         let sidebar = Sidebar::new();
-        sidebar.container.set_size_request(280, -1); // minimum width
-        paned.set_start_child(Some(&sidebar.container));
+        let tasks_panel = TasksPanel::new();
+
+        let left_box = GtkBox::new(Orientation::Vertical, 0);
+        left_box.set_size_request(280, -1);
+
+        let stack = Stack::new();
+        stack.set_vexpand(true);
+        stack.add_titled(&sidebar.container, Some("conversations"), "Conversations");
+        stack.add_titled(&tasks_panel.container, Some("tasks"), "Tasks");
+
+        let stack_switcher = StackSwitcher::new();
+        stack_switcher.set_stack(Some(&stack));
+        stack_switcher.set_halign(Align::Center);
+        stack_switcher.set_margin_top(8);
+        stack_switcher.set_margin_bottom(4);
+        stack_switcher.add_css_class("sidebar-stack-switcher");
+        left_box.append(&stack_switcher);
+        left_box.append(&stack);
+
+        paned.set_start_child(Some(&left_box));
         paned.set_resize_start_child(false);
         paned.set_shrink_start_child(false);
         paned.set_position(280);
@@ -170,6 +193,8 @@ impl AdelieWindow {
         let input_bar = Rc::new(input_bar);
         let status_label = Rc::new(status_label);
         let model_picker = Rc::new(model_picker);
+        let tasks_panel = Rc::new(tasks_panel);
+        let stack = Rc::new(stack);
 
         // Client wrapped in Arc for async tasks, Rc<RefCell<>> for GTK thread
         let client: Rc<RefCell<Option<Arc<TransportClient>>>> = Rc::new(RefCell::new(None));
@@ -186,6 +211,7 @@ impl AdelieWindow {
             let client = Rc::clone(&client);
             let input_bar = Rc::clone(&input_bar);
             let model_picker = Rc::clone(&model_picker);
+            let tasks_panel = Rc::clone(&tasks_panel);
 
             AsyncBridge::new(move |msg, ui_tx| {
                 handle_ui_message(
@@ -197,6 +223,7 @@ impl AdelieWindow {
                     &client,
                     &input_bar,
                     &model_picker,
+                    &tasks_panel,
                     ui_tx,
                 );
             })
@@ -518,7 +545,8 @@ impl AdelieWindow {
                         // D-Bus we fall through to the plain send_prompt.
                         let result = match (client.as_ws(), override_selection) {
                             (Some(ws), Some(over)) => {
-                                ws.send_prompt_with_override(&conv_id, &text, Some(over)).await
+                                ws.send_prompt_with_override(&conv_id, &text, Some(over))
+                                    .await
                             }
                             _ => client.send_prompt(&conv_id, &text).await,
                         };
@@ -580,8 +608,7 @@ impl AdelieWindow {
             knowledge_btn.connect_clicked(move |_| {
                 popover_ref.popdown();
                 let Some(transport) = client_ref.borrow().clone() else {
-                    status_label_ref
-                        .set_text("Not connected — knowledge base unavailable");
+                    status_label_ref.set_text("Not connected — knowledge base unavailable");
                     return;
                 };
                 let browser = crate::widgets::knowledge_browser::KnowledgeBrowser::new(
@@ -614,23 +641,76 @@ impl AdelieWindow {
             debug_check.connect_toggled(move |btn| {
                 state.borrow_mut().debug_enabled = btn.is_active();
                 let conv_id = state.borrow().current_conversation_id.clone();
-                if let Some(conv_id) = conv_id {
-                    if let Some(client) = client_ref.borrow().clone() {
-                        let tx = bridge_ref.ui_sender();
-                        bridge_ref.spawn(async move {
-                            match client.get_conversation(&conv_id).await {
-                                Ok(detail) => {
-                                    let _ = tx.send(UiMessage::ConversationLoaded(detail));
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(UiMessage::Error(format!(
-                                        "Reload conversation: {e}"
-                                    )));
-                                }
+                if let Some(conv_id) = conv_id
+                    && let Some(client) = client_ref.borrow().clone()
+                {
+                    let tx = bridge_ref.ui_sender();
+                    bridge_ref.spawn(async move {
+                        match client.get_conversation(&conv_id).await {
+                            Ok(detail) => {
+                                let _ = tx.send(UiMessage::ConversationLoaded(detail));
                             }
-                        });
-                    }
+                            Err(e) => {
+                                let _ =
+                                    tx.send(UiMessage::Error(format!("Reload conversation: {e}")));
+                            }
+                        }
+                    });
                 }
+            });
+        }
+
+        // Tasks panel: toolbar wiring (#19).
+        //
+        // `Cancel` sends `CancelBackgroundTask` over WS; `Open Conversation`
+        // routes the user back to the Conversations stack page and loads the
+        // task's conversation so the streaming output keeps flowing into the
+        // chat view.
+        {
+            let client_ref = Rc::clone(&client);
+            let bridge_ref = Rc::clone(&bridge);
+            tasks_panel.connect_cancel(move |task_id| {
+                let Some(transport) = client_ref.borrow().clone() else {
+                    return;
+                };
+                let tx = bridge_ref.ui_sender();
+                bridge_ref.spawn(async move {
+                    let Some(ws) = transport.as_ws() else {
+                        let _ = tx.send(UiMessage::Error(
+                            "Background tasks require the WebSocket transport".to_string(),
+                        ));
+                        return;
+                    };
+                    if let Err(e) = ws
+                        .send_command(api::Command::CancelBackgroundTask { id: task_id })
+                        .await
+                    {
+                        let _ = tx.send(UiMessage::Error(format!("Cancel task: {e}")));
+                    }
+                });
+            });
+        }
+
+        {
+            let client_ref = Rc::clone(&client);
+            let bridge_ref = Rc::clone(&bridge);
+            let stack_ref = Rc::clone(&stack);
+            tasks_panel.connect_open_conversation(move |conv_id| {
+                stack_ref.set_visible_child_name("conversations");
+                let Some(transport) = client_ref.borrow().clone() else {
+                    return;
+                };
+                let tx = bridge_ref.ui_sender();
+                bridge_ref.spawn(async move {
+                    match transport.get_conversation(&conv_id).await {
+                        Ok(detail) => {
+                            let _ = tx.send(UiMessage::ConversationLoaded(detail));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(UiMessage::Error(format!("Load conversation: {e}")));
+                        }
+                    }
+                });
             });
         }
 
@@ -642,6 +722,17 @@ impl AdelieWindow {
     }
 }
 
+/// Current wall-clock time in epoch milliseconds. Centralized so the
+/// task-panel callers all use the same units as `TaskView.started_at`.
+fn now_epoch_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_ui_message(
     msg: UiMessage,
     state: &Rc<RefCell<WindowState>>,
@@ -651,6 +742,7 @@ fn handle_ui_message(
     client: &Rc<RefCell<Option<Arc<TransportClient>>>>,
     input_bar: &Rc<InputBar>,
     model_picker: &Rc<ModelPicker>,
+    tasks_panel: &Rc<TasksPanel>,
     ui_tx: &mpsc::UnboundedSender<UiMessage>,
 ) {
     match msg {
@@ -809,6 +901,25 @@ fn handle_ui_message(
             status_label.set_text(&label);
             input_bar.send_button.set_sensitive(true);
         }
+        UiMessage::TasksLoaded(tasks) => {
+            tasks_panel.replace_all(tasks, now_epoch_ms());
+        }
+        UiMessage::TaskStarted(task) => {
+            tasks_panel.handle_task_started(task, now_epoch_ms());
+        }
+        UiMessage::TaskProgress { id, progress_hint } => {
+            tasks_panel.handle_task_progress(id, progress_hint, now_epoch_ms());
+        }
+        UiMessage::TaskLogAppended { id, entry } => {
+            tasks_panel.handle_task_log_appended(id, entry);
+        }
+        UiMessage::TaskCompleted {
+            id,
+            status,
+            last_error,
+        } => {
+            tasks_panel.handle_task_completed(id, status, last_error, now_epoch_ms());
+        }
         UiMessage::Disconnected { reason } => {
             *client.borrow_mut() = None;
             input_bar.send_button.set_sensitive(false);
@@ -854,12 +965,12 @@ fn ensure_active_conversation(
         let s = state.borrow();
 
         // Already-active and still present → just sync the sidebar selection.
-        if let Some(active_id) = s.current_conversation_id.as_deref() {
-            if let Some(idx) = s.conversations.iter().position(|c| c.id == active_id) {
-                drop(s);
-                sidebar.select_index(idx);
-                return;
-            }
+        if let Some(active_id) = s.current_conversation_id.as_deref()
+            && let Some(idx) = s.conversations.iter().position(|c| c.id == active_id)
+        {
+            drop(s);
+            sidebar.select_index(idx);
+            return;
         }
 
         match s.conversations.first() {
@@ -902,9 +1013,7 @@ fn ensure_active_conversation(
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(UiMessage::Error(format!(
-                            "Auto-create conversation: {e}"
-                        )));
+                        let _ = tx.send(UiMessage::Error(format!("Auto-create conversation: {e}")));
                     }
                 }
             });
@@ -924,10 +1033,7 @@ pub fn install_app_icon() {
     let cache_root = dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("adele-gtk-icons");
-    let icon_dir = cache_root
-        .join("hicolor")
-        .join("512x512")
-        .join("apps");
+    let icon_dir = cache_root.join("hicolor").join("512x512").join("apps");
     let icon_path = icon_dir.join(format!("{ICON_NAME}.png"));
 
     if let Err(e) = std::fs::create_dir_all(&icon_dir) {
