@@ -914,12 +914,8 @@ fn handle_ui_message(
         UiMessage::TaskLogAppended { id, entry } => {
             tasks_panel.handle_task_log_appended(id, entry);
         }
-        UiMessage::TaskCompleted {
-            id,
-            status,
-            last_error,
-        } => {
-            tasks_panel.handle_task_completed(id, status, last_error, now_epoch_ms());
+        UiMessage::TaskCompleted { id } => {
+            tasks_panel.handle_task_completed(id, now_epoch_ms());
         }
         UiMessage::Disconnected { reason } => {
             *client.borrow_mut() = None;

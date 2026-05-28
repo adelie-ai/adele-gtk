@@ -194,20 +194,15 @@ impl TasksModel {
         self.logs.get(id).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// Apply a `TaskCompleted` event to the matching task.
-    pub fn apply_completion(
-        &mut self,
-        id: &str,
-        status: api::TaskStatus,
-        last_error: Option<String>,
-        ended_at: i64,
-    ) {
+    /// Remove the matching task from the model on a `TaskCompleted`
+    /// event. The associated log buffer is dropped too; the daemon
+    /// already filters terminal rows out of subsequent snapshots, so
+    /// retaining them would only let the panel accumulate stale rows.
+    pub fn apply_completion(&mut self, id: &str) {
         if let Some(idx) = self.position_of(id) {
-            let t = &mut self.tasks[idx];
-            t.status = status;
-            t.last_error = last_error;
-            t.ended_at = Some(ended_at);
+            self.tasks.remove(idx);
         }
+        self.logs.remove(id);
     }
 }
 
@@ -447,16 +442,8 @@ impl TasksPanel {
     }
 
     /// Apply a `UiMessage::TaskCompleted` event.
-    pub fn handle_task_completed(
-        &self,
-        id: String,
-        status: api::TaskStatus,
-        last_error: Option<String>,
-        now_ms: i64,
-    ) {
-        self.model
-            .borrow_mut()
-            .apply_completion(&id, status, last_error, now_ms);
+    pub fn handle_task_completed(&self, id: String, now_ms: i64) {
+        self.model.borrow_mut().apply_completion(&id);
         self.refresh_rows(now_ms);
     }
 
@@ -719,7 +706,7 @@ mod tests {
     fn apply_completion_removes_task_from_list() {
         let mut model = TasksModel::new();
         model.upsert(running_task("t-end", "c"));
-        model.apply_completion("t-end", api::TaskStatus::Failed, Some("boom".into()), 1);
+        model.apply_completion("t-end");
         assert_eq!(model.len(), 0);
         assert!(model.position_of("t-end").is_none());
     }
@@ -730,7 +717,7 @@ mod tests {
         model.upsert(running_task("t-end", "c"));
         model.append_log("t-end", log_entry(1, "hello"));
         model.append_log("t-end", log_entry(2, "world"));
-        model.apply_completion("t-end", api::TaskStatus::Completed, None, 1);
+        model.apply_completion("t-end");
         assert!(model.logs_for("t-end").is_empty());
     }
 
@@ -738,7 +725,7 @@ mod tests {
     fn apply_completion_for_unknown_id_is_noop() {
         let mut model = TasksModel::new();
         model.upsert(running_task("t-1", "c"));
-        model.apply_completion("missing", api::TaskStatus::Completed, None, 1);
+        model.apply_completion("missing");
         assert_eq!(model.len(), 1);
     }
 
@@ -747,7 +734,7 @@ mod tests {
         let mut model = TasksModel::new();
         model.upsert(running_task("keep", "c1"));
         model.upsert(running_task("drop", "c2"));
-        model.apply_completion("drop", api::TaskStatus::Completed, None, 1);
+        model.apply_completion("drop");
         assert_eq!(model.len(), 1);
         assert_eq!(model.get(0).unwrap().id.0, "keep");
     }

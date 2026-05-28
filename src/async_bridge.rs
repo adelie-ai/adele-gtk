@@ -99,8 +99,6 @@ pub enum UiMessage {
     },
     TaskCompleted {
         id: String,
-        status: api::TaskStatus,
-        last_error: Option<String>,
     },
 }
 
@@ -341,15 +339,7 @@ fn signal_to_ui_message(signal: SignalEvent) -> UiMessage {
             UiMessage::TaskProgress { id, progress_hint }
         }
         SignalEvent::TaskLogAppended { id, entry } => UiMessage::TaskLogAppended { id, entry },
-        SignalEvent::TaskCompleted {
-            id,
-            status,
-            last_error,
-        } => UiMessage::TaskCompleted {
-            id,
-            status,
-            last_error,
-        },
+        SignalEvent::TaskCompleted { id, .. } => UiMessage::TaskCompleted { id },
         SignalEvent::Disconnected { reason } => UiMessage::Disconnected { reason },
     }
 }
@@ -428,16 +418,14 @@ mod tests {
     #[test]
     fn signal_task_completed_routes_id_only() {
         // Terminal-row eviction means the panel only needs the id —
-        // status / last_error are not displayed once the row is gone.
-        // (Test still destructures the legacy fields here because the
-        // impl commit is the one that drops them from the message shape.)
+        // status / last_error are dropped at the routing boundary.
         let msg = signal_to_ui_message(SignalEvent::TaskCompleted {
             id: "task-1".to_string(),
             status: api::TaskStatus::Failed,
             last_error: Some("boom".to_string()),
         });
         match msg {
-            UiMessage::TaskCompleted { id, .. } => {
+            UiMessage::TaskCompleted { id } => {
                 assert_eq!(id, "task-1");
             }
             other => panic!("expected TaskCompleted, got {other:?}"),
