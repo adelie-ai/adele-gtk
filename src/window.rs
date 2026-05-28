@@ -551,8 +551,8 @@ impl AdelieWindow {
                             _ => client.send_prompt(&conv_id, &text).await,
                         };
                         match result {
-                            Ok(request_id) => {
-                                let _ = tx.send(UiMessage::PromptSent { request_id });
+                            Ok(task_id) => {
+                                let _ = tx.send(UiMessage::PromptSent { task_id });
                             }
                             Err(e) => {
                                 let _ = tx.send(UiMessage::Error(format!("Send error: {e}")));
@@ -792,14 +792,15 @@ fn handle_ui_message(
             drop(s);
             sidebar.set_conversations(&convs);
         }
-        UiMessage::PromptSent { request_id } => {
+        UiMessage::PromptSent { task_id: _ } => {
+            // The wire ack carries either a `task_id` (post-#114
+            // `SendMessageAck`) or an empty string (legacy `Ack`). Neither
+            // is the chunk-stream `request_id` — that is daemon-generated
+            // and arrives inside the first `AssistantDelta`. Use the
+            // sentinel until then; `StreamChunk` claims it on first frame.
+            // See issue #31.
             let mut s = state.borrow_mut();
-            if request_id.is_empty() {
-                // WS doesn't return request ID upfront; use a sentinel.
-                s.pending_request_id = Some("__pending__".to_string());
-            } else {
-                s.pending_request_id = Some(request_id);
-            }
+            s.pending_request_id = Some("__pending__".to_string());
             s.streaming_buffer.clear();
         }
         UiMessage::AssistantStatus {
