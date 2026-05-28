@@ -58,8 +58,12 @@ pub enum UiMessage {
         conversation_id: String,
         title: String,
     },
+    /// The wire ack carries a `task_id` (post-#114 `SendMessageAck`) or an
+    /// empty string (legacy `Ack`). It is NOT the chunk-stream
+    /// `request_id` — that is server-generated and arrives embedded in
+    /// the first `AssistantDelta`. See issue #31.
     PromptSent {
-        request_id: String,
+        task_id: String,
     },
     /// Available (connection, model) pairs, fetched once on connect.
     /// Empty list means the picker should hide (e.g. D-Bus transport).
