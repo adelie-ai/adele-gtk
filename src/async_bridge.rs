@@ -426,21 +426,19 @@ mod tests {
     }
 
     #[test]
-    fn signal_task_completed_routes_with_status_and_last_error() {
+    fn signal_task_completed_routes_id_only() {
+        // Terminal-row eviction means the panel only needs the id —
+        // status / last_error are not displayed once the row is gone.
+        // (Test still destructures the legacy fields here because the
+        // impl commit is the one that drops them from the message shape.)
         let msg = signal_to_ui_message(SignalEvent::TaskCompleted {
             id: "task-1".to_string(),
             status: api::TaskStatus::Failed,
             last_error: Some("boom".to_string()),
         });
         match msg {
-            UiMessage::TaskCompleted {
-                id,
-                status,
-                last_error,
-            } => {
+            UiMessage::TaskCompleted { id, .. } => {
                 assert_eq!(id, "task-1");
-                assert!(matches!(status, api::TaskStatus::Failed));
-                assert_eq!(last_error.as_deref(), Some("boom"));
             }
             other => panic!("expected TaskCompleted, got {other:?}"),
         }

@@ -716,19 +716,40 @@ mod tests {
     }
 
     #[test]
-    fn apply_completion_transitions_status() {
+    fn apply_completion_removes_task_from_list() {
         let mut model = TasksModel::new();
         model.upsert(running_task("t-end", "c"));
-        model.apply_completion(
-            "t-end",
-            api::TaskStatus::Failed,
-            Some("boom".into()),
-            1_700_000_999_000,
-        );
-        let t = model.get(0).unwrap();
-        assert_eq!(t.status, api::TaskStatus::Failed);
-        assert_eq!(t.last_error.as_deref(), Some("boom"));
-        assert_eq!(t.ended_at, Some(1_700_000_999_000));
+        model.apply_completion("t-end", api::TaskStatus::Failed, Some("boom".into()), 1);
+        assert_eq!(model.len(), 0);
+        assert!(model.position_of("t-end").is_none());
+    }
+
+    #[test]
+    fn apply_completion_drops_log_buffer() {
+        let mut model = TasksModel::new();
+        model.upsert(running_task("t-end", "c"));
+        model.append_log("t-end", log_entry(1, "hello"));
+        model.append_log("t-end", log_entry(2, "world"));
+        model.apply_completion("t-end", api::TaskStatus::Completed, None, 1);
+        assert!(model.logs_for("t-end").is_empty());
+    }
+
+    #[test]
+    fn apply_completion_for_unknown_id_is_noop() {
+        let mut model = TasksModel::new();
+        model.upsert(running_task("t-1", "c"));
+        model.apply_completion("missing", api::TaskStatus::Completed, None, 1);
+        assert_eq!(model.len(), 1);
+    }
+
+    #[test]
+    fn apply_completion_leaves_other_tasks_alone() {
+        let mut model = TasksModel::new();
+        model.upsert(running_task("keep", "c1"));
+        model.upsert(running_task("drop", "c2"));
+        model.apply_completion("drop", api::TaskStatus::Completed, None, 1);
+        assert_eq!(model.len(), 1);
+        assert_eq!(model.get(0).unwrap().id.0, "keep");
     }
 
     #[test]
