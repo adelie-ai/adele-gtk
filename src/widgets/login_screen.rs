@@ -60,10 +60,9 @@ impl LoginScreen {
             .create_new(true)
             .open(&icon_path)
             .and_then(|mut f| std::io::Write::write_all(&mut f, ICON_BYTES))
+            && e.kind() != std::io::ErrorKind::AlreadyExists
         {
-            if e.kind() != std::io::ErrorKind::AlreadyExists {
-                tracing::warn!("Failed to write brand icon: {e}");
-            }
+            tracing::warn!("Failed to write brand icon: {e}");
         }
         let icon = Image::from_file(icon_path.to_str().unwrap_or_default());
         icon.set_pixel_size(56);
@@ -122,6 +121,9 @@ impl LoginScreen {
 
         // Use a shared flag so `populate` can schedule itself after a popover closes.
         // The Rc<dyn Fn()> is built in two steps because the closure references itself.
+        // Narrow allow: this self-referential closure cell is a one-off local; a
+        // `type` alias would not reduce cognitive load and is out of scope here.
+        #[allow(clippy::type_complexity)]
         let populate: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
 
         {
@@ -263,10 +265,10 @@ impl LoginScreen {
                 }
 
                 // Select first row if any
-                if !profs.is_empty() {
-                    if let Some(first_row) = list_box.row_at_index(0) {
-                        list_box.select_row(Some(&first_row));
-                    }
+                if !profs.is_empty()
+                    && let Some(first_row) = list_box.row_at_index(0)
+                {
+                    list_box.select_row(Some(&first_row));
                 }
             });
 
@@ -412,52 +414,50 @@ pub async fn connect_to_profile(
     let has_password = discovery.methods.contains(&"password".to_string());
 
     // Try OIDC first if available
-    if has_oidc {
-        if let Some(ref oidc) = discovery.oidc {
-            // Try silent refresh first
-            if let Ok(Some(refresh_token)) = CredentialStore::get_refresh_token(&profile.id) {
-                tracing::info!("attempting silent token refresh");
-                match oauth::refresh_access_token(oidc, &refresh_token).await {
-                    Ok(tokens) => {
-                        // Store new refresh token if provided
-                        if let Some(ref new_refresh) = tokens.refresh_token {
-                            let _ = CredentialStore::store_refresh_token(&profile.id, new_refresh);
-                        }
-                        return Ok(ConnectionConfig {
-                            transport_mode: TransportMode::Ws,
-                            ws_url: ws_url.clone(),
-                            ws_jwt: Some(tokens.access_token),
-                            ws_login_username: None,
-                            ws_login_password: None,
-                            ws_subject: ws_subject.clone(),
-                            ..Default::default()
-                        });
+    if has_oidc && let Some(ref oidc) = discovery.oidc {
+        // Try silent refresh first
+        if let Ok(Some(refresh_token)) = CredentialStore::get_refresh_token(&profile.id) {
+            tracing::info!("attempting silent token refresh");
+            match oauth::refresh_access_token(oidc, &refresh_token).await {
+                Ok(tokens) => {
+                    // Store new refresh token if provided
+                    if let Some(ref new_refresh) = tokens.refresh_token {
+                        let _ = CredentialStore::store_refresh_token(&profile.id, new_refresh);
                     }
-                    Err(e) => {
-                        tracing::info!("silent refresh failed, will try browser flow: {e}");
-                    }
+                    return Ok(ConnectionConfig {
+                        transport_mode: TransportMode::Ws,
+                        ws_url: ws_url.clone(),
+                        ws_jwt: Some(tokens.access_token),
+                        ws_login_username: None,
+                        ws_login_password: None,
+                        ws_subject: ws_subject.clone(),
+                        ..Default::default()
+                    });
+                }
+                Err(e) => {
+                    tracing::info!("silent refresh failed, will try browser flow: {e}");
                 }
             }
-
-            // Full browser OAuth flow
-            tracing::info!("starting browser OAuth flow");
-            let tokens = oauth::run_oauth_flow(oidc).await?;
-
-            // Store refresh token for next time
-            if let Some(ref refresh_token) = tokens.refresh_token {
-                let _ = CredentialStore::store_refresh_token(&profile.id, refresh_token);
-            }
-
-            return Ok(ConnectionConfig {
-                transport_mode: TransportMode::Ws,
-                ws_url: ws_url.clone(),
-                ws_jwt: Some(tokens.access_token),
-                ws_login_username: None,
-                ws_login_password: None,
-                ws_subject: ws_subject.clone(),
-                ..Default::default()
-            });
         }
+
+        // Full browser OAuth flow
+        tracing::info!("starting browser OAuth flow");
+        let tokens = oauth::run_oauth_flow(oidc).await?;
+
+        // Store refresh token for next time
+        if let Some(ref refresh_token) = tokens.refresh_token {
+            let _ = CredentialStore::store_refresh_token(&profile.id, refresh_token);
+        }
+
+        return Ok(ConnectionConfig {
+            transport_mode: TransportMode::Ws,
+            ws_url: ws_url.clone(),
+            ws_jwt: Some(tokens.access_token),
+            ws_login_username: None,
+            ws_login_password: None,
+            ws_subject: ws_subject.clone(),
+            ..Default::default()
+        });
     }
 
     // Fall back to password auth

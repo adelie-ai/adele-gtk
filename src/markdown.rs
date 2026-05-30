@@ -92,14 +92,14 @@ pub fn render_messages_html(
         ));
     }
 
-    if let Some(buffer) = streaming_buffer {
-        if !buffer.is_empty() {
-            let content_html = markdown_to_html(buffer);
-            let avatar_html = avatar_img(&avatars.adele, "Adele");
-            html.push_str(&format!(
+    if let Some(buffer) = streaming_buffer
+        && !buffer.is_empty()
+    {
+        let content_html = markdown_to_html(buffer);
+        let avatar_html = avatar_img(&avatars.adele, "Adele");
+        html.push_str(&format!(
                 r#"<div class="message assistant-message streaming">{avatar_html}<div class="bubble"><div class="label">Adele</div><div class="content">{content_html}<span class="cursor">▌</span></div></div></div>"#
             ));
-        }
     }
 
     html
@@ -488,8 +488,14 @@ mod tests {
         // ammonia, which keeps <img> with a safe src — what must vanish is
         // the executable event handler.
         let html = markdown_to_html("before <img src=x onerror=\"alert(1)\"> after");
-        assert!(html.contains("before"), "leading text must survive: {html:?}");
-        assert!(html.contains("after"), "trailing text must survive: {html:?}");
+        assert!(
+            html.contains("before"),
+            "leading text must survive: {html:?}"
+        );
+        assert!(
+            html.contains("after"),
+            "trailing text must survive: {html:?}"
+        );
         assert!(
             !html.to_ascii_lowercase().contains("onerror"),
             "onerror handler must never appear in output: {html:?}"
@@ -511,8 +517,14 @@ mod tests {
             !html.to_ascii_lowercase().contains("javascript:"),
             "javascript: URIs must be stripped: {html:?}"
         );
-        assert!(html.contains("click"), "surrounding text must survive: {html:?}");
-        assert!(html.contains("now"), "surrounding text must survive: {html:?}");
+        assert!(
+            html.contains("click"),
+            "surrounding text must survive: {html:?}"
+        );
+        assert!(
+            html.contains("now"),
+            "surrounding text must survive: {html:?}"
+        );
         assert!(html.contains("me"), "link text must survive: {html:?}");
     }
 
@@ -523,19 +535,37 @@ mod tests {
                   > quoted\n\n\
                   [link](https://example.com)";
         let html = markdown_to_html(md);
-        assert!(html.contains("<h1>Heading</h1>"), "headings render: {html:?}");
-        assert!(html.contains("<strong>bold</strong>"), "bold renders: {html:?}");
+        assert!(
+            html.contains("<h1>Heading</h1>"),
+            "headings render: {html:?}"
+        );
+        assert!(
+            html.contains("<strong>bold</strong>"),
+            "bold renders: {html:?}"
+        );
         assert!(html.contains("<em>italic</em>"), "italic renders: {html:?}");
-        assert!(html.contains("<code>code</code>"), "inline code renders: {html:?}");
-        assert!(html.contains("<ul>") && html.contains("<li>item 1</li>"), "lists render: {html:?}");
-        assert!(html.contains("<blockquote>"), "blockquotes render: {html:?}");
+        assert!(
+            html.contains("<code>code</code>"),
+            "inline code renders: {html:?}"
+        );
+        assert!(
+            html.contains("<ul>") && html.contains("<li>item 1</li>"),
+            "lists render: {html:?}"
+        );
+        assert!(
+            html.contains("<blockquote>"),
+            "blockquotes render: {html:?}"
+        );
         // ammonia adds rel="noopener noreferrer" to <a> tags, so assert
         // the load-bearing attributes/text rather than the full tag string.
         assert!(
             html.contains(r#"href="https://example.com""#),
             "markdown link href renders: {html:?}"
         );
-        assert!(html.contains(">link</a>"), "markdown link text renders: {html:?}");
+        assert!(
+            html.contains(">link</a>"),
+            "markdown link text renders: {html:?}"
+        );
     }
 
     #[test]
@@ -546,8 +576,12 @@ mod tests {
             .find("Content-Security-Policy")
             .expect("template has CSP meta tag");
         let after = &template[csp_start..];
-        let content_start = after.find("content=\"").expect("CSP has content attr") + "content=\"".len();
-        let content_end = content_start + after[content_start..].find('"').expect("CSP content closes");
+        let content_start =
+            after.find("content=\"").expect("CSP has content attr") + "content=\"".len();
+        let content_end = content_start
+            + after[content_start..]
+                .find('"')
+                .expect("CSP content closes");
         let csp = &after[content_start..content_end];
 
         // Find the script-src directive specifically.
@@ -578,7 +612,9 @@ mod tests {
         // If they drift, the WebView silently refuses to run the script and the
         // chat UI stops updating — this test pins them together.
         let template = html_template();
-        let script_open = template.find("<script>").expect("template has inline script");
+        let script_open = template
+            .find("<script>")
+            .expect("template has inline script");
         let body_start = script_open + "<script>".len();
         let body_end = body_start
             + template[body_start..]

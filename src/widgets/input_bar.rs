@@ -55,6 +55,10 @@ impl InputBar {
     }
 
     /// Get the current text content without clearing.
+    // Read-only counterpart to `take_text` (which is used). Part of the public
+    // InputBar API; not yet called from `window.rs` but kept for the input-bar
+    // consumers added by the connections/model-selector work (#1).
+    #[allow(dead_code)]
     pub fn text(&self) -> String {
         let buffer = self.text_view.buffer();
         buffer

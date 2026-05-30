@@ -63,6 +63,11 @@ pub enum UiMessage {
     /// `request_id` — that is server-generated and arrives embedded in
     /// the first `AssistantDelta`. See issue #31.
     PromptSent {
+        // Staged for streaming-chunk correlation (#31): consumer currently
+        // ignores it (`PromptSent { task_id: _ }`), but the ack value is kept
+        // on the message so the streaming work can correlate without a wire
+        // change. See the variant doc above and issues #114/#31.
+        #[allow(dead_code)]
         task_id: String,
     },
     /// Available (connection, model) pairs, fetched once on connect.
