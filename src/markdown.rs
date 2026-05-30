@@ -92,14 +92,14 @@ pub fn render_messages_html(
         ));
     }
 
-    if let Some(buffer) = streaming_buffer {
-        if !buffer.is_empty() {
-            let content_html = markdown_to_html(buffer);
-            let avatar_html = avatar_img(&avatars.adele, "Adele");
-            html.push_str(&format!(
+    if let Some(buffer) = streaming_buffer
+        && !buffer.is_empty()
+    {
+        let content_html = markdown_to_html(buffer);
+        let avatar_html = avatar_img(&avatars.adele, "Adele");
+        html.push_str(&format!(
                 r#"<div class="message assistant-message streaming">{avatar_html}<div class="bubble"><div class="label">Adele</div><div class="content">{content_html}<span class="cursor">▌</span></div></div></div>"#
             ));
-        }
     }
 
     html

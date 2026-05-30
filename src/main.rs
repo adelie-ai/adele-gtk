@@ -1,3 +1,12 @@
+//! adele-gtk — the GTK4 desktop client for the Adele assistant.
+//!
+//! Renders the chat UI and talks to the `desktop-assistant` daemon over the
+//! transport provided by `desktop-assistant-client-common` (D-Bus on Linux,
+//! or a direct WebSocket/UDS connection). The GTK widget tree lives in
+//! [`widgets`] and [`window`]; daemon I/O runs on a Tokio runtime and is
+//! marshalled back onto the GTK main loop via [`async_bridge`]. Credentials
+//! and OAuth/OIDC login are handled by [`credential_store`] and [`oauth`].
+
 mod async_bridge;
 mod avatars;
 mod credential_store;

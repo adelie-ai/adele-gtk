@@ -144,7 +144,8 @@ pub fn show_select_models_dialog<F>(
         let chosen: Vec<SelectedModel> = checks_ref
             .borrow()
             .iter()
-            .filter_map(|(model, check)| check.is_active().then(|| model.clone()))
+            .filter(|&(_model, check)| check.is_active())
+            .map(|(model, _check)| model.clone())
             .collect();
         dialog_ref.close();
         on_save(chosen);
