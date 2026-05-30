@@ -2,13 +2,39 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Transport-specific connection settings for a profile.
+///
+/// Tagged on a `kind` field so the on-disk JSON is self-describing:
+/// `{"kind":"local"}` or `{"kind":"websocket","url":...,"subject":...}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ProtocolConfig {
+    /// Local Unix domain socket. A `None` path uses the daemon's default
+    /// socket (`$XDG_RUNTIME_DIR/adelie/sock`).
+    Local {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
+    },
+    /// WebSocket endpoint (local or remote).
+    Websocket {
+        url: String,
+        #[serde(default = "default_ws_subject")]
+        subject: String,
+    },
+}
+
+impl Default for ProtocolConfig {
+    fn default() -> Self {
+        // New connections default to the local socket.
+        ProtocolConfig::Local { path: None }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectionProfile {
     pub id: String,
     pub name: String,
-    pub ws_url: String,
-    #[serde(default = "default_ws_subject")]
-    pub ws_subject: String,
+    pub protocol: ProtocolConfig,
 }
 
 fn default_ws_subject() -> String {
@@ -47,9 +73,22 @@ impl ProfileStore {
         }
         let data = std::fs::read_to_string(&self.path)
             .with_context(|| format!("reading {}", self.path.display()))?;
-        let file: ProfilesFile =
-            serde_json::from_str(&data).with_context(|| "parsing profiles.json")?;
-        Ok(file.profiles)
+        // No schema migration (#33): a profiles.json written by an older build
+        // (the flat `ws_url`/`ws_subject` shape) lacks the `protocol` field and
+        // won't parse into the tagged shape. Treat an unparseable file as "no
+        // profiles" so the user just re-creates their connections instead of
+        // the app erroring on startup. Mirrors `LastConnectionStore::get`'s
+        // existing corrupt-file tolerance.
+        match serde_json::from_str::<ProfilesFile>(&data) {
+            Ok(file) => Ok(file.profiles),
+            Err(e) => {
+                tracing::warn!(
+                    "ignoring unparseable {} ({e}); starting with no profiles",
+                    self.path.display()
+                );
+                Ok(Vec::new())
+            }
+        }
     }
 
     pub fn save(&self, profiles: &[ConnectionProfile]) -> Result<()> {
@@ -162,8 +201,10 @@ mod tests {
         ConnectionProfile {
             id: id.to_string(),
             name: format!("name-{id}"),
-            ws_url: format!("ws://example.com/{id}"),
-            ws_subject: "desktop-tui".to_string(),
+            protocol: ProtocolConfig::Websocket {
+                url: format!("ws://example.com/{id}"),
+                subject: "desktop-tui".to_string(),
+            },
         }
     }
 
@@ -190,6 +231,61 @@ mod tests {
         let remaining = store.load().unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, "b");
+    }
+
+    #[test]
+    fn protocol_config_serializes_both_variants() {
+        let local = ProtocolConfig::Local {
+            path: Some(PathBuf::from("/run/user/1000/adelie/sock")),
+        };
+        let local_json = serde_json::to_string(&local).unwrap();
+        assert!(local_json.contains("\"kind\":\"local\""));
+        assert_eq!(
+            serde_json::from_str::<ProtocolConfig>(&local_json).unwrap(),
+            local
+        );
+
+        // Default Local omits the path entirely.
+        let default_local = ProtocolConfig::Local { path: None };
+        let json = serde_json::to_string(&default_local).unwrap();
+        assert_eq!(json, r#"{"kind":"local"}"#);
+        assert_eq!(
+            serde_json::from_str::<ProtocolConfig>(&json).unwrap(),
+            default_local
+        );
+
+        let ws = ProtocolConfig::Websocket {
+            url: "wss://host/ws".into(),
+            subject: "desktop-tui".into(),
+        };
+        let ws_json = serde_json::to_string(&ws).unwrap();
+        assert!(ws_json.contains("\"kind\":\"websocket\""));
+        assert_eq!(
+            serde_json::from_str::<ProtocolConfig>(&ws_json).unwrap(),
+            ws
+        );
+    }
+
+    #[test]
+    fn new_profile_protocol_defaults_to_local() {
+        assert_eq!(
+            ProtocolConfig::default(),
+            ProtocolConfig::Local { path: None }
+        );
+    }
+
+    #[test]
+    fn load_tolerates_legacy_unparseable_profiles() {
+        // The pre-#33 flat shape (ws_url/ws_subject, no `protocol`). With no
+        // migration, this must degrade to "no profiles", not an error.
+        let dir = TempDir::new("legacy-profiles");
+        let store = ProfileStore::with_dir(dir.path.clone());
+        std::fs::write(
+            dir.path.join("profiles.json"),
+            r#"{"profiles":[{"id":"1","name":"old","ws_url":"ws://x","ws_subject":"s"}]}"#,
+        )
+        .unwrap();
+        assert!(store.load().unwrap().is_empty());
     }
 
     #[test]

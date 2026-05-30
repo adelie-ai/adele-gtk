@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use desktop_assistant_api_model as api;
 use desktop_assistant_client_common::SignalEvent;
 use desktop_assistant_client_common::{
-    AssistantClient, ConnectionConfig, TransportClient, connect_transport,
+    AssistantClient, AssistantCommands, ConnectionConfig, TransportClient, connect_transport,
     transport::transport_label,
 };
 use gtk4::glib;

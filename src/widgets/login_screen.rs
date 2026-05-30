@@ -10,7 +10,7 @@ use gtk4::{
 use crate::async_bridge;
 use crate::credential_store::CredentialStore;
 use crate::oauth;
-use crate::profile::{ConnectionProfile, LastConnectionStore, ProfileStore};
+use crate::profile::{ConnectionProfile, LastConnectionStore, ProfileStore, ProtocolConfig};
 use crate::widgets::setup_dialog;
 use crate::window;
 
@@ -156,7 +156,14 @@ impl LoginScreen {
                     name_label.set_hexpand(true);
                     hbox.append(&name_label);
 
-                    let url_label = Label::new(Some(&profile.ws_url));
+                    let detail = match &profile.protocol {
+                        ProtocolConfig::Local { path: Some(p) } => {
+                            format!("local · {}", p.display())
+                        }
+                        ProtocolConfig::Local { path: None } => "Local socket".to_string(),
+                        ProtocolConfig::Websocket { url, .. } => url.clone(),
+                    };
+                    let url_label = Label::new(Some(&detail));
                     url_label.add_css_class("dim-label");
                     url_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
                     url_label.set_max_width_chars(30);
@@ -372,10 +379,25 @@ pub async fn connect_to_profile(
 ) -> anyhow::Result<desktop_assistant_client_common::ConnectionConfig> {
     use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
 
+    // Local socket: skip auth discovery entirely. The bearer token is minted
+    // locally (via D-Bus) inside `connect_transport`, so we just hand back a
+    // UDS config and let it dial `$XDG_RUNTIME_DIR/adelie/sock` (or the
+    // explicit path).
+    let (ws_url, ws_subject) = match &profile.protocol {
+        ProtocolConfig::Local { path } => {
+            return Ok(ConnectionConfig {
+                transport_mode: TransportMode::Uds,
+                socket_path: path.clone(),
+                ..Default::default()
+            });
+        }
+        ProtocolConfig::Websocket { url, subject } => (url.clone(), subject.clone()),
+    };
+
     // Try to discover auth config from server
     let ca_cert = desktop_assistant_client_common::config::default_ca_cert_path();
     let ca_cert_ref = ca_cert.as_path();
-    let discovery = match oauth::discover_auth_config(&profile.ws_url, Some(ca_cert_ref)).await {
+    let discovery = match oauth::discover_auth_config(&ws_url, Some(ca_cert_ref)).await {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!("auth discovery failed, assuming password-only: {e}");
@@ -403,11 +425,11 @@ pub async fn connect_to_profile(
                         }
                         return Ok(ConnectionConfig {
                             transport_mode: TransportMode::Ws,
-                            ws_url: profile.ws_url.clone(),
+                            ws_url: ws_url.clone(),
                             ws_jwt: Some(tokens.access_token),
                             ws_login_username: None,
                             ws_login_password: None,
-                            ws_subject: profile.ws_subject.clone(),
+                            ws_subject: ws_subject.clone(),
                             ..Default::default()
                         });
                     }
@@ -428,11 +450,11 @@ pub async fn connect_to_profile(
 
             return Ok(ConnectionConfig {
                 transport_mode: TransportMode::Ws,
-                ws_url: profile.ws_url.clone(),
+                ws_url: ws_url.clone(),
                 ws_jwt: Some(tokens.access_token),
                 ws_login_username: None,
                 ws_login_password: None,
-                ws_subject: profile.ws_subject.clone(),
+                ws_subject: ws_subject.clone(),
                 ..Default::default()
             });
         }
@@ -447,11 +469,11 @@ pub async fn connect_to_profile(
 
         return Ok(ConnectionConfig {
             transport_mode: TransportMode::Ws,
-            ws_url: profile.ws_url.clone(),
+            ws_url: ws_url.clone(),
             ws_jwt: None,
             ws_login_username: username,
             ws_login_password: password,
-            ws_subject: profile.ws_subject.clone(),
+            ws_subject: ws_subject.clone(),
             ..Default::default()
         });
     }

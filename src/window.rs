@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_client_common::{
-    AssistantClient, ChatMessage, ConnectionConfig, ConversationDetail, ConversationSummary,
-    TransportClient,
+    AssistantClient, AssistantCommands, ChatMessage, ConnectionConfig, ConversationDetail,
+    ConversationSummary, TransportClient,
 };
 use gtk4::prelude::*;
 use gtk4::{
