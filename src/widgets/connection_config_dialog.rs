@@ -37,6 +37,11 @@ impl ConnectorType {
         }
     }
 
+    /// Inverse of [`Self::from_slug`]. Only exercised by the round-trip
+    /// test today (the daemon supplies connector-type strings directly),
+    /// so it's gated to test builds to avoid a dead-code warning while
+    /// keeping the round-trip assertion meaningful.
+    #[cfg(test)]
     pub fn slug(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",

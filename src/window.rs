@@ -15,6 +15,7 @@ use gtk4::{
 use tokio::sync::mpsc;
 
 use crate::async_bridge::{AsyncBridge, InternalMsg, UiMessage, connection_manager};
+use crate::management_client;
 use crate::widgets::chat_view::ChatView;
 use crate::widgets::input_bar::InputBar;
 use crate::widgets::model_picker::ModelPicker;
@@ -118,6 +119,11 @@ impl AdelieWindow {
         let menu_popover = Popover::new();
         menu_popover.add_css_class("context-popover");
         let menu_box = GtkBox::new(Orientation::Vertical, 0);
+
+        let settings_btn = Button::with_label("Settings");
+        settings_btn.add_css_class("context-button");
+        settings_btn.set_halign(Align::Fill);
+        menu_box.append(&settings_btn);
 
         let switch_conn_btn = Button::with_label("Switch Connection…");
         switch_conn_btn.add_css_class("context-button");
@@ -595,6 +601,51 @@ impl AdelieWindow {
                 popover_ref.popdown();
                 let login = crate::widgets::login_screen::LoginScreen::new(&app_ref);
                 login.present();
+            });
+        }
+
+        // Hamburger menu: Settings → Connections / Purposes tabs (#1). The
+        // dialog is WS-only (named-connection management isn't exposed over
+        // D-Bus); on a D-Bus transport we status-message and no-op — the
+        // header model picker is already hidden there.
+        {
+            let popover_ref = menu_popover.clone();
+            let window_ref = window.clone();
+            let client_ref = Rc::clone(&client);
+            let bridge_ref = Rc::clone(&bridge);
+            let status_label_ref = Rc::clone(&status_label);
+            settings_btn.connect_clicked(move |_| {
+                popover_ref.popdown();
+                let Some(transport) = client_ref.borrow().clone() else {
+                    status_label_ref.set_text("Not connected — settings unavailable");
+                    return;
+                };
+                if transport.as_ws().is_none() {
+                    status_label_ref
+                        .set_text("Settings require the WebSocket transport (unavailable on D-Bus)");
+                    return;
+                }
+                crate::widgets::settings_dialog::show_settings_dialog(
+                    &window_ref,
+                    Arc::clone(&transport),
+                    Rc::clone(&bridge_ref),
+                );
+                // The user may have added/removed connections; re-query the
+                // aggregated model list so the header picker reflects the new
+                // set. Fire-and-forget — errors are non-fatal. Runs once when
+                // Settings is opened (so it picks up the previous session's
+                // changes); the dialog itself keeps its own tabs in sync.
+                let tx = bridge_ref.ui_sender();
+                bridge_ref.spawn(async move {
+                    match management_client::list_available_models(&transport, None, false).await {
+                        Ok(listings) => {
+                            let _ = tx.send(UiMessage::ModelsLoaded(listings));
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to refresh models after settings: {e}");
+                        }
+                    }
+                });
             });
         }
 
