@@ -104,6 +104,22 @@ impl From<CliArgs> for ConnectionConfig {
     }
 }
 
+/// CLI connection overrides; `None` for a field means the flag was not given.
+struct CliConnectionOverride {
+    transport: Option<CliTransportMode>,
+    ws_url: Option<String>,
+    ws_subject: Option<String>,
+}
+
+/// Resolve the startup connection target. STUB — implemented after the
+/// failing-tests commit (#26).
+fn resolve_startup_target(
+    _cli: &CliConnectionOverride,
+    _last_active: Option<profile::ConnectionProfile>,
+) -> Option<profile::ConnectionProfile> {
+    None
+}
+
 fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -171,4 +187,90 @@ fn last_active_profile() -> Option<profile::ConnectionProfile> {
     let id = LastConnectionStore::new().get()?;
     let profiles = ProfileStore::new().load().ok()?;
     profiles.into_iter().find(|p| p.id == id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::{ConnectionProfile, ProtocolConfig, default_ws_subject};
+
+    fn ws_profile(id: &str, url: &str) -> ConnectionProfile {
+        ConnectionProfile {
+            id: id.to_string(),
+            name: format!("name-{id}"),
+            protocol: ProtocolConfig::Websocket {
+                url: url.to_string(),
+                subject: default_ws_subject(),
+            },
+        }
+    }
+
+    #[test]
+    fn cli_ws_url_override_changes_default_profile_target() {
+        let cli = CliConnectionOverride {
+            transport: None,
+            ws_url: Some("wss://remote/ws".to_string()),
+            ws_subject: None,
+        };
+        let last_active = Some(ws_profile("saved", "ws://127.0.0.1:11339/ws"));
+        let target = resolve_startup_target(&cli, last_active).expect("expected override target");
+        match target.protocol {
+            ProtocolConfig::Websocket { url, subject } => {
+                assert_eq!(url, "wss://remote/ws");
+                assert_eq!(subject, default_ws_subject());
+            }
+            other => panic!("expected websocket override, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_ws_url_override_applies_custom_subject() {
+        let cli = CliConnectionOverride {
+            transport: None,
+            ws_url: Some("wss://remote/ws".to_string()),
+            ws_subject: Some("custom".to_string()),
+        };
+        let target = resolve_startup_target(&cli, None).expect("expected override target");
+        match target.protocol {
+            ProtocolConfig::Websocket { url, subject } => {
+                assert_eq!(url, "wss://remote/ws");
+                assert_eq!(subject, "custom");
+            }
+            other => panic!("expected websocket override, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_override_returns_last_active() {
+        let cli = CliConnectionOverride {
+            transport: None,
+            ws_url: None,
+            ws_subject: None,
+        };
+        let p = ws_profile("saved", "ws://127.0.0.1:11339/ws");
+        let target = resolve_startup_target(&cli, Some(p.clone()));
+        assert_eq!(target, Some(p));
+    }
+
+    #[test]
+    fn no_override_and_no_last_active_returns_none() {
+        let cli = CliConnectionOverride {
+            transport: None,
+            ws_url: None,
+            ws_subject: None,
+        };
+        assert_eq!(resolve_startup_target(&cli, None), None);
+    }
+
+    #[test]
+    fn dbus_transport_override_forces_local() {
+        let cli = CliConnectionOverride {
+            transport: Some(CliTransportMode::Dbus),
+            ws_url: None,
+            ws_subject: None,
+        };
+        let last_active = Some(ws_profile("saved", "ws://127.0.0.1:11339/ws"));
+        let target = resolve_startup_target(&cli, last_active).expect("expected local override");
+        assert_eq!(target.protocol, ProtocolConfig::Local { path: None });
+    }
 }
