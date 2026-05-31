@@ -37,7 +37,7 @@ pub struct ConnectionProfile {
     pub protocol: ProtocolConfig,
 }
 
-fn default_ws_subject() -> String {
+pub fn default_ws_subject() -> String {
     "desktop-tui".to_string()
 }
 

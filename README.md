@@ -61,14 +61,16 @@ adele-gtk
 
 ### CLI options
 
-| Flag | Env var | Default | Description |
-|------|---------|---------|-------------|
-| `--transport` | `ADELIE_GTK_TRANSPORT` | `ws` | Transport: `ws` or `dbus` |
-| `--ws-url` | `ADELIE_GTK_WS_URL` | `ws://127.0.0.1:11339/ws` | WebSocket URL |
-| `--ws-jwt` | `ADELIE_GTK_WS_JWT` | | Direct JWT token |
-| `--ws-login-username` | `ADELIE_GTK_WS_LOGIN_USERNAME` | | Login username |
-| `--ws-login-password` | `ADELIE_GTK_WS_LOGIN_PASSWORD` | | Login password |
-| `--ws-subject` | `ADELIE_GTK_WS_SUBJECT` | `desktop-tui` | JWT subject |
+| Flag | Env var | Description |
+|------|---------|-------------|
+| `--transport` | `ADELIE_GTK_TRANSPORT` | `ws` or `dbus`. `dbus` forces a connection to the local daemon, overriding the saved startup profile. |
+| `--ws-url` | `ADELIE_GTK_WS_URL` | WebSocket URL. Overrides the startup target and bypasses the saved-profile picker. |
+| `--ws-subject` | `ADELIE_GTK_WS_SUBJECT` | JWT subject used with `--ws-url` (defaults to `desktop-tui`). |
+
+When `--ws-url` is given (or `--transport dbus`), it overrides the saved
+auto-reconnect profile so headless/scripted/remote launches work without a
+pre-saved profile; the resulting connection is ephemeral and is not persisted as
+the last connection.
 
 ## Test
 
