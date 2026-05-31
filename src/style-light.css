@@ -29,6 +29,13 @@ window {
     color: #1f6f97;
 }
 
+/* Unselected rows: GTK's default row chrome is dark against the light
+   window, so re-assert a transparent surface with the light foreground. */
+.conversation-list row {
+    background-color: transparent;
+    color: #1a1d2e;
+}
+
 .conversation-list row:selected {
     background-color: #3a57a8;
     color: #ffffff;
@@ -36,6 +43,18 @@ window {
 
 .dim-label {
     color: #5b6473;
+}
+
+/* Plain GTK buttons render with a dark default surface in light mode; give
+   them the light surface, foreground and border used elsewhere here. */
+.new-conversation-button {
+    background-color: #ffffff;
+    color: #1a1d2e;
+    border: 1px solid #cdd3e0;
+}
+
+.new-conversation-button:hover {
+    background-color: #e6eaf3;
 }
 
 .input-textview {
@@ -47,6 +66,16 @@ window {
 .input-textview text {
     background-color: #ffffff;
     color: #1a1d2e;
+}
+
+.send-button {
+    background-color: #ffffff;
+    color: #1a1d2e;
+    border: 1px solid #cdd3e0;
+}
+
+.send-button:hover {
+    background-color: #e6eaf3;
 }
 
 .status-bar {
@@ -160,9 +189,23 @@ entry:focus {
     color: #ffffff;
 }
 
+/* Unselected task rows: same dark-default-chrome fix as the conversation
+   list — transparent surface with the light foreground. */
+.task-list row {
+    background-color: transparent;
+    color: #1a1d2e;
+}
+
 .task-list row:selected {
     background-color: #3a57a8;
     color: #ffffff;
+}
+
+/* The dot is an empty label whose fill comes from the per-status classes
+   below; re-assert a transparent base surface so the unstyled dot never
+   shows GTK's dark default behind the status colour in light mode. */
+.task-dot {
+    background-color: transparent;
 }
 
 /* Status dots: keep the semantic hues but darken the neutral/amber ones so

@@ -29,6 +29,7 @@ dependencies = [
  "url",
  "uuid",
  "webkit6",
+ "zbus",
  "zbus-secret-service-keyring-store",
 ]
 
