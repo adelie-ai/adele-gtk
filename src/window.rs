@@ -10,7 +10,8 @@ use desktop_assistant_client_common::{
 use gtk4::prelude::*;
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, Entry, Label,
-    MenuButton, Orientation, Paned, Popover, Separator, Stack, StackSwitcher, Window, gdk, glib,
+    MenuButton, Orientation, Paned, Popover, Revealer, RevealerTransitionType, Separator, Stack,
+    StackSwitcher, Window, gdk, glib,
 };
 use tokio::sync::mpsc;
 
@@ -152,6 +153,34 @@ impl AdelieWindow {
         let chat_view = ChatView::new();
         right_box.append(&chat_view.container);
 
+        // Passive toast for advisory warnings (e.g. a dangling model
+        // selection cleared by the daemon). The revealer is always in the
+        // layout; we reveal it with a message when something needs
+        // attention, and the user can dismiss it.
+        let toast_revealer = Revealer::new();
+        toast_revealer.set_transition_type(RevealerTransitionType::SlideUp);
+        toast_revealer.set_reveal_child(false);
+        let toast_row = GtkBox::new(Orientation::Horizontal, 8);
+        toast_row.add_css_class("toast-row");
+        toast_row.set_margin_start(12);
+        toast_row.set_margin_end(12);
+        toast_row.set_margin_top(6);
+        toast_row.set_margin_bottom(6);
+        let toast_label = Label::new(None);
+        toast_label.set_halign(Align::Start);
+        toast_label.set_hexpand(true);
+        toast_label.set_wrap(true);
+        toast_row.append(&toast_label);
+        let toast_dismiss = Button::from_icon_name("window-close-symbolic");
+        toast_dismiss.add_css_class("flat");
+        {
+            let revealer_ref = toast_revealer.clone();
+            toast_dismiss.connect_clicked(move |_| revealer_ref.set_reveal_child(false));
+        }
+        toast_row.append(&toast_dismiss);
+        toast_revealer.set_child(Some(&toast_row));
+        right_box.append(&toast_revealer);
+
         let input_sep = Separator::new(Orientation::Horizontal);
         right_box.append(&input_sep);
 
@@ -201,6 +230,8 @@ impl AdelieWindow {
         let model_picker = Rc::new(model_picker);
         let tasks_panel = Rc::new(tasks_panel);
         let stack = Rc::new(stack);
+        let toast_revealer = Rc::new(toast_revealer);
+        let toast_label = Rc::new(toast_label);
 
         // Client wrapped in Arc for async tasks, Rc<RefCell<>> for GTK thread
         let client: Rc<RefCell<Option<Arc<TransportClient>>>> = Rc::new(RefCell::new(None));
@@ -218,6 +249,8 @@ impl AdelieWindow {
             let input_bar = Rc::clone(&input_bar);
             let model_picker = Rc::clone(&model_picker);
             let tasks_panel = Rc::clone(&tasks_panel);
+            let toast_revealer = Rc::clone(&toast_revealer);
+            let toast_label = Rc::clone(&toast_label);
 
             AsyncBridge::new(move |msg, ui_tx| {
                 handle_ui_message(
@@ -230,6 +263,8 @@ impl AdelieWindow {
                     &input_bar,
                     &model_picker,
                     &tasks_panel,
+                    &toast_revealer,
+                    &toast_label,
                     ui_tx,
                 );
             })
@@ -621,8 +656,9 @@ impl AdelieWindow {
                     return;
                 };
                 if transport.as_ws().is_none() {
-                    status_label_ref
-                        .set_text("Settings require the WebSocket transport (unavailable on D-Bus)");
+                    status_label_ref.set_text(
+                        "Settings require the WebSocket transport (unavailable on D-Bus)",
+                    );
                     return;
                 }
                 crate::widgets::settings_dialog::show_settings_dialog(
@@ -794,6 +830,8 @@ fn handle_ui_message(
     input_bar: &Rc<InputBar>,
     model_picker: &Rc<ModelPicker>,
     tasks_panel: &Rc<TasksPanel>,
+    toast_revealer: &Rc<Revealer>,
+    toast_label: &Rc<Label>,
     ui_tx: &mpsc::UnboundedSender<UiMessage>,
 ) {
     match msg {
@@ -932,6 +970,37 @@ fn handle_ui_message(
             let convs = s.conversations.clone();
             drop(s);
             sidebar.set_conversations(&convs);
+        }
+        UiMessage::ConversationWarning {
+            conversation_id,
+            warning,
+        } => {
+            // Single variant today — DanglingModelSelection. The daemon has
+            // already cleared its side and fell back; if this is the
+            // currently-open conversation, clear the header picker so it
+            // doesn't show a stale "stuck" model, then surface a passive
+            // toast explaining the fallback.
+            match &warning {
+                api::ConversationWarning::DanglingModelSelection {
+                    previous_selection,
+                    fallback_to,
+                } => {
+                    let is_current = state.borrow().current_conversation_id.as_deref()
+                        == Some(conversation_id.as_str());
+                    if is_current {
+                        model_picker.set_selection(None);
+                    }
+                    let message = format!(
+                        "The model \"{}\" on connection \"{}\" is no longer available — falling back to \"{}\" on \"{}\".",
+                        previous_selection.model_id,
+                        previous_selection.connection_id,
+                        fallback_to.model_id,
+                        fallback_to.connection_id,
+                    );
+                    toast_label.set_text(&message);
+                    toast_revealer.set_reveal_child(true);
+                }
+            }
         }
         UiMessage::StatusUpdate(text) => {
             status_label.set_text(&text);

@@ -60,6 +60,13 @@ window {
     font-size: 12px;
 }
 
+/* Advisory toast (e.g. a dangling model selection cleared by the daemon). */
+.toast-row {
+    background-color: #2a2e45;
+    border-radius: 6px;
+    color: #e0e0e0;
+}
+
 .debug-check {
     color: #e0e0e0;
     margin-end: 12px;

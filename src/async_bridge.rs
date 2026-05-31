@@ -58,6 +58,15 @@ pub enum UiMessage {
         conversation_id: String,
         title: String,
     },
+    /// A one-time advisory for a conversation emitted as a live signal
+    /// (today only `DanglingModelSelection`: the stored model selection no
+    /// longer resolves and was cleared server-side). Drives a passive toast
+    /// in the window. Replaces the earlier lossy `StatusUpdate`-string
+    /// mapping so the handler can act on the typed warning.
+    ConversationWarning {
+        conversation_id: String,
+        warning: api::ConversationWarning,
+    },
     /// The wire ack carries a `task_id` (post-#114 `SendMessageAck`) or an
     /// empty string (legacy `Ack`). It is NOT the chunk-stream
     /// `request_id` — that is server-generated and arrives embedded in
@@ -338,7 +347,10 @@ fn signal_to_ui_message(signal: SignalEvent) -> UiMessage {
         SignalEvent::ConversationWarning {
             conversation_id,
             warning,
-        } => UiMessage::StatusUpdate(format!("Conversation {conversation_id}: {warning:?}")),
+        } => UiMessage::ConversationWarning {
+            conversation_id,
+            warning,
+        },
         SignalEvent::TaskStarted { task } => UiMessage::TaskStarted(task),
         SignalEvent::TaskProgress { id, progress_hint } => {
             UiMessage::TaskProgress { id, progress_hint }
@@ -449,6 +461,38 @@ mod tests {
                 assert_eq!(chunk, "hello");
             }
             other => panic!("expected StreamChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signal_conversation_warning_routes_to_typed_ui_warning() {
+        let prev = api::ConversationModelSelectionView {
+            connection_id: "old".to_string(),
+            model_id: "gone".to_string(),
+            effort: None,
+        };
+        let fallback = api::ConversationModelSelectionView {
+            connection_id: "work".to_string(),
+            model_id: "claude".to_string(),
+            effort: None,
+        };
+        let warning = api::ConversationWarning::DanglingModelSelection {
+            previous_selection: prev,
+            fallback_to: fallback,
+        };
+        let msg = signal_to_ui_message(SignalEvent::ConversationWarning {
+            conversation_id: "conv-1".to_string(),
+            warning: warning.clone(),
+        });
+        match msg {
+            UiMessage::ConversationWarning {
+                conversation_id,
+                warning: got,
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                assert_eq!(got, warning);
+            }
+            other => panic!("expected ConversationWarning, got {other:?}"),
         }
     }
 
