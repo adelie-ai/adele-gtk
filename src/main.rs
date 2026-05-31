@@ -10,6 +10,7 @@
 mod async_bridge;
 mod avatars;
 mod credential_store;
+mod management_client;
 mod markdown;
 mod oauth;
 mod profile;
