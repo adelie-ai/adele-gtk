@@ -470,15 +470,7 @@ pub async fn connect_to_profile(
                     if let Some(ref new_refresh) = tokens.refresh_token {
                         let _ = CredentialStore::store_refresh_token(&profile.id, new_refresh);
                     }
-                    return Ok(ConnectionConfig {
-                        transport_mode: TransportMode::Ws,
-                        ws_url: ws_url.clone(),
-                        ws_jwt: Some(tokens.access_token),
-                        ws_login_username: None,
-                        ws_login_password: None,
-                        ws_subject: ws_subject.clone(),
-                        ..Default::default()
-                    });
+                    return Ok(ws_jwt_config(&ws_url, &ws_subject, tokens.access_token));
                 }
                 Err(e) => {
                     tracing::info!("silent refresh failed, will try browser flow: {e}");
@@ -495,15 +487,7 @@ pub async fn connect_to_profile(
             let _ = CredentialStore::store_refresh_token(&profile.id, refresh_token);
         }
 
-        return Ok(ConnectionConfig {
-            transport_mode: TransportMode::Ws,
-            ws_url: ws_url.clone(),
-            ws_jwt: Some(tokens.access_token),
-            ws_login_username: None,
-            ws_login_password: None,
-            ws_subject: ws_subject.clone(),
-            ..Default::default()
-        });
+        return Ok(ws_jwt_config(&ws_url, &ws_subject, tokens.access_token));
     }
 
     // Fall back to password auth
@@ -525,4 +509,24 @@ pub async fn connect_to_profile(
     }
 
     anyhow::bail!("server does not offer any supported auth methods")
+}
+
+/// Build the WebSocket + bearer-JWT connection config shared by both OAuth
+/// success paths (silent refresh and full browser flow). The only thing that
+/// differs between those paths is where the `jwt` comes from.
+fn ws_jwt_config(
+    ws_url: &str,
+    ws_subject: &str,
+    jwt: String,
+) -> desktop_assistant_client_common::ConnectionConfig {
+    use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
+    ConnectionConfig {
+        transport_mode: TransportMode::Ws,
+        ws_url: ws_url.to_string(),
+        ws_jwt: Some(jwt),
+        ws_login_username: None,
+        ws_login_password: None,
+        ws_subject: ws_subject.to_string(),
+        ..Default::default()
+    }
 }
