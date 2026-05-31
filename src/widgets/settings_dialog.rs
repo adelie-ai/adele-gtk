@@ -324,10 +324,17 @@ pub fn show_settings_dialog(
                     return;
                 }
             };
-            // We don't have the raw config from the daemon in ConnectionView
-            // (credentials are never surfaced). Pass an empty config of the
-            // right variant; the user re-enters fields on edit.
-            let existing_pair = Some((existing.id.clone(), connector.empty_config()));
+            // The daemon echoes the non-secret config (base_url, env-var
+            // *name*, aws_profile, region) on `ConnectionView::config`; pre-fill
+            // the dialog from it so edits don't wipe stored fields. Raw secrets
+            // are never echoed, so the api-key entry stays blank. Fall back to
+            // an empty config of the right variant when an older daemon omits
+            // `config`.
+            let existing_config = existing
+                .config
+                .clone()
+                .unwrap_or_else(|| connector.empty_config());
+            let existing_pair = Some((existing.id.clone(), existing_config));
 
             let transport_save = Arc::clone(&transport);
             let bridge_save = Rc::clone(&bridge);
