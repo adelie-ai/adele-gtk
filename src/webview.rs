@@ -94,3 +94,75 @@ pub fn scroll_to_bottom(webview: &WebView) {
         |_| {},
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `js_safe_string` is the security boundary that prevents a hostile
+    /// assistant/tool message from breaking out of the JS string literal it is
+    /// interpolated into. Its contract is the JSON-string contract: the output
+    /// is a quoted JSON string literal that parses back to *exactly* the input.
+    /// This property-style test drives it with a representative input set that
+    /// covers every C0 control char (0x00–0x1F), quotes, backslashes, the
+    /// line/paragraph separators that are valid JSON but break naive JS string
+    /// literals, and non-ASCII, asserting the round-trip holds for each.
+    #[test]
+    fn js_safe_string_round_trips_through_json_for_all_control_chars() {
+        // Build the representative corpus.
+        let mut inputs: Vec<String> = Vec::new();
+
+        // Every C0 control character, individually and embedded in text.
+        for code in 0x00u32..=0x1F {
+            let c = char::from_u32(code).unwrap();
+            inputs.push(c.to_string());
+            inputs.push(format!("before{c}after"));
+        }
+
+        // Quotes, backslashes, slashes, and combinations that classically
+        // escape JS string / template literals.
+        for s in [
+            "\"",
+            "'",
+            "\\",
+            "\\\"",
+            "\\n",          // literal backslash-n, not a newline
+            "</script>",    // HTML closer
+            "`${alert(1)}`", // JS template-literal injection
+            "\u{2028}",     // LINE SEPARATOR (breaks naive JS string literals)
+            "\u{2029}",     // PARAGRAPH SEPARATOR
+            "\u{FEFF}",     // BOM / zero-width no-break space
+            "\0embedded\0null",
+            "emoji 🦀 and accents éàü",
+            "中文字符",
+            "",
+        ] {
+            inputs.push(s.to_string());
+        }
+
+        for input in &inputs {
+            let encoded = js_safe_string(input);
+            // The output must be a self-contained JSON string literal that
+            // parses back to the exact original — the guarantee callers rely on
+            // when they do `format!("appendChunk({});", js_safe_string(x))`.
+            let decoded: String = serde_json::from_str(&encoded).unwrap_or_else(|e| {
+                panic!("js_safe_string({input:?}) -> {encoded:?} did not parse as JSON: {e}")
+            });
+            assert_eq!(
+                &decoded, input,
+                "round-trip mismatch: input {input:?} encoded as {encoded:?} decoded as {decoded:?}"
+            );
+            // Defensive: a raw control char must never survive into the output
+            // unescaped, or it could terminate/derange the JS literal.
+            for code in 0x00u32..=0x1F {
+                let c = char::from_u32(code).unwrap();
+                if input.contains(c) {
+                    assert!(
+                        !encoded.contains(c),
+                        "control char {code:#04x} leaked unescaped into {encoded:?}"
+                    );
+                }
+            }
+        }
+    }
+}

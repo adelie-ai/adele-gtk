@@ -248,6 +248,9 @@ fn ws_url_to_http_base(ws_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oauth2::CsrfToken;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_ws_url_to_http_base() {
@@ -263,5 +266,161 @@ mod tests {
             ws_url_to_http_base("wss://example.com:8443/ws"),
             "https://example.com:8443"
         );
+    }
+
+    // --- Item 4: CA cert must not be silently dropped --------------------
+    //
+    // The historical bug: `builder.build().unwrap_or_else(|_| Client::new())`
+    // plus an `if let Ok(cert) = from_pem(...)` guard meant a misconfigured /
+    // corrupt CA cert was silently discarded and the HTTPS request proceeded
+    // with *default* trust — a TLS-trust downgrade. The fix propagates the
+    // error; an invalid configured CA cert must yield `Err`, never a default
+    // no-CA client.
+    #[test]
+    fn build_http_client_errors_on_invalid_ca_cert_instead_of_dropping_it() {
+        let dir = std::env::temp_dir().join(format!("adele-gtk-oauth-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad_cert = dir.join("not-a-real.pem");
+        std::fs::write(&bad_cert, b"this is not a valid PEM certificate").unwrap();
+
+        let result = build_http_client(Some(bad_cert.as_path()));
+        std::fs::remove_file(&bad_cert).ok();
+
+        assert!(
+            result.is_err(),
+            "an invalid configured CA cert must produce Err, not a silent default-trust client"
+        );
+    }
+
+    #[test]
+    fn build_http_client_succeeds_with_no_ca_cert() {
+        // The success path (no CA configured) must remain unchanged: a usable
+        // client is returned.
+        assert!(build_http_client(None).is_ok());
+    }
+
+    // --- Item 3: accept_redirect branch coverage -------------------------
+
+    /// Connect to `addr`, send `request`, and read the HTTP response body
+    /// back so the server side can finish its write/shutdown.
+    async fn send_redirect_request(addr: std::net::SocketAddr, request: &str) {
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+        // Drain whatever the server sends so its `write_all`/`shutdown` can
+        // complete; ignore content.
+        let mut sink = Vec::new();
+        let _ = client.read_to_end(&mut sink).await;
+    }
+
+    #[tokio::test]
+    async fn accept_redirect_rejects_csrf_state_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected = CsrfToken::new("the-real-state".to_string());
+
+        let server = tokio::spawn(async move { accept_redirect(listener, &expected).await });
+        send_redirect_request(
+            addr,
+            "GET /?code=abc&state=WRONG-STATE HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+
+        let result = server.await.unwrap();
+        let err = result.expect_err("CSRF state mismatch must be rejected");
+        assert!(
+            err.to_string().contains("CSRF state mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_redirect_propagates_oauth_error_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected = CsrfToken::new("state-123".to_string());
+
+        let server = tokio::spawn(async move { accept_redirect(listener, &expected).await });
+        send_redirect_request(
+            addr,
+            "GET /?state=state-123&error=access_denied&error_description=nope HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+
+        let result = server.await.unwrap();
+        let err = result.expect_err("an error= response must be surfaced as Err");
+        assert!(
+            err.to_string().contains("OAuth error") && err.to_string().contains("access_denied"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_redirect_rejects_missing_code() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected = CsrfToken::new("state-xyz".to_string());
+
+        let server = tokio::spawn(async move { accept_redirect(listener, &expected).await });
+        // Valid state, no error, but no `code` param.
+        send_redirect_request(
+            addr,
+            "GET /?state=state-xyz HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+
+        let result = server.await.unwrap();
+        let err = result.expect_err("a missing code param must be rejected");
+        assert!(
+            err.to_string().contains("missing authorization code"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_redirect_extracts_code_on_happy_path() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected = CsrfToken::new("state-ok".to_string());
+
+        let server = tokio::spawn(async move { accept_redirect(listener, &expected).await });
+        send_redirect_request(
+            addr,
+            "GET /?code=happy-code&state=state-ok HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+
+        let code = server.await.unwrap().expect("happy path must yield the code");
+        assert_eq!(code, "happy-code");
+    }
+
+    // --- Item 5: long redirect must not be truncated at 4096 bytes -------
+    //
+    // Historically the handler read exactly 4096 bytes; a long claim set /
+    // large query string would be truncated and the request line never fully
+    // parsed. The fix reads until the end of the HTTP headers (`\r\n\r\n`).
+    #[tokio::test]
+    async fn accept_redirect_parses_request_longer_than_4096_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected = CsrfToken::new("state-long".to_string());
+
+        // Pad the query string so the full request comfortably exceeds 4096
+        // bytes. `code`/`state` live near the front of the line but the line
+        // (and headers) push well past the old fixed buffer.
+        let padding = "x".repeat(8192);
+        let request = format!(
+            "GET /?code=long-code&state=state-long&blob={padding} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        assert!(request.len() > 4096);
+
+        let server = tokio::spawn(async move { accept_redirect(listener, &expected).await });
+        send_redirect_request(addr, &request).await;
+
+        let code = server
+            .await
+            .unwrap()
+            .expect("a >4096-byte redirect must still parse");
+        assert_eq!(code, "long-code");
     }
 }
