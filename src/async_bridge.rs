@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use desktop_assistant_api_model as api;
 use desktop_assistant_client_common::SignalEvent;
 use desktop_assistant_client_common::{
-    AssistantClient, AssistantCommands, ConnectionConfig, TransportClient, connect_transport,
+    AssistantClient, ConnectionConfig, TransportClient, connect_transport,
     transport::transport_label,
 };
 use gtk4::glib;
@@ -327,9 +327,10 @@ pub async fn connection_manager(config: ConnectionConfig, ui_tx: mpsc::Unbounded
                 }
 
                 // Fetch available models when the transport supports it
-                // (WS only — the D-Bus interface doesn't expose this command).
-                let listings = match transport.as_ws() {
-                    Some(ws) => ws
+                // (the command channel — Uds and Ws; the D-Bus interface
+                // doesn't expose this command).
+                let listings = match transport.as_commands() {
+                    Some(cmds) => cmds
                         .list_available_models(None, false)
                         .await
                         .unwrap_or_else(|e| {
@@ -343,16 +344,17 @@ pub async fn connection_manager(config: ConnectionConfig, ui_tx: mpsc::Unbounded
                 }
 
                 // Subscribe to background-task events and fetch the initial
-                // snapshot. WS-only: the D-Bus surface does not expose
-                // background tasks (issue #116 covers that path).
-                if let Some(ws) = transport.as_ws() {
-                    if let Err(e) = ws
+                // snapshot over the command channel (Uds and Ws). The D-Bus
+                // surface does not expose background tasks (issue #116 covers
+                // that path).
+                if let Some(cmds) = transport.as_commands() {
+                    if let Err(e) = cmds
                         .send_command(api::Command::SubscribeBackgroundTasks)
                         .await
                     {
                         tracing::warn!("SubscribeBackgroundTasks failed: {e}");
                     }
-                    match ws
+                    match cmds
                         .send_command(api::Command::ListBackgroundTasks {
                             include_finished: false,
                             limit: None,

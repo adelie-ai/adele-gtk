@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_client_common::{
-    AssistantClient, AssistantCommands, ChatMessage, ConnectionConfig, ConversationDetail,
-    ConversationSummary, TransportClient,
+    AssistantClient, ChatMessage, ConnectionConfig, ConversationDetail, ConversationSummary,
+    TransportClient,
 };
 use gtk4::prelude::*;
 use gtk4::{
@@ -962,14 +962,15 @@ impl AdelieWindow {
                         let tx = bridge_ref.ui_sender();
                         let text = text.clone();
                         bridge_ref.spawn(async move {
-                            // Use the WS-specific override path when available so
-                            // the picker's selection is honoured. The shared
-                            // AssistantClient trait can't carry the override
-                            // because the D-Bus surface doesn't expose it; on
-                            // D-Bus we fall through to the plain send_prompt.
-                            let result = match (client.as_ws(), override_selection) {
-                                (Some(ws), Some(over)) => {
-                                    ws.send_prompt_with_override(&conv_id, &text, Some(over))
+                            // Use the command-channel override path when
+                            // available so the picker's selection is honoured.
+                            // The shared AssistantClient trait can't carry the
+                            // override because the D-Bus surface doesn't expose
+                            // it; on D-Bus we fall through to the plain
+                            // send_prompt.
+                            let result = match (client.as_commands(), override_selection) {
+                                (Some(cmds), Some(over)) => {
+                                    cmds.send_prompt_with_override(&conv_id, &text, Some(over))
                                         .await
                                 }
                                 _ => client.send_prompt(&conv_id, &text).await,
@@ -1052,9 +1053,9 @@ impl AdelieWindow {
                     status_label.set_text("Not connected — settings unavailable");
                     return;
                 };
-                if transport.as_ws().is_none() {
+                if transport.as_commands().is_none() {
                     status_label.set_text(
-                        "Settings require the WebSocket transport (unavailable on D-Bus)",
+                        "Settings require a local-socket or WebSocket connection (not available over D-Bus)",
                     );
                     return;
                 }
@@ -1157,7 +1158,8 @@ impl AdelieWindow {
 
         // Tasks panel: toolbar wiring (#19).
         //
-        // `Cancel` sends `CancelBackgroundTask` over WS; `Open Conversation`
+        // `Cancel` sends `CancelBackgroundTask` over the command channel;
+        // `Open Conversation`
         // routes the user back to the Conversations stack page and loads the
         // task's conversation so the streaming output keeps flowing into the
         // chat view.
@@ -1172,13 +1174,15 @@ impl AdelieWindow {
                 };
                 let tx = bridge.ui_sender();
                 bridge.spawn(async move {
-                    let Some(ws) = transport.as_ws() else {
+                    let Some(cmds) = transport.as_commands() else {
                         let _ = tx.send(UiMessage::Error(
-                            "Background tasks require the WebSocket transport".to_string(),
+                            "Background tasks require a local-socket or WebSocket connection \
+                             (not available over D-Bus)"
+                                .to_string(),
                         ));
                         return;
                     };
-                    if let Err(e) = ws
+                    if let Err(e) = cmds
                         .send_command(api::Command::CancelBackgroundTask { id: task_id })
                         .await
                     {
