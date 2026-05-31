@@ -406,14 +406,10 @@ impl AdelieWindow {
         // Set application icon for taskbar
         install_app_icon();
 
-        // Apply CSS
-        let provider = gtk4::CssProvider::new();
-        provider.load_from_data(include_str!("style.css"));
-        gtk4::style_context_add_provider_for_display(
-            &gdk::Display::default().expect("display"),
-            &provider,
-            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
+        // Apply theme-aware CSS: the dark palette is always installed; the
+        // light overrides (see `crate::theme`) are layered on only when the
+        // system/GTK preference is light, and re-applied on preference change.
+        crate::theme::install_for_display(&gdk::Display::default().expect("display"));
 
         // Layout: resizable paned split between sidebar and chat. The left
         // pane is a `Stack` that swaps between the conversation list and the
