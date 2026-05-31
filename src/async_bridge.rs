@@ -24,8 +24,14 @@ fn runtime() -> &'static Runtime {
 }
 
 /// Messages sent from async tasks back to the GTK main thread.
-#[derive(Debug)]
 pub enum UiMessage {
+    /// A freshly connected transport handed off to the GTK main thread.
+    /// `Arc<TransportClient>` is `Send`, so this rides the same channel as
+    /// every other UI message (replacing the former dedicated `InternalMsg`
+    /// channel). Sent by `connection_manager` immediately after `Connected`
+    /// and before `ConversationsLoaded`, so the window's client cell is
+    /// populated before any handler that needs it runs.
+    ClientReady(Arc<TransportClient>),
     ConversationsLoaded(Vec<desktop_assistant_client_common::ConversationSummary>),
     ConversationLoaded(desktop_assistant_client_common::ConversationDetail),
     ConversationCreated {
@@ -116,9 +122,108 @@ pub enum UiMessage {
     },
 }
 
-/// Internal message for delivering a new client to the GTK main thread.
-pub enum InternalMsg {
-    ClientReady(Arc<TransportClient>),
+// Manual `Debug` (can't derive: `TransportClient` is not `Debug`). Only
+// `ClientReady` needs special handling — it prints a marker instead of the
+// opaque transport; every other variant forwards its fields as before so
+// the test panic messages stay informative.
+impl std::fmt::Debug for UiMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UiMessage::ClientReady(_) => {
+                f.debug_tuple("ClientReady").field(&"<transport>").finish()
+            }
+            UiMessage::ConversationsLoaded(v) => {
+                f.debug_tuple("ConversationsLoaded").field(v).finish()
+            }
+            UiMessage::ConversationLoaded(v) => {
+                f.debug_tuple("ConversationLoaded").field(v).finish()
+            }
+            UiMessage::ConversationCreated { id } => f
+                .debug_struct("ConversationCreated")
+                .field("id", id)
+                .finish(),
+            UiMessage::ConversationDeleted { id } => f
+                .debug_struct("ConversationDeleted")
+                .field("id", id)
+                .finish(),
+            UiMessage::ConversationRenamed { id, title } => f
+                .debug_struct("ConversationRenamed")
+                .field("id", id)
+                .field("title", title)
+                .finish(),
+            UiMessage::StreamChunk { request_id, chunk } => f
+                .debug_struct("StreamChunk")
+                .field("request_id", request_id)
+                .field("chunk", chunk)
+                .finish(),
+            UiMessage::StreamComplete {
+                request_id,
+                full_response,
+            } => f
+                .debug_struct("StreamComplete")
+                .field("request_id", request_id)
+                .field("full_response", full_response)
+                .finish(),
+            UiMessage::StreamError { request_id, error } => f
+                .debug_struct("StreamError")
+                .field("request_id", request_id)
+                .field("error", error)
+                .finish(),
+            UiMessage::AssistantStatus {
+                request_id,
+                message,
+            } => f
+                .debug_struct("AssistantStatus")
+                .field("request_id", request_id)
+                .field("message", message)
+                .finish(),
+            UiMessage::TitleChanged {
+                conversation_id,
+                title,
+            } => f
+                .debug_struct("TitleChanged")
+                .field("conversation_id", conversation_id)
+                .field("title", title)
+                .finish(),
+            UiMessage::ConversationWarning {
+                conversation_id,
+                warning,
+            } => f
+                .debug_struct("ConversationWarning")
+                .field("conversation_id", conversation_id)
+                .field("warning", warning)
+                .finish(),
+            UiMessage::PromptSent { task_id } => f
+                .debug_struct("PromptSent")
+                .field("task_id", task_id)
+                .finish(),
+            UiMessage::ModelsLoaded(v) => f.debug_tuple("ModelsLoaded").field(v).finish(),
+            UiMessage::Connected { label } => {
+                f.debug_struct("Connected").field("label", label).finish()
+            }
+            UiMessage::Disconnected { reason } => f
+                .debug_struct("Disconnected")
+                .field("reason", reason)
+                .finish(),
+            UiMessage::StatusUpdate(s) => f.debug_tuple("StatusUpdate").field(s).finish(),
+            UiMessage::Error(s) => f.debug_tuple("Error").field(s).finish(),
+            UiMessage::TasksLoaded(v) => f.debug_tuple("TasksLoaded").field(v).finish(),
+            UiMessage::TaskStarted(v) => f.debug_tuple("TaskStarted").field(v).finish(),
+            UiMessage::TaskProgress { id, progress_hint } => f
+                .debug_struct("TaskProgress")
+                .field("id", id)
+                .field("progress_hint", progress_hint)
+                .finish(),
+            UiMessage::TaskLogAppended { id, entry } => f
+                .debug_struct("TaskLogAppended")
+                .field("id", id)
+                .field("entry", entry)
+                .finish(),
+            UiMessage::TaskCompleted { id } => {
+                f.debug_struct("TaskCompleted").field("id", id).finish()
+            }
+        }
+    }
 }
 
 /// Bridge between the GTK main loop and tokio async tasks.
@@ -177,11 +282,7 @@ where
 /// disconnect → reconnect with exponential backoff.
 ///
 /// Exits when `ui_tx` is closed (GTK window gone).
-pub async fn connection_manager(
-    config: ConnectionConfig,
-    ui_tx: mpsc::UnboundedSender<UiMessage>,
-    internal_tx: mpsc::UnboundedSender<InternalMsg>,
-) {
+pub async fn connection_manager(config: ConnectionConfig, ui_tx: mpsc::UnboundedSender<UiMessage>) {
     const INITIAL_BACKOFF_SECS: u64 = 2;
     const MAX_BACKOFF_SECS: u64 = 30;
 
@@ -198,8 +299,11 @@ pub async fn connection_manager(
                     return;
                 }
 
-                if internal_tx
-                    .send(InternalMsg::ClientReady(Arc::clone(&transport)))
+                // Hand the transport to the GTK main thread before the
+                // conversation list (which needs it). Same channel, so
+                // delivery stays ordered.
+                if ui_tx
+                    .send(UiMessage::ClientReady(Arc::clone(&transport)))
                     .is_err()
                 {
                     return;

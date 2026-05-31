@@ -15,7 +15,7 @@ use gtk4::{
 };
 use tokio::sync::mpsc;
 
-use crate::async_bridge::{AsyncBridge, InternalMsg, UiMessage, connection_manager};
+use crate::async_bridge::{AsyncBridge, UiMessage, connection_manager};
 use crate::management_client;
 use crate::widgets::chat_view::ChatView;
 use crate::widgets::input_bar::InputBar;
@@ -32,8 +32,6 @@ struct WindowState {
     streaming_buffer: String,
     debug_enabled: bool,
 }
-
-// InternalMsg is now defined in async_bridge and re-imported.
 
 pub struct AdelieWindow {
     pub window: ApplicationWindow,
@@ -237,9 +235,6 @@ impl AdelieWindow {
         // Client wrapped in Arc for async tasks, Rc<RefCell<>> for GTK thread
         let client: Rc<RefCell<Option<Arc<TransportClient>>>> = Rc::new(RefCell::new(None));
 
-        // Internal channel for transport bootstrap (sends non-Send types via main thread)
-        let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<InternalMsg>();
-
         // Set up async bridge with UI message handler
         let bridge = AsyncBridge::new(glib::clone!(
             #[strong]
@@ -281,25 +276,13 @@ impl AdelieWindow {
         ));
         let bridge = Rc::new(bridge);
 
-        // Spawn a local future to receive the transport client on the main thread
-        glib::spawn_future_local(glib::clone!(
-            #[strong]
-            client,
-            async move {
-                while let Some(msg) = internal_rx.recv().await {
-                    match msg {
-                        InternalMsg::ClientReady(transport) => {
-                            *client.borrow_mut() = Some(transport);
-                        }
-                    }
-                }
-            }
-        ));
-
-        // Spawn persistent connection manager (connect → forward → reconnect)
+        // Spawn persistent connection manager (connect → forward → reconnect).
+        // It now delivers the freshly connected transport to the main thread
+        // via `UiMessage::ClientReady` on the same channel as every other UI
+        // message (handled in `handle_ui_message`).
         {
             let ui_tx = bridge.ui_sender();
-            bridge.spawn(connection_manager(config.clone(), ui_tx, internal_tx));
+            bridge.spawn(connection_manager(config.clone(), ui_tx));
         }
 
         // Sidebar row activation → load conversation
@@ -912,6 +895,12 @@ fn handle_ui_message(
     ui_tx: &mpsc::UnboundedSender<UiMessage>,
 ) {
     match msg {
+        UiMessage::ClientReady(transport) => {
+            // The connection_manager handed us a freshly connected transport.
+            // Stash it so the rest of the UI can issue RPCs; this arrives
+            // before `ConversationsLoaded`, which relies on the client cell.
+            *client.borrow_mut() = Some(transport);
+        }
         UiMessage::ConversationsLoaded(convs) => {
             sidebar.set_conversations(&convs);
             state.borrow_mut().conversations = convs;
