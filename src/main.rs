@@ -28,6 +28,7 @@ use gtk4::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 use crate::async_bridge::spawn_on_runtime;
+use crate::credential_store::CredentialStore;
 use crate::profile::{LastConnectionStore, ProfileStore};
 use crate::widgets::login_screen::{LoginScreen, connect_to_profile};
 
@@ -111,6 +112,8 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
+
+    CredentialStore::init_store();
 
     let cli = CliArgs::parse();
     let _config = ConnectionConfig::from(cli);
