@@ -190,7 +190,20 @@ entry:focus {
     color: #1a1d2e;
 }
 
+/* When the window is inactive (backdrop), the base theme dims the switcher
+   label; without an explicit light value the unselected text washed out to
+   near-white over the light surface. Re-assert a readable, palette-consistent
+   dim foreground so the tabs stay visible. */
+.sidebar-stack-switcher button:backdrop {
+    color: #5b6473;
+}
+
 .sidebar-stack-switcher button:checked {
+    background-color: #3a57a8;
+    color: #ffffff;
+}
+
+.sidebar-stack-switcher button:checked:backdrop {
     background-color: #3a57a8;
     color: #ffffff;
 }

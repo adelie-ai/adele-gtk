@@ -15,6 +15,24 @@
 //!   then win over the dark base; in dark mode it is removed entirely, leaving
 //!   the original dark appearance untouched.
 //!
+//! ## Pinned base theme
+//!
+//! The app's own CSS only styles widgets that carry an app style class; every
+//! other GTK-drawn control (list-box surfaces, `MenuButton`s, `CheckButton`s,
+//! the task list, the task panel's plain buttons, the sidebar stack-switcher,
+//! …) falls back to the ambient GTK theme. Most third-party system themes do
+//! **not** honour `gtk-application-prefer-dark-theme`, so those controls would
+//! stay in whatever palette the system theme paints (typically dark) regardless
+//! of the desktop's light/dark preference. To make the whole window follow the
+//! preference, [`install_for_display`] pins the base GTK theme to GTK4's
+//! built-in **Adwaita** (`gtk-theme-name = "Adwaita"`), which is the one theme
+//! guaranteed to switch between its light and dark variants from
+//! `gtk-application-prefer-dark-theme`. Accepted trade-off: in dark mode those
+//! unstyled GTK controls render as Adwaita-dark rather than the system theme;
+//! the app's custom accent palette (below) is unaffected either way.
+//!
+//! ## Live preference tracking
+//!
 //! We treat `gtk-application-prefer-dark-theme` as the source of truth and
 //! re-apply the provider choice whenever it changes. GTK4 reads that property
 //! from the `org.freedesktop.appearance color-scheme` portal setting only
@@ -108,6 +126,15 @@ pub fn install_for_display(display: &gdk::Display) {
     );
 
     let settings = gtk4::Settings::for_display(display);
+
+    // Pin the base GTK theme to the built-in Adwaita, which honours
+    // `gtk-application-prefer-dark-theme` by switching between its light and
+    // dark variants. This makes every GTK-drawn control that has no app style
+    // class follow the desktop's light/dark preference instead of staying in
+    // the system theme's (typically non-switching) palette. Idempotent across
+    // windows: setting the property repeatedly to the same value is harmless.
+    settings.set_gtk_theme_name(Some("Adwaita"));
+
     let light_applied = Rc::new(Cell::new(false));
 
     let apply = {
