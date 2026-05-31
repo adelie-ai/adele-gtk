@@ -126,12 +126,12 @@ mod tests {
             "'",
             "\\",
             "\\\"",
-            "\\n",          // literal backslash-n, not a newline
-            "</script>",    // HTML closer
+            "\\n",           // literal backslash-n, not a newline
+            "</script>",     // HTML closer
             "`${alert(1)}`", // JS template-literal injection
-            "\u{2028}",     // LINE SEPARATOR (breaks naive JS string literals)
-            "\u{2029}",     // PARAGRAPH SEPARATOR
-            "\u{FEFF}",     // BOM / zero-width no-break space
+            "\u{2028}",      // LINE SEPARATOR (breaks naive JS string literals)
+            "\u{2029}",      // PARAGRAPH SEPARATOR
+            "\u{FEFF}",      // BOM / zero-width no-break space
             "\0embedded\0null",
             "emoji 🦀 and accents éàü",
             "中文字符",

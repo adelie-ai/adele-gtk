@@ -35,14 +35,7 @@ pub async fn discover_auth_config(
     let base_url = ws_url_to_http_base(ws_url);
     let url = format!("{base_url}/auth/config");
 
-    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
-    if let Some(ca_path) = tls_ca_cert
-        && let Ok(pem_bytes) = std::fs::read(ca_path)
-        && let Ok(cert) = reqwest::tls::Certificate::from_pem(&pem_bytes)
-    {
-        builder = builder.add_root_certificate(cert);
-    }
-    let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
+    let client = build_http_client(tls_ca_cert)?;
 
     let response = client
         .get(&url)
@@ -62,6 +55,47 @@ pub async fn discover_auth_config(
         .json::<AuthDiscovery>()
         .await
         .with_context(|| "parsing auth config response")
+}
+
+/// Build the HTTP client used for auth discovery, optionally trusting a
+/// caller-supplied CA certificate (for a self-signed local daemon).
+///
+/// SECURITY: when a CA certificate *is present* but cannot be honored, the
+/// error is propagated as `Err` rather than swallowed. Previously the cert was
+/// loaded behind `if let Ok(pem_bytes) = std::fs::read(ca_path)` and the client
+/// built with `builder.build().unwrap_or_else(|_| Client::new())`, so a present
+/// but unreadable/unparseable CA cert — or a builder failure — silently fell
+/// back to a *default-trust* client, downgrading TLS trust without telling the
+/// caller.
+///
+/// A *missing* CA file (`NotFound`) is treated as "no cert configured" and we
+/// proceed without one: callers always pass the daemon's default CA path even
+/// when it hasn't been generated, and that case is not a trust downgrade
+/// (there was no configured cert to honor). Any other read failure, a parse
+/// failure, or a builder failure is a hard error.
+fn build_http_client(tls_ca_cert: Option<&std::path::Path>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
+    if let Some(ca_path) = tls_ca_cert {
+        match std::fs::read(ca_path) {
+            Ok(pem_bytes) => {
+                let cert = reqwest::tls::Certificate::from_pem(&pem_bytes).with_context(|| {
+                    format!("parsing CA certificate from {}", ca_path.display())
+                })?;
+                builder = builder.add_root_certificate(cert);
+            }
+            // No cert at the configured path — proceed with default trust.
+            // This is the daemon's optional auto-generated CA that may not
+            // exist yet; not a downgrade of an actually-configured cert.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // The cert exists but we couldn't read it (permissions, etc.):
+            // do NOT silently fall back to default trust.
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("reading CA certificate from {}", ca_path.display()));
+            }
+        }
+    }
+    builder.build().context("building HTTP client")
 }
 
 /// Run the full OAuth2 Authorization Code + PKCE flow.
@@ -178,9 +212,28 @@ async fn accept_redirect(
 
     let (mut stream, _) = listener.accept().await?;
 
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await?;
-    let request = String::from_utf8_lossy(&buf[..n]);
+    // Read until the end of the HTTP request head (`\r\n\r\n`) rather than a
+    // fixed buffer: a long claim set / large query string can push the request
+    // line past 4096 bytes, and a fixed read would truncate it before the
+    // `code`/`state` params were fully captured. A generous cap guards against
+    // a peer that never sends the header terminator.
+    const MAX_REQUEST_BYTES: usize = 64 * 1024;
+    let mut data = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break; // peer closed before sending the terminator
+        }
+        data.extend_from_slice(&chunk[..n]);
+        if data.windows(4).any(|w| w == b"\r\n\r\n") {
+            break; // end of request head reached
+        }
+        if data.len() >= MAX_REQUEST_BYTES {
+            anyhow::bail!("OAuth redirect request exceeded {MAX_REQUEST_BYTES} bytes");
+        }
+    }
+    let request = String::from_utf8_lossy(&data);
 
     // Parse the GET request line to extract query params
     let path = request
@@ -270,26 +323,41 @@ mod tests {
 
     // --- Item 4: CA cert must not be silently dropped --------------------
     //
-    // The historical bug: `builder.build().unwrap_or_else(|_| Client::new())`
-    // plus an `if let Ok(cert) = from_pem(...)` guard meant a misconfigured /
-    // corrupt CA cert was silently discarded and the HTTPS request proceeded
-    // with *default* trust — a TLS-trust downgrade. The fix propagates the
-    // error; an invalid configured CA cert must yield `Err`, never a default
-    // no-CA client.
+    // The historical bug: a configured CA cert was loaded behind
+    // `if let Ok(pem_bytes) = std::fs::read(ca_path)` and the client built with
+    // `builder.build().unwrap_or_else(|_| Client::new())`. So a present but
+    // unreadable CA file (or a builder failure) was silently swallowed and the
+    // HTTPS request proceeded with *default* trust — a TLS-trust downgrade the
+    // caller never learned about. The fix propagates the error: when a CA cert
+    // is present but cannot be loaded, `build_http_client` must return `Err`,
+    // never a silent default-trust client.
     #[test]
-    fn build_http_client_errors_on_invalid_ca_cert_instead_of_dropping_it() {
-        let dir = std::env::temp_dir().join(format!("adele-gtk-oauth-test-{}", std::process::id()));
+    fn build_http_client_errors_when_present_ca_cert_cannot_be_loaded() {
+        // A directory at the cert path is a present-but-unreadable-as-a-file
+        // entry: `std::fs::read` returns a non-NotFound error, which stands in
+        // for any "configured CA cert we were asked to trust but can't honor"
+        // — the exact case the old `if let Ok(..)` guard swallowed.
+        let dir =
+            std::env::temp_dir().join(format!("adele-gtk-oauth-ca-dir-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let bad_cert = dir.join("not-a-real.pem");
-        std::fs::write(&bad_cert, b"this is not a valid PEM certificate").unwrap();
 
-        let result = build_http_client(Some(bad_cert.as_path()));
-        std::fs::remove_file(&bad_cert).ok();
+        let result = build_http_client(Some(dir.as_path()));
+        std::fs::remove_dir_all(&dir).ok();
 
         assert!(
             result.is_err(),
-            "an invalid configured CA cert must produce Err, not a silent default-trust client"
+            "a present-but-unloadable CA cert must produce Err, not a silent default-trust client"
         );
+    }
+
+    #[test]
+    fn build_http_client_tolerates_missing_ca_cert_path() {
+        // A *missing* CA file is "no cert configured" — callers always pass the
+        // daemon's default path even when it hasn't been generated. This must
+        // NOT error (preserves the success path); there is no configured cert
+        // to downgrade away from.
+        let missing = std::path::Path::new("/nonexistent/adele-gtk/ca-does-not-exist.pem");
+        assert!(build_http_client(Some(missing)).is_ok());
     }
 
     #[test]
@@ -390,7 +458,10 @@ mod tests {
         )
         .await;
 
-        let code = server.await.unwrap().expect("happy path must yield the code");
+        let code = server
+            .await
+            .unwrap()
+            .expect("happy path must yield the code");
         assert_eq!(code, "happy-code");
     }
 
