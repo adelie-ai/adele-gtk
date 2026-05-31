@@ -1454,3 +1454,584 @@ fn filter_messages(detail: &ConversationDetail, debug: bool) -> ConversationDeta
         model_selection: detail.model_selection.clone(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Fixtures --------------------------------------------------------
+
+    fn summary(id: &str, title: &str, archived: bool) -> ConversationSummary {
+        ConversationSummary {
+            id: id.to_string(),
+            title: title.to_string(),
+            message_count: 0,
+            archived,
+        }
+    }
+
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    fn detail(id: &str, messages: Vec<ChatMessage>) -> ConversationDetail {
+        ConversationDetail {
+            id: id.to_string(),
+            title: format!("conv {id}"),
+            messages,
+            model_selection: None,
+        }
+    }
+
+    fn selection(connection_id: &str, model_id: &str) -> api::ConversationModelSelectionView {
+        api::ConversationModelSelectionView {
+            connection_id: connection_id.to_string(),
+            model_id: model_id.to_string(),
+            effort: None,
+        }
+    }
+
+    fn listing(connection_id: &str, model_id: &str) -> api::ModelListing {
+        api::ModelListing {
+            connection_id: connection_id.to_string(),
+            connection_label: connection_id.to_string(),
+            model: api::ModelInfoView {
+                id: model_id.to_string(),
+                display_name: model_id.to_string(),
+                context_limit: None,
+                capabilities: api::ModelCapabilitiesView::default(),
+            },
+        }
+    }
+
+    // --- __pending__ sentinel handoff (#31) ------------------------------
+
+    #[test]
+    fn prompt_sent_sets_pending_sentinel_and_clears_buffer() {
+        let mut state = WindowState {
+            streaming_buffer: "leftover".to_string(),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::PromptSent {
+            task_id: "ack-1".to_string(),
+        });
+        assert!(effects.is_empty(), "PromptSent performs no widget effects");
+        assert_eq!(state.pending_request_id.as_deref(), Some("__pending__"));
+        assert!(state.streaming_buffer.is_empty());
+    }
+
+    #[test]
+    fn first_stream_chunk_claims_real_request_id_from_pending_sentinel() {
+        let mut state = WindowState {
+            pending_request_id: Some("__pending__".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::StreamChunk {
+            request_id: "req-real".to_string(),
+            chunk: "hello".to_string(),
+        });
+        // Sentinel is replaced by the daemon's real request id...
+        assert_eq!(state.pending_request_id.as_deref(), Some("req-real"));
+        assert_eq!(state.streaming_buffer, "hello");
+        // ...and because this is the first chunk, the chat status is cleared
+        // before the chunk is rendered.
+        assert!(
+            matches!(effects.as_slice(), [Effect::ClearChatStatus, Effect::ReceiveChunk(c)] if c == "hello"),
+            "unexpected effects: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn subsequent_stream_chunk_appends_without_clearing_status() {
+        let mut state = WindowState {
+            pending_request_id: Some("req-real".to_string()),
+            streaming_buffer: "hello".to_string(),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::StreamChunk {
+            request_id: "req-real".to_string(),
+            chunk: " world".to_string(),
+        });
+        assert_eq!(state.streaming_buffer, "hello world");
+        // Non-first chunk: only the chunk is rendered, no status clear.
+        assert!(
+            matches!(effects.as_slice(), [Effect::ReceiveChunk(c)] if c == " world"),
+            "unexpected effects: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn stream_chunk_for_unrelated_request_id_is_ignored() {
+        let mut state = WindowState {
+            pending_request_id: Some("req-real".to_string()),
+            streaming_buffer: "hello".to_string(),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::StreamChunk {
+            request_id: "some-other-req".to_string(),
+            chunk: "noise".to_string(),
+        });
+        assert!(effects.is_empty(), "stray chunk must not render");
+        assert_eq!(state.streaming_buffer, "hello", "buffer must be untouched");
+    }
+
+    #[test]
+    fn assistant_status_matches_pending_sentinel_before_request_id_known() {
+        let mut state = WindowState {
+            pending_request_id: Some("__pending__".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::AssistantStatus {
+            request_id: "req-not-yet-claimed".to_string(),
+            message: "Searching...".to_string(),
+        });
+        assert!(
+            matches!(effects.as_slice(), [Effect::SetChatStatus(m)] if m == "Searching..."),
+            "status during the __pending__ window must reach the chat: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn stream_complete_claims_sentinel_appends_message_and_clears_pending() {
+        let mut state = WindowState {
+            pending_request_id: Some("__pending__".to_string()),
+            streaming_buffer: "partial".to_string(),
+            current_conversation: Some(detail("c1", vec![msg("user", "hi")])),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-real".to_string(),
+            full_response: "the answer".to_string(),
+        });
+        assert!(state.pending_request_id.is_none());
+        assert!(state.streaming_buffer.is_empty());
+        let conv = state.current_conversation.as_ref().unwrap();
+        assert_eq!(conv.messages.last().unwrap().role, "assistant");
+        assert_eq!(conv.messages.last().unwrap().content, "the answer");
+        assert!(
+            matches!(effects.as_slice(), [Effect::ClearChatStatus, Effect::CompleteStreaming(c)] if c == "the answer"),
+            "unexpected effects: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn stream_error_clears_pending_and_sets_error_status() {
+        let mut state = WindowState {
+            pending_request_id: Some("req-real".to_string()),
+            streaming_buffer: "partial".to_string(),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::StreamError {
+            request_id: "req-real".to_string(),
+            error: "boom".to_string(),
+        });
+        assert!(state.pending_request_id.is_none());
+        assert!(state.streaming_buffer.is_empty());
+        assert!(
+            matches!(effects.as_slice(), [Effect::ClearChatStatus, Effect::SetStatusText(t)] if t == "Error: boom"),
+            "unexpected effects: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn disconnect_finalizes_in_progress_stream_with_connection_lost_marker() {
+        let mut state = WindowState {
+            pending_request_id: Some("req-real".to_string()),
+            streaming_buffer: "half a thought".to_string(),
+            current_conversation: Some(detail("c1", vec![])),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::Disconnected {
+            reason: "socket closed".to_string(),
+        });
+        assert!(state.pending_request_id.is_none());
+        assert!(state.streaming_buffer.is_empty());
+        // The partial response is committed to the conversation with the marker.
+        let last = state
+            .current_conversation
+            .as_ref()
+            .unwrap()
+            .messages
+            .last()
+            .unwrap();
+        assert_eq!(last.content, "half a thought\n\n[Connection lost]");
+        // Effects: clear client, desensitize send, status text, then finalize.
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::ClearClient,
+                    Effect::SetSendSensitive(false),
+                    Effect::SetStatusText(t),
+                    Effect::CompleteStreaming(c),
+                ] if t == "Disconnected: socket closed" && c == "half a thought\n\n[Connection lost]"
+            ),
+            "unexpected effects: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn disconnect_without_active_stream_does_not_emit_complete_streaming() {
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::Disconnected {
+            reason: "bye".to_string(),
+        });
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::ClearClient,
+                    Effect::SetSendSensitive(false),
+                    Effect::SetStatusText(_)
+                ]
+            ),
+            "no streaming buffer => no CompleteStreaming: {effects:?}"
+        );
+    }
+
+    // --- Archived-list refresh -------------------------------------------
+
+    #[test]
+    fn conversations_loaded_stores_list_and_refreshes_sidebar_then_ensures_active() {
+        // The "show archived" toggle re-fetches and re-delivers the list via
+        // ConversationsLoaded; apply must repaint the sidebar with the new
+        // (possibly archived-including) set and re-run ensure-active.
+        let mut state = WindowState::default();
+        let convs = vec![
+            summary("c1", "Active one", false),
+            summary("c2", "Archived one", true),
+        ];
+        let effects = state.apply(UiMessage::ConversationsLoaded(convs.clone()));
+        assert_eq!(state.conversations.len(), 2);
+        assert_eq!(state.conversations[1].id, "c2");
+        assert!(state.conversations[1].archived);
+        match effects.as_slice() {
+            [
+                Effect::SetConversations(got),
+                Effect::EnsureActiveConversation,
+            ] => {
+                assert_eq!(got.len(), 2);
+                assert_eq!(got[1].id, "c2");
+            }
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deleting_active_conversation_clears_chat_and_re_ensures_active() {
+        let mut state = WindowState {
+            conversations: vec![summary("c1", "one", false), summary("c2", "two", false)],
+            current_conversation_id: Some("c1".to_string()),
+            current_conversation: Some(detail("c1", vec![])),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::ConversationDeleted {
+            id: "c1".to_string(),
+        });
+        assert_eq!(state.conversations.len(), 1);
+        assert_eq!(state.conversations[0].id, "c2");
+        assert!(state.current_conversation_id.is_none());
+        assert!(state.current_conversation.is_none());
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::SetConversations(_),
+                    Effect::ClearChat,
+                    Effect::EnsureActiveConversation
+                ]
+            ),
+            "deleting the active conversation must clear chat + re-ensure: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn deleting_inactive_conversation_only_refreshes_sidebar() {
+        let mut state = WindowState {
+            conversations: vec![summary("c1", "one", false), summary("c2", "two", false)],
+            current_conversation_id: Some("c1".to_string()),
+            current_conversation: Some(detail("c1", vec![])),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::ConversationDeleted {
+            id: "c2".to_string(),
+        });
+        assert!(state.current_conversation_id.as_deref() == Some("c1"));
+        assert!(
+            matches!(effects.as_slice(), [Effect::SetConversations(got)] if got.len() == 1),
+            "deleting an inactive conversation must not touch the chat: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn rename_updates_matching_conversation_title_and_refreshes_sidebar() {
+        let mut state = WindowState {
+            conversations: vec![summary("c1", "old", false), summary("c2", "keep", false)],
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::ConversationRenamed {
+            id: "c1".to_string(),
+            title: "new title".to_string(),
+        });
+        assert_eq!(state.conversations[0].title, "new title");
+        assert_eq!(state.conversations[1].title, "keep");
+        match effects.as_slice() {
+            [Effect::SetConversations(got)] => assert_eq!(got[0].title, "new title"),
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn title_changed_signal_updates_matching_conversation_and_refreshes_sidebar() {
+        let mut state = WindowState {
+            conversations: vec![summary("c1", "untitled", false)],
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::TitleChanged {
+            conversation_id: "c1".to_string(),
+            title: "Auto Title".to_string(),
+        });
+        assert_eq!(state.conversations[0].title, "Auto Title");
+        assert!(matches!(effects.as_slice(), [Effect::SetConversations(_)]));
+    }
+
+    // --- Debug filter ----------------------------------------------------
+
+    #[test]
+    fn conversation_loaded_hides_tool_messages_when_debug_off() {
+        let mut state = WindowState {
+            debug_enabled: false,
+            ..Default::default()
+        };
+        let d = detail(
+            "c1",
+            vec![
+                msg("user", "hi"),
+                msg("tool", "tool noise"),
+                msg("assistant", "answer"),
+                msg("assistant", "   "), // empty (tool-calls only) assistant
+            ],
+        );
+        let effects = state.apply(UiMessage::ConversationLoaded(d));
+        // The cached (unfiltered) conversation keeps all 4 messages...
+        assert_eq!(
+            state.current_conversation.as_ref().unwrap().messages.len(),
+            4
+        );
+        // ...but the chat view receives only user + non-empty assistant.
+        match effects.as_slice() {
+            [
+                Effect::SetModelSelection(_),
+                Effect::LoadConversationIntoChat(filtered),
+            ] => {
+                let roles: Vec<&str> = filtered.messages.iter().map(|m| m.role.as_str()).collect();
+                assert_eq!(roles, vec!["user", "assistant"]);
+                assert_eq!(filtered.messages[1].content, "answer");
+            }
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conversation_loaded_shows_tool_messages_when_debug_on() {
+        let mut state = WindowState {
+            debug_enabled: true,
+            ..Default::default()
+        };
+        let d = detail(
+            "c1",
+            vec![
+                msg("user", "hi"),
+                msg("tool", "tool noise"),
+                msg("assistant", "   "),
+            ],
+        );
+        let effects = state.apply(UiMessage::ConversationLoaded(d));
+        match effects.as_slice() {
+            [
+                Effect::SetModelSelection(_),
+                Effect::LoadConversationIntoChat(filtered),
+            ] => {
+                // Debug on: nothing is filtered out.
+                assert_eq!(filtered.messages.len(), 3);
+            }
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conversation_loaded_sets_active_id_and_applies_stored_model_selection() {
+        let mut state = WindowState::default();
+        let mut d = detail("c9", vec![msg("user", "hi")]);
+        d.model_selection = Some(selection("work", "claude"));
+        let effects = state.apply(UiMessage::ConversationLoaded(d));
+        assert_eq!(state.current_conversation_id.as_deref(), Some("c9"));
+        match effects.as_slice() {
+            [
+                Effect::SetModelSelection(Some(sel)),
+                Effect::LoadConversationIntoChat(_),
+            ] => {
+                assert_eq!(sel.connection_id, "work");
+                assert_eq!(sel.model_id, "claude");
+            }
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    // --- Model-picker re-application -------------------------------------
+
+    #[test]
+    fn models_loaded_reapplies_active_conversation_selection_and_shows_picker() {
+        let mut conv = detail("c1", vec![]);
+        conv.model_selection = Some(selection("work", "claude"));
+        let mut state = WindowState {
+            current_conversation: Some(conv),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::ModelsLoaded(vec![listing("work", "claude")]));
+        // set_models resets the dropdown, so apply must re-emit the stored
+        // selection, then make the picker visible (non-empty list).
+        match effects.as_slice() {
+            [
+                Effect::SetModels(models),
+                Effect::SetModelSelection(Some(sel)),
+                Effect::SetModelPickerVisible(true),
+            ] => {
+                assert_eq!(models.len(), 1);
+                assert_eq!(sel.model_id, "claude");
+            }
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn models_loaded_empty_list_hides_picker_and_skips_reapply_when_no_conversation() {
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::ModelsLoaded(Vec::new()));
+        match effects.as_slice() {
+            [
+                Effect::SetModels(models),
+                Effect::SetModelPickerVisible(false),
+            ] => {
+                assert!(models.is_empty());
+            }
+            other => panic!("unexpected effects (no conversation => no reapply): {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dangling_model_warning_for_current_conversation_clears_picker_and_cached_selection() {
+        let mut conv = detail("c1", vec![]);
+        conv.model_selection = Some(selection("old", "gone"));
+        let mut state = WindowState {
+            current_conversation: Some(conv),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let warning = api::ConversationWarning::DanglingModelSelection {
+            previous_selection: selection("old", "gone"),
+            fallback_to: selection("work", "claude"),
+        };
+        let effects = state.apply(UiMessage::ConversationWarning {
+            conversation_id: "c1".to_string(),
+            warning,
+        });
+        // Cached selection must be cleared so a later ModelsLoaded doesn't
+        // re-apply the stale dangling selection, contradicting the toast.
+        assert!(
+            state
+                .current_conversation
+                .as_ref()
+                .unwrap()
+                .model_selection
+                .is_none()
+        );
+        match effects.as_slice() {
+            [Effect::SetModelSelection(None), Effect::ShowToast(message)] => {
+                assert!(message.contains("gone"));
+                assert!(message.contains("claude"));
+            }
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dangling_model_warning_for_other_conversation_only_toasts() {
+        let mut conv = detail("c1", vec![]);
+        conv.model_selection = Some(selection("old", "gone"));
+        let mut state = WindowState {
+            current_conversation: Some(conv),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let warning = api::ConversationWarning::DanglingModelSelection {
+            previous_selection: selection("old", "gone"),
+            fallback_to: selection("work", "claude"),
+        };
+        let effects = state.apply(UiMessage::ConversationWarning {
+            conversation_id: "c2-not-current".to_string(),
+            warning,
+        });
+        // Not the current conversation: don't touch the picker or cached
+        // selection — only surface the advisory toast.
+        assert!(
+            state
+                .current_conversation
+                .as_ref()
+                .unwrap()
+                .model_selection
+                .is_some()
+        );
+        assert!(
+            matches!(effects.as_slice(), [Effect::ShowToast(_)]),
+            "unexpected effects: {effects:?}"
+        );
+    }
+
+    // --- Simple passthrough variants -------------------------------------
+
+    #[test]
+    fn status_update_sets_status_text_verbatim() {
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::StatusUpdate("Connecting".to_string()));
+        assert!(matches!(effects.as_slice(), [Effect::SetStatusText(t)] if t == "Connecting"));
+    }
+
+    #[test]
+    fn error_message_is_prefixed_in_status_bar() {
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::Error("nope".to_string()));
+        assert!(matches!(effects.as_slice(), [Effect::SetStatusText(t)] if t == "Error: nope"));
+    }
+
+    #[test]
+    fn connected_sets_label_and_enables_send() {
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::Connected {
+            label: "Local daemon".to_string(),
+        });
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::SetStatusText(t), Effect::SetSendSensitive(true)] if t == "Local daemon"
+            ),
+            "unexpected effects: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn conversation_created_sets_active_id_without_effects() {
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::ConversationCreated {
+            id: "new-c".to_string(),
+        });
+        assert_eq!(state.current_conversation_id.as_deref(), Some("new-c"));
+        assert!(effects.is_empty());
+    }
+}
