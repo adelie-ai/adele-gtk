@@ -88,6 +88,14 @@ pub enum UiMessage {
     /// Available (connection, model) pairs, fetched once on connect.
     /// Empty list means the picker should hide (e.g. D-Bus transport).
     ModelsLoaded(Vec<api::ModelListing>),
+    /// The resolved interactive-purpose default model, fetched via
+    /// `GetPurposes` on connect (and re-fetched after Settings edits). The
+    /// picker uses it as the fallback selection for conversations with no
+    /// stored selection, so the button always shows a concrete model instead
+    /// of a "(default)" placeholder. `None` when it can't be resolved (the
+    /// command failed, the interactive purpose is unset, or it uses the
+    /// "primary"/inherit sentinel) — the picker then degrades to "Model".
+    DefaultModelLoaded(Option<crate::selected_models::SelectedModel>),
     Connected {
         label: String,
     },
@@ -198,6 +206,9 @@ impl std::fmt::Debug for UiMessage {
                 .field("task_id", task_id)
                 .finish(),
             UiMessage::ModelsLoaded(v) => f.debug_tuple("ModelsLoaded").field(v).finish(),
+            UiMessage::DefaultModelLoaded(v) => {
+                f.debug_tuple("DefaultModelLoaded").field(v).finish()
+            }
             UiMessage::Connected { label } => {
                 f.debug_struct("Connected").field("label", label).finish()
             }
@@ -343,6 +354,25 @@ pub async fn connection_manager(config: ConnectionConfig, ui_tx: mpsc::Unbounded
                     return;
                 }
 
+                // Resolve the interactive-purpose default model so the picker
+                // can show a concrete fallback for conversations with no stored
+                // selection (issue #53). Graceful: on failure (or a D-Bus
+                // transport that doesn't carry GetPurposes) we send `None` and
+                // the picker degrades to its last-resort "Model" label.
+                let default_model = match crate::management_client::get_purposes(&transport).await {
+                    Ok(purposes) => interactive_default_from_purposes(&purposes),
+                    Err(e) => {
+                        tracing::warn!("get_purposes failed; default model unresolved: {e}");
+                        None
+                    }
+                };
+                if ui_tx
+                    .send(UiMessage::DefaultModelLoaded(default_model))
+                    .is_err()
+                {
+                    return;
+                }
+
                 // Subscribe to background-task events and fetch the initial
                 // snapshot over the command channel (Uds and Ws). The D-Bus
                 // surface does not expose background tasks (issue #116 covers
@@ -423,6 +453,33 @@ pub async fn connection_manager(config: ConnectionConfig, ui_tx: mpsc::Unbounded
     }
 }
 
+/// The daemon sentinel meaning "inherit from the interactive purpose"; it
+/// never appears for the *interactive* purpose itself, but we guard against it
+/// (and empty fields) defensively so a malformed config degrades to "no
+/// default" rather than pinning a non-resolvable model.
+const PRIMARY_SENTINEL: &str = "primary";
+
+/// Extract the interactive purpose's concrete `(connection, model)` as a
+/// [`SelectedModel`]. Returns `None` when the interactive purpose is unset, has
+/// an empty connection/model, or uses the `"primary"` inherit sentinel — any of
+/// which means there's no concrete model to pin. Pure; unit-tested below.
+///
+/// Shared with `window.rs`, which re-resolves the default after Settings edits.
+pub(crate) fn interactive_default_from_purposes(
+    purposes: &api::PurposesView,
+) -> Option<crate::selected_models::SelectedModel> {
+    let cfg = purposes.interactive.as_ref()?;
+    let is_resolvable = |field: &str| !field.is_empty() && field != PRIMARY_SENTINEL;
+    if is_resolvable(&cfg.connection) && is_resolvable(&cfg.model) {
+        Some(crate::selected_models::SelectedModel {
+            connection_id: cfg.connection.clone(),
+            model_id: cfg.model.clone(),
+        })
+    } else {
+        None
+    }
+}
+
 /// Translate a `SignalEvent` from `client-common` into the corresponding
 /// `UiMessage` the GTK main thread consumes. Pure mapping; tested below.
 fn signal_to_ui_message(signal: SignalEvent) -> UiMessage {
@@ -487,6 +544,52 @@ mod tests {
             title: "demo".to_string(),
             progress_hint: None,
         }
+    }
+
+    fn purpose_cfg(connection: &str, model: &str) -> api::PurposeConfigView {
+        api::PurposeConfigView {
+            connection: connection.to_string(),
+            model: model.to_string(),
+            effort: None,
+            max_context_tokens: None,
+        }
+    }
+
+    #[test]
+    fn interactive_default_resolves_concrete_connection_and_model() {
+        let purposes = api::PurposesView {
+            interactive: Some(purpose_cfg("work", "claude")),
+            ..Default::default()
+        };
+        let resolved = interactive_default_from_purposes(&purposes).expect("resolvable");
+        assert_eq!(resolved.connection_id, "work");
+        assert_eq!(resolved.model_id, "claude");
+    }
+
+    #[test]
+    fn interactive_default_is_none_when_interactive_purpose_unset() {
+        let purposes = api::PurposesView::default();
+        assert!(interactive_default_from_purposes(&purposes).is_none());
+    }
+
+    #[test]
+    fn interactive_default_is_none_for_primary_inherit_sentinel() {
+        // The interactive purpose shouldn't use the inherit sentinel, but a
+        // malformed config must degrade to "no default" rather than pin it.
+        let purposes = api::PurposesView {
+            interactive: Some(purpose_cfg("primary", "primary")),
+            ..Default::default()
+        };
+        assert!(interactive_default_from_purposes(&purposes).is_none());
+    }
+
+    #[test]
+    fn interactive_default_is_none_when_model_field_empty() {
+        let purposes = api::PurposesView {
+            interactive: Some(purpose_cfg("work", "")),
+            ..Default::default()
+        };
+        assert!(interactive_default_from_purposes(&purposes).is_none());
     }
 
     #[test]

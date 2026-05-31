@@ -28,11 +28,28 @@ pub struct ModelPicker {
     available: Rc<RefCell<Vec<api::ModelListing>>>,
     /// User's curated subset, mirrored to `selected_models.json`.
     selected: Rc<RefCell<Vec<SelectedModel>>>,
-    /// Currently active selection. `None` means "use the daemon default" —
-    /// we leave the override field empty and let the daemon fall back to
-    /// the conversation's stored selection or the interactive purpose.
+    /// Currently active selection. Normally `Some` — either the conversation's
+    /// stored selection or, when it has none, the resolved interactive-purpose
+    /// default (see `resolve_active`). `current_override` returns this verbatim,
+    /// so a conversation on the default pins it on the first send. Only `None`
+    /// when even the default can't be resolved (the button then shows "Model").
     active: Rc<RefCell<Option<SelectedModel>>>,
+    /// The interactive-purpose default model, resolved from `GetPurposes` on
+    /// connect (and after Settings edits). Used as the fallback selection for
+    /// conversations with no stored selection. `None` until resolved (or when
+    /// it can't be — e.g. the interactive purpose uses the inherit sentinel).
+    default_model: Rc<RefCell<Option<SelectedModel>>>,
     store: Rc<SelectedModelsStore>,
+}
+
+/// Resolve the picker's active selection: a conversation's stored selection
+/// wins; otherwise fall back to the resolved interactive-purpose default. Pure
+/// so the precedence can be unit-tested without a live GTK context.
+fn resolve_active(
+    stored: Option<SelectedModel>,
+    default: Option<SelectedModel>,
+) -> Option<SelectedModel> {
+    stored.or(default)
 }
 
 impl ModelPicker {
@@ -45,7 +62,7 @@ impl ModelPicker {
         container.append(&label);
 
         let menu_button = MenuButton::new();
-        menu_button.set_label("(default)");
+        menu_button.set_label("Model");
         menu_button.set_tooltip_text(Some(
             "Pick a model for this conversation. The choice is remembered \
              until you change it again.",
@@ -65,6 +82,7 @@ impl ModelPicker {
             available: Rc::new(RefCell::new(Vec::new())),
             selected: Rc::new(RefCell::new(Vec::new())),
             active: Rc::new(RefCell::new(None)),
+            default_model: Rc::new(RefCell::new(None)),
             store: Rc::new(SelectedModelsStore::new()),
         }
     }
@@ -120,16 +138,41 @@ impl ModelPicker {
         self.refresh_button_label();
     }
 
-    /// Apply the active conversation's stored selection (or clear when the
-    /// argument is `None`). Updates the visible label without rebuilding
-    /// the popover; callers are expected to have already populated the
-    /// available list.
+    /// Apply the active conversation's stored selection. When the argument is
+    /// `None` (no stored selection), the picker falls back to the resolved
+    /// interactive-purpose default so the button still shows a concrete model.
+    /// Updates the visible label without rebuilding the popover; callers are
+    /// expected to have already populated the available list.
     pub fn set_selection(&self, selection: Option<&api::ConversationModelSelectionView>) {
-        let active = selection.map(|s| SelectedModel {
+        let stored = selection.map(|s| SelectedModel {
             connection_id: s.connection_id.clone(),
             model_id: s.model_id.clone(),
         });
-        *self.active.borrow_mut() = active;
+        let default = self.default_model.borrow().clone();
+        *self.active.borrow_mut() = resolve_active(stored, default);
+        self.refresh_button_label();
+    }
+
+    /// Set the resolved interactive-purpose default, used as the fallback
+    /// selection for conversations with no stored selection. Stores the value
+    /// and, when nothing is actively selected yet, adopts it so the button
+    /// shows a concrete model even before a conversation finishes loading.
+    /// `None` clears the default (e.g. `GetPurposes` failed or the interactive
+    /// purpose uses the inherit sentinel) — the button then shows the
+    /// last-resort "Model" text unless a stored selection is present.
+    ///
+    /// Re-application on conversation change is driven by `set_selection`,
+    /// which re-resolves `stored.or(default)` on every conversation load; this
+    /// method only needs to fill in the default when no selection is active
+    /// (connect, or after a Settings edit on a conversation still on the
+    /// default — the `ModelsLoaded` flow re-runs `set_selection` there).
+    pub fn set_default_model(&self, default: Option<SelectedModel>) {
+        *self.default_model.borrow_mut() = default.clone();
+        // Adopt the default only when nothing is actively selected — never
+        // clobber a conversation's explicit selection.
+        if self.active.borrow().is_none() {
+            *self.active.borrow_mut() = default;
+        }
         self.refresh_button_label();
     }
 
@@ -157,7 +200,9 @@ impl ModelPicker {
         let active = self.active.borrow();
         let label_text = match active.as_ref() {
             Some(sel) => self.label_for(sel),
-            None => "(default)".to_string(),
+            // Last resort only: neither a stored selection nor a resolved
+            // default is known (e.g. before connect, or GetPurposes failed).
+            None => "Model".to_string(),
         };
         self.menu_button.set_label(&label_text);
     }
@@ -274,11 +319,17 @@ fn rebuild_popover_into(
         empty.set_margin_bottom(6);
         menu_box.append(&empty);
     } else {
+        let active_now = active.borrow().clone();
         for sel in selected_list.iter() {
             let label_text = label_for(sel, available);
             let btn = Button::with_label(&label_text);
             btn.add_css_class("context-button");
             btn.set_halign(Align::Fill);
+            // Mark the row matching the active selection (whether that's the
+            // conversation's stored pick or the resolved default).
+            if active_now.as_ref() == Some(sel) {
+                btn.add_css_class("selected-model");
+            }
 
             let sel_owned = sel.clone();
             btn.connect_clicked(glib::clone!(
@@ -310,7 +361,7 @@ fn refresh_menu_button_label(
 ) {
     let text = match active.borrow().as_ref() {
         Some(sel) => label_for(sel, available),
-        None => "(default)".to_string(),
+        None => "Model".to_string(),
     };
     menu_button.set_label(&text);
 }
@@ -337,4 +388,37 @@ fn format_label(listing: &api::ModelListing) -> String {
         listing.model.display_name.as_str()
     };
     format!("{} · {}", model_label, listing.connection_label)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model(connection_id: &str, model_id: &str) -> SelectedModel {
+        SelectedModel {
+            connection_id: connection_id.to_string(),
+            model_id: model_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_active_prefers_stored_selection_over_default() {
+        let stored = model("work", "claude");
+        let default = model("openai", "gpt-4o");
+        assert_eq!(
+            resolve_active(Some(stored.clone()), Some(default)),
+            Some(stored)
+        );
+    }
+
+    #[test]
+    fn resolve_active_falls_back_to_default_when_no_stored_selection() {
+        let default = model("openai", "gpt-4o");
+        assert_eq!(resolve_active(None, Some(default.clone())), Some(default));
+    }
+
+    #[test]
+    fn resolve_active_is_none_when_neither_is_present() {
+        assert_eq!(resolve_active(None, None), None);
+    }
 }

@@ -77,6 +77,10 @@ enum Effect {
     SetModelSelection(Option<api::ConversationModelSelectionView>),
     /// Replace the model-picker's available models.
     SetModels(Vec<api::ModelListing>),
+    /// Set the picker's resolved interactive-purpose default (issue #53). Used
+    /// as the fallback selection for conversations with no stored selection so
+    /// the button shows a concrete model instead of "(default)".
+    SetDefaultModel(Option<crate::selected_models::SelectedModel>),
     /// Show/hide the model picker.
     SetModelPickerVisible(bool),
     /// Reveal a passive toast with the given message.
@@ -122,6 +126,7 @@ impl std::fmt::Debug for Effect {
             Effect::CompleteStreaming(c) => f.debug_tuple("CompleteStreaming").field(c).finish(),
             Effect::SetModelSelection(s) => f.debug_tuple("SetModelSelection").field(s).finish(),
             Effect::SetModels(m) => f.debug_tuple("SetModels").field(m).finish(),
+            Effect::SetDefaultModel(m) => f.debug_tuple("SetDefaultModel").field(m).finish(),
             Effect::SetModelPickerVisible(v) => {
                 f.debug_tuple("SetModelPickerVisible").field(v).finish()
             }
@@ -348,6 +353,14 @@ impl WindowState {
                 }
                 effects.push(Effect::SetModelPickerVisible(visible));
                 effects
+            }
+            UiMessage::DefaultModelLoaded(default) => {
+                // The picker uses this as the fallback selection for
+                // conversations with no stored selection. Set it independently
+                // of `set_selection`; the picker re-resolves
+                // stored-or-default on every conversation load, so ordering
+                // between the two only requires both to have run.
+                vec![Effect::SetDefaultModel(default)]
             }
             UiMessage::Connected { label } => {
                 vec![Effect::SetStatusText(label), Effect::SetSendSensitive(true)]
@@ -1079,6 +1092,23 @@ impl AdelieWindow {
                             tracing::warn!("Failed to refresh models after settings: {e}");
                         }
                     }
+                    // The user may have changed the interactive purpose; re-fetch
+                    // purposes so the picker's default updates for conversations
+                    // still on the default (issue #53). Graceful: on failure we
+                    // emit `None` (picker degrades to "Model").
+                    let default_model =
+                        match management_client::get_purposes(&transport).await {
+                            Ok(purposes) => {
+                                crate::async_bridge::interactive_default_from_purposes(&purposes)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to refresh purposes after settings: {e}"
+                                );
+                                None
+                            }
+                        };
+                    let _ = tx.send(UiMessage::DefaultModelLoaded(default_model));
                 });
             }
         ));
@@ -1298,6 +1328,9 @@ fn handle_ui_message(
             }
             Effect::SetModels(listings) => {
                 model_picker.set_models(&listings);
+            }
+            Effect::SetDefaultModel(default) => {
+                model_picker.set_default_model(default);
             }
             Effect::SetModelPickerVisible(visible) => {
                 model_picker.set_visible(visible);
@@ -1923,6 +1956,33 @@ mod tests {
             }
             other => panic!("unexpected effects (no conversation => no reapply): {other:?}"),
         }
+    }
+
+    #[test]
+    fn default_model_loaded_emits_set_default_model_effect() {
+        let mut state = WindowState::default();
+        let default = crate::selected_models::SelectedModel {
+            connection_id: "work".to_string(),
+            model_id: "claude".to_string(),
+        };
+        let effects = state.apply(UiMessage::DefaultModelLoaded(Some(default.clone())));
+        match effects.as_slice() {
+            [Effect::SetDefaultModel(Some(got))] => {
+                assert_eq!(got.connection_id, "work");
+                assert_eq!(got.model_id, "claude");
+            }
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_model_loaded_none_emits_set_default_model_none() {
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::DefaultModelLoaded(None));
+        assert!(
+            matches!(effects.as_slice(), [Effect::SetDefaultModel(None)]),
+            "unresolved default must still emit a (None) effect: {effects:?}"
+        );
     }
 
     #[test]
