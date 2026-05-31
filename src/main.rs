@@ -21,7 +21,6 @@ mod window;
 
 use anyhow::Result;
 use clap::Parser;
-use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
 use gtk4::Application;
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -29,12 +28,12 @@ use tracing_subscriber::EnvFilter;
 
 use crate::async_bridge::spawn_on_runtime;
 use crate::credential_store::CredentialStore;
-use crate::profile::{LastConnectionStore, ProfileStore};
+use crate::profile::{
+    ConnectionProfile, LastConnectionStore, ProfileStore, ProtocolConfig, default_ws_subject,
+};
 use crate::widgets::login_screen::{LoginScreen, connect_to_profile};
 
 const APP_ID: &str = "org.adelie.DesktopAssistant";
-const DEFAULT_WS_URL: &str = desktop_assistant_client_common::config::DEFAULT_WS_URL;
-const DEFAULT_WS_SUBJECT: &str = desktop_assistant_client_common::config::DEFAULT_WS_SUBJECT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lower")]
@@ -46,78 +45,77 @@ enum CliTransportMode {
 #[derive(Debug, Parser)]
 #[command(name = "adele-gtk")]
 struct CliArgs {
-    #[arg(
-        long,
-        env = "ADELIE_GTK_TRANSPORT",
-        value_enum,
-        default_value_t = CliTransportMode::Ws
-    )]
-    transport: CliTransportMode,
-    #[arg(
-        long = "ws-url",
-        env = "ADELIE_GTK_WS_URL",
-        default_value = DEFAULT_WS_URL
-    )]
-    ws_url: String,
-    #[arg(
-        long = "ws-subject",
-        env = "ADELIE_GTK_WS_SUBJECT",
-        default_value = DEFAULT_WS_SUBJECT
-    )]
-    ws_subject: String,
-}
-
-impl From<CliArgs> for ConnectionConfig {
-    fn from(cli: CliArgs) -> Self {
-        let ws_url = {
-            let trimmed = cli.ws_url.trim();
-            if trimmed.is_empty() {
-                DEFAULT_WS_URL.to_string()
-            } else {
-                trimmed.to_string()
-            }
-        };
-
-        let ws_subject = {
-            let trimmed = cli.ws_subject.trim();
-            if trimmed.is_empty() {
-                DEFAULT_WS_SUBJECT.to_string()
-            } else {
-                trimmed.to_string()
-            }
-        };
-
-        let transport_mode = match cli.transport {
-            CliTransportMode::Ws => TransportMode::Ws,
-            CliTransportMode::Dbus => TransportMode::Dbus,
-        };
-
-        Self {
-            transport_mode,
-            ws_url,
-            ws_jwt: None,
-            ws_login_username: None,
-            ws_login_password: None,
-            ws_subject,
-            ..Default::default()
-        }
-    }
+    /// Override the startup transport. With `dbus`, connect to the local
+    /// daemon over D-Bus instead of replaying the saved auto-reconnect profile.
+    #[arg(long, env = "ADELIE_GTK_TRANSPORT", value_enum)]
+    transport: Option<CliTransportMode>,
+    /// Override the startup target with this WebSocket URL, bypassing the
+    /// saved-profile picker.
+    #[arg(long = "ws-url", env = "ADELIE_GTK_WS_URL")]
+    ws_url: Option<String>,
+    /// JWT subject to use with `--ws-url` (defaults to the standard subject).
+    #[arg(long = "ws-subject", env = "ADELIE_GTK_WS_SUBJECT")]
+    ws_subject: Option<String>,
 }
 
 /// CLI connection overrides; `None` for a field means the flag was not given.
+#[derive(Clone)]
 struct CliConnectionOverride {
     transport: Option<CliTransportMode>,
     ws_url: Option<String>,
     ws_subject: Option<String>,
 }
 
-/// Resolve the startup connection target. STUB — implemented after the
-/// failing-tests commit (#26).
+impl From<CliArgs> for CliConnectionOverride {
+    fn from(cli: CliArgs) -> Self {
+        Self {
+            transport: cli.transport,
+            ws_url: cli.ws_url,
+            ws_subject: cli.ws_subject,
+        }
+    }
+}
+
+impl CliConnectionOverride {
+    /// Whether any flag was supplied that overrides the saved startup target.
+    /// When false, the saved auto-reconnect profile is used unchanged.
+    fn is_active(&self) -> bool {
+        self.ws_url.is_some() || matches!(self.transport, Some(CliTransportMode::Dbus))
+    }
+}
+
+/// Resolve the startup connection target.
+///
+/// A CLI override takes precedence over the saved auto-reconnect profile so a
+/// headless/scripted/remote launch works without a pre-saved profile:
+/// - `--ws-url` produces an ephemeral WebSocket profile (with `--ws-subject`
+///   or the default subject), bypassing the picker.
+/// - otherwise `--transport dbus` forces the local daemon.
+/// - otherwise the saved `last_active` profile is returned unchanged.
 fn resolve_startup_target(
-    _cli: &CliConnectionOverride,
-    _last_active: Option<profile::ConnectionProfile>,
-) -> Option<profile::ConnectionProfile> {
-    None
+    cli: &CliConnectionOverride,
+    last_active: Option<ConnectionProfile>,
+) -> Option<ConnectionProfile> {
+    if let Some(url) = &cli.ws_url {
+        return Some(ConnectionProfile {
+            id: "cli-override".to_string(),
+            name: "CLI override".to_string(),
+            protocol: ProtocolConfig::Websocket {
+                url: url.clone(),
+                subject: cli.ws_subject.clone().unwrap_or_else(default_ws_subject),
+            },
+        });
+    }
+
+    if matches!(cli.transport, Some(CliTransportMode::Dbus)) {
+        return Some(ConnectionProfile {
+            id: "cli-local".to_string(),
+            name: "CLI override (local)".to_string(),
+            protocol: ProtocolConfig::Local { path: None },
+        });
+    }
+
+    last_active
 }
 
 fn main() -> Result<()> {
@@ -131,22 +129,25 @@ fn main() -> Result<()> {
 
     CredentialStore::init_store();
 
-    let cli = CliArgs::parse();
-    let _config = ConnectionConfig::from(cli);
+    let cli_override = CliConnectionOverride::from(CliArgs::parse());
 
     let app = Application::builder().application_id(APP_ID).build();
 
     app.connect_activate(move |app| {
-        // If a profile was used last time and is still configured, attempt to
-        // silently re-establish that connection. On any failure, fall back to
-        // the connection picker.
+        // Resolve the startup target: a CLI override (--ws-url / --transport
+        // dbus) wins over the saved auto-reconnect profile. On any failure,
+        // fall back to the connection picker.
+        let cli_override = cli_override.clone();
         let app_clone = app.clone();
         // Hold the application active across the async reconnect so it does
         // not shut down before the future creates its first window.
         let hold = app.hold();
         glib::spawn_future_local(async move {
             let _hold = hold;
-            if let Some(profile) = last_active_profile() {
+            // Ephemeral CLI-override profiles must not be persisted as the
+            // last connection; only refresh the marker for real saved profiles.
+            let override_active = cli_override.is_active();
+            if let Some(profile) = resolve_startup_target(&cli_override, last_active_profile()) {
                 let profile_id = profile.id.clone();
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 spawn_on_runtime(async move {
@@ -154,7 +155,9 @@ fn main() -> Result<()> {
                 });
                 match rx.await {
                     Ok(Ok(config)) => {
-                        if let Err(e) = LastConnectionStore::new().set(&profile_id) {
+                        if !override_active
+                            && let Err(e) = LastConnectionStore::new().set(&profile_id)
+                        {
                             tracing::warn!("Failed to refresh last-connection marker: {e}");
                         }
                         let main_win = window::AdelieWindow::new(&app_clone, config);
@@ -192,7 +195,6 @@ fn last_active_profile() -> Option<profile::ConnectionProfile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::{ConnectionProfile, ProtocolConfig, default_ws_subject};
 
     fn ws_profile(id: &str, url: &str) -> ConnectionProfile {
         ConnectionProfile {
