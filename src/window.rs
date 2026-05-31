@@ -1233,31 +1233,13 @@ pub fn install_app_icon() {
     let cache_root = dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("adele-gtk-icons");
-    let icon_dir = cache_root.join("hicolor").join("512x512").join("apps");
-    let icon_path = icon_dir.join(format!("{ICON_NAME}.png"));
 
-    if let Err(e) = std::fs::create_dir_all(&icon_dir) {
-        tracing::warn!("Failed to create icon dir: {e}");
+    // Resolves to <cache_root>/hicolor/512x512/apps/<ICON_NAME>.png; the
+    // helper creates the parent dirs and writes idempotently.
+    let icon_rel = format!("adele-gtk-icons/hicolor/512x512/apps/{ICON_NAME}.png");
+    if let Err(e) = crate::assets::extract_to_cache(ICON_BYTES, &icon_rel) {
+        tracing::warn!("Failed to install icon: {e}");
         return;
-    }
-    // Use create_new to avoid TOCTOU: the write either atomically creates the
-    // file or harmlessly fails because it already exists.
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&icon_path)
-    {
-        Ok(mut file) => {
-            if let Err(e) = std::io::Write::write_all(&mut file, ICON_BYTES) {
-                tracing::warn!("Failed to write icon: {e}");
-                return;
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => {
-            tracing::warn!("Failed to create icon file: {e}");
-            return;
-        }
     }
 
     let display = gdk::Display::default().expect("display");

@@ -7,6 +7,7 @@
 //! marshalled back onto the GTK main loop via [`async_bridge`]. Credentials
 //! and OAuth/OIDC login are handled by [`credential_store`] and [`oauth`].
 
+mod assets;
 mod async_bridge;
 mod avatars;
 mod credential_store;

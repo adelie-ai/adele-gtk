@@ -52,18 +52,16 @@ impl LoginScreen {
         brand_box.set_margin_bottom(16);
 
         const ICON_BYTES: &[u8] = include_bytes!("../../assets/adele_communicating.png");
-        let icon_path = dirs::cache_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("adele-gtk-brand-icon.png");
-        if let Err(e) = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&icon_path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, ICON_BYTES))
-            && e.kind() != std::io::ErrorKind::AlreadyExists
-        {
-            tracing::warn!("Failed to write brand icon: {e}");
-        }
+        let icon_path =
+            match crate::assets::extract_to_cache(ICON_BYTES, "adele-gtk-brand-icon.png") {
+                Ok(path) => path,
+                Err(e) => {
+                    tracing::warn!("Failed to write brand icon: {e}");
+                    dirs::cache_dir()
+                        .unwrap_or_else(std::env::temp_dir)
+                        .join("adele-gtk-brand-icon.png")
+                }
+            };
         let icon = Image::from_file(icon_path.to_str().unwrap_or_default());
         icon.set_pixel_size(56);
         brand_box.append(&icon);
