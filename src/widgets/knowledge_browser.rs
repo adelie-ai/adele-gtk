@@ -229,12 +229,16 @@ impl KnowledgeBrowser {
         // search debouncer, post-save/delete) holds a clone of the same
         // closure rather than each maintaining their own copy of the
         // captured `transport` / `bridge` / `msg_tx`.
-        let refresh: Rc<dyn Fn()> = {
-            let transport = Arc::clone(&transport);
-            let bridge = Rc::clone(&bridge);
-            let msg_tx = msg_tx.clone();
-            let state = Rc::clone(&state);
-            Rc::new(move || {
+        let refresh: Rc<dyn Fn()> = Rc::new(glib::clone!(
+            #[strong]
+            transport,
+            #[strong]
+            bridge,
+            #[strong]
+            msg_tx,
+            #[strong]
+            state,
+            move || {
                 let query = state.borrow().last_query.clone();
                 let transport = Arc::clone(&transport);
                 let msg_tx = msg_tx.clone();
@@ -251,26 +255,36 @@ impl KnowledgeBrowser {
                         Err(e) => msg_tx.send(BrowserMsg::Error(e.to_string())),
                     };
                 })
-            })
-        };
+            }
+        ));
 
         // GTK-side message pump. Dropped automatically when the window
         // closes (because the cloned widget refs are dropped, breaking
         // the channel).
-        {
-            let list_box = list_box.clone();
-            let list_status = list_status.clone();
-            let editor_status = editor_status.clone();
-            let id_label = id_label.clone();
-            let updated_label = updated_label.clone();
-            let content_view = content_view.clone();
-            let tags_entry = tags_entry.clone();
-            let metadata_view = metadata_view.clone();
-            let delete_button = delete_button.clone();
-            let state = Rc::clone(&state);
-            let refresh = Rc::clone(&refresh);
-
-            glib::spawn_future_local(async move {
+        glib::spawn_future_local(glib::clone!(
+            #[strong]
+            list_box,
+            #[strong]
+            list_status,
+            #[strong]
+            editor_status,
+            #[strong]
+            id_label,
+            #[strong]
+            updated_label,
+            #[strong]
+            content_view,
+            #[strong]
+            tags_entry,
+            #[strong]
+            metadata_view,
+            #[strong]
+            delete_button,
+            #[strong]
+            state,
+            #[strong]
+            refresh,
+            async move {
                 while let Some(msg) = msg_rx.recv().await {
                     match msg {
                         BrowserMsg::EntriesLoaded(entries) => {
@@ -321,58 +335,72 @@ impl KnowledgeBrowser {
                         }
                     }
                 }
-            });
-        }
+            }
+        ));
 
         // Initial load.
         refresh();
 
         // Refresh button.
-        {
-            let refresh = Rc::clone(&refresh);
-            refresh_button.connect_clicked(move |_| refresh());
-        }
+        refresh_button.connect_clicked(glib::clone!(
+            #[strong]
+            refresh,
+            move |_| refresh()
+        ));
 
         // Search entry: debounce keystrokes, then re-run the query.
         {
-            let state = Rc::clone(&state);
-            let list_status = list_status.clone();
-            let refresh = Rc::clone(&refresh);
             let search_handle: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-            search.connect_search_changed(move |entry| {
-                let q = entry.text().to_string();
-                state.borrow_mut().last_query = q;
-                list_status.set_text("Searching…");
-                // Cancel any pending debounce.
-                if let Some(prev) = search_handle.borrow_mut().take() {
-                    prev.remove();
+            search.connect_search_changed(glib::clone!(
+                #[strong]
+                state,
+                #[strong]
+                list_status,
+                #[strong]
+                refresh,
+                move |entry| {
+                    let q = entry.text().to_string();
+                    state.borrow_mut().last_query = q;
+                    list_status.set_text("Searching…");
+                    // Cancel any pending debounce.
+                    if let Some(prev) = search_handle.borrow_mut().take() {
+                        prev.remove();
+                    }
+                    let handle_slot = Rc::clone(&search_handle);
+                    let refresh_for_timeout = Rc::clone(&refresh);
+                    let timeout = glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS as u64),
+                        move || {
+                            // Drop our slot so we don't try to remove an
+                            // already-fired source on the next keystroke.
+                            let _ = handle_slot.borrow_mut().take();
+                            refresh_for_timeout();
+                        },
+                    );
+                    *search_handle.borrow_mut() = Some(timeout);
                 }
-                let handle_slot = Rc::clone(&search_handle);
-                let refresh_for_timeout = Rc::clone(&refresh);
-                let timeout = glib::timeout_add_local_once(
-                    std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS as u64),
-                    move || {
-                        // Drop our slot so we don't try to remove an
-                        // already-fired source on the next keystroke.
-                        let _ = handle_slot.borrow_mut().take();
-                        refresh_for_timeout();
-                    },
-                );
-                *search_handle.borrow_mut() = Some(timeout);
-            });
+            ));
         }
 
         // List selection: load the selected entry into the editor.
-        {
-            let state = Rc::clone(&state);
-            let id_label = id_label.clone();
-            let updated_label = updated_label.clone();
-            let content_view = content_view.clone();
-            let tags_entry = tags_entry.clone();
-            let metadata_view = metadata_view.clone();
-            let delete_button = delete_button.clone();
-            let editor_status = editor_status.clone();
-            list_box.connect_row_selected(move |_, row| {
+        list_box.connect_row_selected(glib::clone!(
+            #[strong]
+            state,
+            #[strong]
+            id_label,
+            #[strong]
+            updated_label,
+            #[strong]
+            content_view,
+            #[strong]
+            tags_entry,
+            #[strong]
+            metadata_view,
+            #[strong]
+            delete_button,
+            #[strong]
+            editor_status,
+            move |_, row| {
                 let Some(row) = row else {
                     return;
                 };
@@ -395,21 +423,30 @@ impl KnowledgeBrowser {
                     &delete_button,
                     entry,
                 );
-            });
-        }
+            }
+        ));
 
         // "+ New" button: clear the editor.
-        {
-            let state = Rc::clone(&state);
-            let id_label = id_label.clone();
-            let updated_label = updated_label.clone();
-            let content_view = content_view.clone();
-            let tags_entry = tags_entry.clone();
-            let metadata_view = metadata_view.clone();
-            let delete_button = delete_button.clone();
-            let editor_status = editor_status.clone();
-            let list_box = list_box.clone();
-            new_button.connect_clicked(move |_| {
+        new_button.connect_clicked(glib::clone!(
+            #[strong]
+            state,
+            #[strong]
+            id_label,
+            #[strong]
+            updated_label,
+            #[strong]
+            content_view,
+            #[strong]
+            tags_entry,
+            #[strong]
+            metadata_view,
+            #[strong]
+            delete_button,
+            #[strong]
+            editor_status,
+            #[strong]
+            list_box,
+            move |_| {
                 state.borrow_mut().editor.selected_id = None;
                 list_box.unselect_all();
                 clear_editor(
@@ -422,20 +459,28 @@ impl KnowledgeBrowser {
                 );
                 editor_status.set_text("New entry — fill in content and Save.");
                 content_view.grab_focus();
-            });
-        }
+            }
+        ));
 
         // Save button: create or update.
-        {
-            let transport = Arc::clone(&transport);
-            let bridge = Rc::clone(&bridge);
-            let msg_tx = msg_tx.clone();
-            let state = Rc::clone(&state);
-            let content_view = content_view.clone();
-            let tags_entry = tags_entry.clone();
-            let metadata_view = metadata_view.clone();
-            let editor_status = editor_status.clone();
-            save_button.connect_clicked(move |_| {
+        save_button.connect_clicked(glib::clone!(
+            #[strong]
+            transport,
+            #[strong]
+            bridge,
+            #[strong]
+            msg_tx,
+            #[strong]
+            state,
+            #[strong]
+            content_view,
+            #[strong]
+            tags_entry,
+            #[strong]
+            metadata_view,
+            #[strong]
+            editor_status,
+            move |_| {
                 let buffer = content_view.buffer();
                 let content = buffer
                     .text(&buffer.start_iter(), &buffer.end_iter(), false)
@@ -483,21 +528,27 @@ impl KnowledgeBrowser {
                         Err(e) => msg_tx.send(BrowserMsg::Error(e.to_string())),
                     };
                 });
-            });
-        }
+            }
+        ));
 
         // Delete button: confirm via a tiny modal Window, then delete.
         // (`AlertDialog` is gated behind gtk4-rs `v4_10` which the
         // crate doesn't currently enable; rolling our own keeps the
         // dependency surface unchanged.)
-        {
-            let transport = Arc::clone(&transport);
-            let bridge = Rc::clone(&bridge);
-            let msg_tx = msg_tx.clone();
-            let state = Rc::clone(&state);
-            let editor_status = editor_status.clone();
-            let parent_window = window.clone();
-            delete_button.connect_clicked(move |_| {
+        delete_button.connect_clicked(glib::clone!(
+            #[strong]
+            transport,
+            #[strong]
+            bridge,
+            #[strong]
+            msg_tx,
+            #[strong]
+            state,
+            #[strong]
+            editor_status,
+            #[weak(rename_to = parent_window)]
+            window,
+            move |_| {
                 let Some(id) = state.borrow().editor.selected_id.clone() else {
                     return;
                 };
@@ -527,17 +578,23 @@ impl KnowledgeBrowser {
                 layout.append(&buttons);
                 confirm.set_child(Some(&layout));
 
-                {
-                    let confirm = confirm.clone();
-                    cancel.connect_clicked(move |_| confirm.close());
-                }
-                {
-                    let transport = Arc::clone(&transport);
-                    let bridge = Rc::clone(&bridge);
-                    let msg_tx = msg_tx.clone();
-                    let editor_status = editor_status.clone();
-                    let confirm_window = confirm.clone();
-                    confirm_btn.connect_clicked(move |_| {
+                cancel.connect_clicked(glib::clone!(
+                    #[weak]
+                    confirm,
+                    move |_| confirm.close()
+                ));
+                confirm_btn.connect_clicked(glib::clone!(
+                    #[strong]
+                    transport,
+                    #[strong]
+                    bridge,
+                    #[strong]
+                    msg_tx,
+                    #[strong]
+                    editor_status,
+                    #[weak(rename_to = confirm_window)]
+                    confirm,
+                    move |_| {
                         confirm_window.close();
                         editor_status.set_text("Deleting…");
                         let id_for_async = id.clone();
@@ -552,12 +609,12 @@ impl KnowledgeBrowser {
                                 Err(e) => msg_tx.send(BrowserMsg::Error(e.to_string())),
                             };
                         });
-                    });
-                }
+                    }
+                ));
 
                 confirm.present();
-            });
-        }
+            }
+        ));
 
         Self { window }
     }

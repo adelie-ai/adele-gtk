@@ -12,7 +12,7 @@ use desktop_assistant_api_model as api;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box as GtkBox, Button, Label, ListBox, ListBoxRow, MenuButton, Orientation, Popover,
-    ScrolledWindow, SelectionMode, Separator,
+    ScrolledWindow, SelectionMode, Separator, glib,
 };
 
 use super::connection_config_dialog::ConnectorType;
@@ -63,14 +63,18 @@ impl ConnectionsTab {
             let btn = Button::with_label(connector.label());
             btn.add_css_class("context-button");
             btn.set_halign(Align::Fill);
-            let on_add_inner = Rc::clone(&on_add);
-            let popover_ref = popover.clone();
-            btn.connect_clicked(move |_| {
-                popover_ref.popdown();
-                if let Some(ref cb) = *on_add_inner.borrow() {
-                    cb(connector);
+            btn.connect_clicked(glib::clone!(
+                #[strong(rename_to = on_add_inner)]
+                on_add,
+                #[weak(rename_to = popover_ref)]
+                popover,
+                move |_| {
+                    popover_ref.popdown();
+                    if let Some(ref cb) = *on_add_inner.borrow() {
+                        cb(connector);
+                    }
                 }
-            });
+            ));
             popover_box.append(&btn);
         }
         popover.set_child(Some(&popover_box));
@@ -194,24 +198,30 @@ impl ConnectionsTab {
         hbox.append(&text_col);
 
         let configure_btn = Button::with_label("Configure");
-        let on_configure = Rc::clone(&self.on_configure);
         let id_for_configure = conn.id.clone();
-        configure_btn.connect_clicked(move |_| {
-            if let Some(ref cb) = *on_configure.borrow() {
-                cb(id_for_configure.clone());
+        configure_btn.connect_clicked(glib::clone!(
+            #[strong(rename_to = on_configure)]
+            self.on_configure,
+            move |_| {
+                if let Some(ref cb) = *on_configure.borrow() {
+                    cb(id_for_configure.clone());
+                }
             }
-        });
+        ));
         hbox.append(&configure_btn);
 
         let remove_btn = Button::with_label("Remove");
         remove_btn.add_css_class("destructive-action");
-        let on_remove = Rc::clone(&self.on_remove);
         let id_for_remove = conn.id.clone();
-        remove_btn.connect_clicked(move |_| {
-            if let Some(ref cb) = *on_remove.borrow() {
-                cb(id_for_remove.clone());
+        remove_btn.connect_clicked(glib::clone!(
+            #[strong(rename_to = on_remove)]
+            self.on_remove,
+            move |_| {
+                if let Some(ref cb) = *on_remove.borrow() {
+                    cb(id_for_remove.clone());
+                }
             }
-        });
+        ));
         hbox.append(&remove_btn);
 
         row.set_child(Some(&hbox));

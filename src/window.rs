@@ -15,7 +15,7 @@ use gtk4::{
 };
 use tokio::sync::mpsc;
 
-use crate::async_bridge::{AsyncBridge, InternalMsg, UiMessage, connection_manager};
+use crate::async_bridge::{AsyncBridge, UiMessage, connection_manager};
 use crate::management_client;
 use crate::widgets::chat_view::ChatView;
 use crate::widgets::input_bar::InputBar;
@@ -32,8 +32,6 @@ struct WindowState {
     streaming_buffer: String,
     debug_enabled: bool,
 }
-
-// InternalMsg is now defined in async_bridge and re-imported.
 
 pub struct AdelieWindow {
     pub window: ApplicationWindow,
@@ -173,10 +171,11 @@ impl AdelieWindow {
         toast_row.append(&toast_label);
         let toast_dismiss = Button::from_icon_name("window-close-symbolic");
         toast_dismiss.add_css_class("flat");
-        {
-            let revealer_ref = toast_revealer.clone();
-            toast_dismiss.connect_clicked(move |_| revealer_ref.set_reveal_child(false));
-        }
+        toast_dismiss.connect_clicked(glib::clone!(
+            #[weak]
+            toast_revealer,
+            move |_| toast_revealer.set_reveal_child(false)
+        ));
         toast_row.append(&toast_dismiss);
         toast_revealer.set_child(Some(&toast_row));
         right_box.append(&toast_revealer);
@@ -236,23 +235,29 @@ impl AdelieWindow {
         // Client wrapped in Arc for async tasks, Rc<RefCell<>> for GTK thread
         let client: Rc<RefCell<Option<Arc<TransportClient>>>> = Rc::new(RefCell::new(None));
 
-        // Internal channel for transport bootstrap (sends non-Send types via main thread)
-        let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<InternalMsg>();
-
         // Set up async bridge with UI message handler
-        let bridge = {
-            let state = Rc::clone(&state);
-            let sidebar = Rc::clone(&sidebar);
-            let chat_view = Rc::clone(&chat_view);
-            let status_label = Rc::clone(&status_label);
-            let client = Rc::clone(&client);
-            let input_bar = Rc::clone(&input_bar);
-            let model_picker = Rc::clone(&model_picker);
-            let tasks_panel = Rc::clone(&tasks_panel);
-            let toast_revealer = Rc::clone(&toast_revealer);
-            let toast_label = Rc::clone(&toast_label);
-
-            AsyncBridge::new(move |msg, ui_tx| {
+        let bridge = AsyncBridge::new(glib::clone!(
+            #[strong]
+            state,
+            #[strong]
+            sidebar,
+            #[strong]
+            chat_view,
+            #[strong]
+            status_label,
+            #[strong]
+            client,
+            #[strong]
+            input_bar,
+            #[strong]
+            model_picker,
+            #[strong]
+            tasks_panel,
+            #[strong]
+            toast_revealer,
+            #[strong]
+            toast_label,
+            move |msg, ui_tx| {
                 handle_ui_message(
                     msg,
                     &state,
@@ -267,43 +272,35 @@ impl AdelieWindow {
                     &toast_label,
                     ui_tx,
                 );
-            })
-        };
+            }
+        ));
         let bridge = Rc::new(bridge);
 
-        // Spawn a local future to receive the transport client on the main thread
-        {
-            let client_ref = Rc::clone(&client);
-            glib::spawn_future_local(async move {
-                while let Some(msg) = internal_rx.recv().await {
-                    match msg {
-                        InternalMsg::ClientReady(transport) => {
-                            *client_ref.borrow_mut() = Some(transport);
-                        }
-                    }
-                }
-            });
-        }
-
-        // Spawn persistent connection manager (connect → forward → reconnect)
+        // Spawn persistent connection manager (connect → forward → reconnect).
+        // It now delivers the freshly connected transport to the main thread
+        // via `UiMessage::ClientReady` on the same channel as every other UI
+        // message (handled in `handle_ui_message`).
         {
             let ui_tx = bridge.ui_sender();
-            bridge.spawn(connection_manager(config.clone(), ui_tx, internal_tx));
+            bridge.spawn(connection_manager(config.clone(), ui_tx));
         }
 
         // Sidebar row activation → load conversation
-        {
-            let client_ref = Rc::clone(&client);
-            let state = Rc::clone(&state);
-            let bridge = Rc::clone(&bridge);
-            sidebar.list_box.connect_row_activated(move |_, row| {
+        sidebar.list_box.connect_row_activated(glib::clone!(
+            #[strong]
+            client,
+            #[strong]
+            state,
+            #[strong]
+            bridge,
+            move |_, row| {
                 let idx = row.index() as usize;
                 let state_borrow = state.borrow();
                 if let Some(conv) = state_borrow.conversations.get(idx) {
                     let conv_id = conv.id.clone();
                     drop(state_borrow);
 
-                    if let Some(client) = client_ref.borrow().clone() {
+                    if let Some(client) = client.borrow().clone() {
                         let tx = bridge.ui_sender();
                         bridge.spawn(async move {
                             match client.get_conversation(&conv_id).await {
@@ -318,15 +315,17 @@ impl AdelieWindow {
                         });
                     }
                 }
-            });
-        }
+            }
+        ));
 
         // New conversation button
-        {
-            let client_ref = Rc::clone(&client);
-            let bridge = Rc::clone(&bridge);
-            sidebar.new_button.connect_clicked(move |_| {
-                if let Some(client) = client_ref.borrow().clone() {
+        sidebar.new_button.connect_clicked(glib::clone!(
+            #[strong]
+            client,
+            #[strong]
+            bridge,
+            move |_| {
+                if let Some(client) = client.borrow().clone() {
                     let tx = bridge.ui_sender();
                     bridge.spawn(async move {
                         match client.create_conversation("New Conversation").await {
@@ -348,15 +347,18 @@ impl AdelieWindow {
                         }
                     });
                 }
-            });
-        }
+            }
+        ));
 
         // Context menu: Delete conversation
-        {
-            let client_ref = Rc::clone(&client);
-            let bridge = Rc::clone(&bridge);
-            let state = Rc::clone(&state);
-            sidebar.connect_delete(move |idx| {
+        sidebar.connect_delete(glib::clone!(
+            #[strong]
+            client,
+            #[strong]
+            bridge,
+            #[strong]
+            state,
+            move |idx| {
                 let id = {
                     let s = state.borrow();
                     match s.conversations.get(idx) {
@@ -364,7 +366,7 @@ impl AdelieWindow {
                         None => return,
                     }
                 };
-                if let Some(client) = client_ref.borrow().clone() {
+                if let Some(client) = client.borrow().clone() {
                     let tx = bridge.ui_sender();
                     let id = id.clone();
                     bridge.spawn(async move {
@@ -379,16 +381,20 @@ impl AdelieWindow {
                         }
                     });
                 }
-            });
-        }
+            }
+        ));
 
         // Context menu: Rename conversation
-        {
-            let client_ref = Rc::clone(&client);
-            let bridge = Rc::clone(&bridge);
-            let state = Rc::clone(&state);
-            let window_ref = window.clone();
-            sidebar.connect_rename(move |idx| {
+        sidebar.connect_rename(glib::clone!(
+            #[strong]
+            client,
+            #[strong]
+            bridge,
+            #[strong]
+            state,
+            #[weak]
+            window,
+            move |idx| {
                 let (id, current_title) = {
                     let s = state.borrow();
                     match s.conversations.get(idx) {
@@ -399,7 +405,7 @@ impl AdelieWindow {
 
                 let dialog = Window::builder()
                     .title("Rename Conversation")
-                    .transient_for(&window_ref)
+                    .transient_for(&window)
                     .modal(true)
                     .default_width(360)
                     .default_height(10)
@@ -421,62 +427,78 @@ impl AdelieWindow {
                 btn_box.set_halign(gtk4::Align::End);
 
                 let cancel_btn = Button::with_label("Cancel");
-                let dialog_ref = dialog.clone();
-                cancel_btn.connect_clicked(move |_| {
-                    dialog_ref.close();
-                });
+                cancel_btn.connect_clicked(glib::clone!(
+                    #[weak]
+                    dialog,
+                    move |_| {
+                        dialog.close();
+                    }
+                ));
                 btn_box.append(&cancel_btn);
 
                 let confirm_btn = Button::with_label("Rename");
                 confirm_btn.add_css_class("suggested-action");
-                let client_ref_inner = Rc::clone(&client_ref);
-                let bridge_inner = Rc::clone(&bridge);
-                let dialog_ref = dialog.clone();
-                let entry_ref = entry.clone();
-                confirm_btn.connect_clicked(move |_| {
-                    let new_title = entry_ref.text().trim().to_string();
-                    if new_title.is_empty() {
-                        return;
-                    }
-                    dialog_ref.close();
-                    if let Some(client) = client_ref_inner.borrow().clone() {
-                        let tx = bridge_inner.ui_sender();
-                        let id = id.clone();
-                        let title = new_title.clone();
-                        bridge_inner.spawn(async move {
-                            match client.rename_conversation(&id, &title).await {
-                                Ok(()) => {
-                                    let _ = tx.send(UiMessage::ConversationRenamed { id, title });
+                confirm_btn.connect_clicked(glib::clone!(
+                    #[strong]
+                    client,
+                    #[strong]
+                    bridge,
+                    #[weak]
+                    dialog,
+                    #[weak]
+                    entry,
+                    move |_| {
+                        let new_title = entry.text().trim().to_string();
+                        if new_title.is_empty() {
+                            return;
+                        }
+                        dialog.close();
+                        if let Some(client) = client.borrow().clone() {
+                            let tx = bridge.ui_sender();
+                            let id = id.clone();
+                            let title = new_title.clone();
+                            bridge.spawn(async move {
+                                match client.rename_conversation(&id, &title).await {
+                                    Ok(()) => {
+                                        let _ =
+                                            tx.send(UiMessage::ConversationRenamed { id, title });
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(UiMessage::Error(format!(
+                                            "Rename conversation: {e}"
+                                        )));
+                                    }
                                 }
-                                Err(e) => {
-                                    let _ = tx.send(UiMessage::Error(format!(
-                                        "Rename conversation: {e}"
-                                    )));
-                                }
-                            }
-                        });
+                            });
+                        }
                     }
-                });
+                ));
                 btn_box.append(&confirm_btn);
 
                 // Enter key in entry confirms
-                let confirm_ref = confirm_btn.clone();
-                entry.connect_activate(move |_| {
-                    confirm_ref.emit_clicked();
-                });
+                entry.connect_activate(glib::clone!(
+                    #[weak]
+                    confirm_btn,
+                    move |_| {
+                        confirm_btn.emit_clicked();
+                    }
+                ));
 
                 vbox.append(&btn_box);
                 dialog.set_child(Some(&vbox));
                 dialog.present();
-            });
-        }
+            }
+        ));
 
         // Context menu: Archive/unarchive conversation
-        {
-            let client_ref = Rc::clone(&client);
-            let bridge = Rc::clone(&bridge);
-            let state = Rc::clone(&state);
-            sidebar.connect_archive(move |idx| {
+        sidebar.connect_archive(glib::clone!(
+            #[strong]
+            client,
+            #[strong]
+            bridge,
+            #[strong]
+            state,
+            move |idx| {
                 let (id, archived) = {
                     let s = state.borrow();
                     match s.conversations.get(idx) {
@@ -484,7 +506,7 @@ impl AdelieWindow {
                         None => return,
                     }
                 };
-                if let Some(client) = client_ref.borrow().clone() {
+                if let Some(client) = client.borrow().clone() {
                     let tx = bridge.ui_sender();
                     let id = id.clone();
                     bridge.spawn(async move {
@@ -507,15 +529,17 @@ impl AdelieWindow {
                         }
                     });
                 }
-            });
-        }
+            }
+        ));
 
         // Show archived checkbox toggle
-        {
-            let client_ref = Rc::clone(&client);
-            let bridge = Rc::clone(&bridge);
-            sidebar.connect_show_archived_toggled(move |include_archived| {
-                if let Some(client) = client_ref.borrow().clone() {
+        sidebar.connect_show_archived_toggled(glib::clone!(
+            #[strong]
+            client,
+            #[strong]
+            bridge,
+            move |include_archived| {
+                if let Some(client) = client.borrow().clone() {
                     let tx = bridge.ui_sender();
                     bridge.spawn(async move {
                         let result = if include_archived {
@@ -534,145 +558,165 @@ impl AdelieWindow {
                         }
                     });
                 }
-            });
-        }
+            }
+        ));
 
         // Send button / Enter key → send prompt
         {
-            let client_ref = Rc::clone(&client);
-            let bridge_ref = Rc::clone(&bridge);
-            let state = Rc::clone(&state);
-            let input_bar_ref = Rc::clone(&input_bar);
-            let chat_view_ref = Rc::clone(&chat_view);
-            let model_picker_ref = Rc::clone(&model_picker);
+            let send_action = Rc::new(glib::clone!(
+                #[strong]
+                client,
+                #[strong(rename_to = bridge_ref)]
+                bridge,
+                #[strong]
+                state,
+                #[strong]
+                input_bar,
+                #[strong]
+                chat_view,
+                #[strong]
+                model_picker,
+                move || {
+                    let text = input_bar.take_text();
+                    let text = text.trim().to_string();
+                    if text.is_empty() {
+                        return;
+                    }
+                    let state_borrow = state.borrow();
+                    let conv_id = match &state_borrow.current_conversation_id {
+                        Some(id) => id.clone(),
+                        None => return,
+                    };
+                    drop(state_borrow);
 
-            let send_action = Rc::new(move || {
-                let text = input_bar_ref.take_text();
-                let text = text.trim().to_string();
-                if text.is_empty() {
-                    return;
-                }
-                let state_borrow = state.borrow();
-                let conv_id = match &state_borrow.current_conversation_id {
-                    Some(id) => id.clone(),
-                    None => return,
-                };
-                drop(state_borrow);
+                    // Show user message immediately
+                    chat_view.borrow_mut().add_user_message(&text);
 
-                // Show user message immediately
-                chat_view_ref.borrow_mut().add_user_message(&text);
+                    // Track in local conversation copy
+                    {
+                        let mut s = state.borrow_mut();
+                        if let Some(ref mut conv) = s.current_conversation {
+                            conv.messages.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: text.clone(),
+                            });
+                        }
+                    }
 
-                // Track in local conversation copy
-                {
-                    let mut s = state.borrow_mut();
-                    if let Some(ref mut conv) = s.current_conversation {
-                        conv.messages.push(ChatMessage {
-                            role: "user".to_string(),
-                            content: text.clone(),
+                    let override_selection = model_picker.current_override();
+
+                    if let Some(client) = client.borrow().clone() {
+                        let tx = bridge_ref.ui_sender();
+                        let text = text.clone();
+                        bridge_ref.spawn(async move {
+                            // Use the WS-specific override path when available so
+                            // the picker's selection is honoured. The shared
+                            // AssistantClient trait can't carry the override
+                            // because the D-Bus surface doesn't expose it; on
+                            // D-Bus we fall through to the plain send_prompt.
+                            let result = match (client.as_ws(), override_selection) {
+                                (Some(ws), Some(over)) => {
+                                    ws.send_prompt_with_override(&conv_id, &text, Some(over))
+                                        .await
+                                }
+                                _ => client.send_prompt(&conv_id, &text).await,
+                            };
+                            match result {
+                                Ok(task_id) => {
+                                    let _ = tx.send(UiMessage::PromptSent { task_id });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(UiMessage::Error(format!("Send error: {e}")));
+                                }
+                            }
                         });
                     }
                 }
-
-                let override_selection = model_picker_ref.current_override();
-
-                if let Some(client) = client_ref.borrow().clone() {
-                    let tx = bridge_ref.ui_sender();
-                    let text = text.clone();
-                    bridge_ref.spawn(async move {
-                        // Use the WS-specific override path when available so
-                        // the picker's selection is honoured. The shared
-                        // AssistantClient trait can't carry the override
-                        // because the D-Bus surface doesn't expose it; on
-                        // D-Bus we fall through to the plain send_prompt.
-                        let result = match (client.as_ws(), override_selection) {
-                            (Some(ws), Some(over)) => {
-                                ws.send_prompt_with_override(&conv_id, &text, Some(over))
-                                    .await
-                            }
-                            _ => client.send_prompt(&conv_id, &text).await,
-                        };
-                        match result {
-                            Ok(task_id) => {
-                                let _ = tx.send(UiMessage::PromptSent { task_id });
-                            }
-                            Err(e) => {
-                                let _ = tx.send(UiMessage::Error(format!("Send error: {e}")));
-                            }
-                        }
-                    });
-                }
-            });
+            ));
 
             // Send button click
-            let send_action_click = Rc::clone(&send_action);
-            input_bar.send_button.connect_clicked(move |_| {
-                send_action_click();
-            });
+            input_bar.send_button.connect_clicked(glib::clone!(
+                #[strong]
+                send_action,
+                move |_| {
+                    send_action();
+                }
+            ));
 
             // Enter key in text view (Shift+Enter for newline)
-            let send_action_key = Rc::clone(&send_action);
             let key_controller = gtk4::EventControllerKey::new();
-            key_controller.connect_key_pressed(move |_, key, _, modifiers| {
-                if key == gdk::Key::Return
-                    && !modifiers.contains(gdk::ModifierType::SHIFT_MASK)
-                    && !modifiers.contains(gdk::ModifierType::CONTROL_MASK)
-                {
-                    send_action_key();
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
+            key_controller.connect_key_pressed(glib::clone!(
+                #[strong]
+                send_action,
+                move |_, key, _, modifiers| {
+                    if key == gdk::Key::Return
+                        && !modifiers.contains(gdk::ModifierType::SHIFT_MASK)
+                        && !modifiers.contains(gdk::ModifierType::CONTROL_MASK)
+                    {
+                        send_action();
+                        glib::Propagation::Stop
+                    } else {
+                        glib::Propagation::Proceed
+                    }
                 }
-            });
+            ));
             input_bar.text_view.add_controller(key_controller);
         }
 
         // Hamburger menu: Switch Connection → open the picker in a new
         // window. The current connection's window is intentionally left open;
         // selecting a profile spawns a fresh AdelieWindow alongside it.
-        {
-            let app_ref = app.clone();
-            let popover_ref = menu_popover.clone();
-            switch_conn_btn.connect_clicked(move |_| {
-                popover_ref.popdown();
-                let login = crate::widgets::login_screen::LoginScreen::new(&app_ref);
+        switch_conn_btn.connect_clicked(glib::clone!(
+            #[weak]
+            app,
+            #[weak]
+            menu_popover,
+            move |_| {
+                menu_popover.popdown();
+                let login = crate::widgets::login_screen::LoginScreen::new(&app);
                 login.present();
-            });
-        }
+            }
+        ));
 
         // Hamburger menu: Settings → Connections / Purposes tabs (#1). The
         // dialog is WS-only (named-connection management isn't exposed over
         // D-Bus); on a D-Bus transport we status-message and no-op — the
         // header model picker is already hidden there.
-        {
-            let popover_ref = menu_popover.clone();
-            let window_ref = window.clone();
-            let client_ref = Rc::clone(&client);
-            let bridge_ref = Rc::clone(&bridge);
-            let status_label_ref = Rc::clone(&status_label);
-            settings_btn.connect_clicked(move |_| {
-                popover_ref.popdown();
-                let Some(transport) = client_ref.borrow().clone() else {
-                    status_label_ref.set_text("Not connected — settings unavailable");
+        settings_btn.connect_clicked(glib::clone!(
+            #[weak]
+            menu_popover,
+            #[weak]
+            window,
+            #[strong]
+            client,
+            #[strong]
+            bridge,
+            #[strong]
+            status_label,
+            move |_| {
+                menu_popover.popdown();
+                let Some(transport) = client.borrow().clone() else {
+                    status_label.set_text("Not connected — settings unavailable");
                     return;
                 };
                 if transport.as_ws().is_none() {
-                    status_label_ref.set_text(
+                    status_label.set_text(
                         "Settings require the WebSocket transport (unavailable on D-Bus)",
                     );
                     return;
                 }
                 crate::widgets::settings_dialog::show_settings_dialog(
-                    &window_ref,
+                    &window,
                     Arc::clone(&transport),
-                    Rc::clone(&bridge_ref),
+                    Rc::clone(&bridge),
                 );
                 // The user may have added/removed connections; re-query the
                 // aggregated model list so the header picker reflects the new
                 // set. Fire-and-forget — errors are non-fatal. Runs once when
                 // Settings is opened (so it picks up the previous session's
                 // changes); the dialog itself keeps its own tabs in sync.
-                let tx = bridge_ref.ui_sender();
-                bridge_ref.spawn(async move {
+                let tx = bridge.ui_sender();
+                bridge.spawn(async move {
                     match management_client::list_available_models(&transport, None, false).await {
                         Ok(listings) => {
                             let _ = tx.send(UiMessage::ModelsLoaded(listings));
@@ -682,57 +726,68 @@ impl AdelieWindow {
                         }
                     }
                 });
-            });
-        }
+            }
+        ));
 
         // Hamburger menu: Knowledge Base → open the KB browser/editor (#74)
-        {
-            let popover_ref = menu_popover.clone();
-            let window_ref = window.clone();
-            let client_ref = Rc::clone(&client);
-            let bridge_ref = Rc::clone(&bridge);
-            let status_label_ref = Rc::clone(&status_label);
-            knowledge_btn.connect_clicked(move |_| {
-                popover_ref.popdown();
-                let Some(transport) = client_ref.borrow().clone() else {
-                    status_label_ref.set_text("Not connected — knowledge base unavailable");
+        knowledge_btn.connect_clicked(glib::clone!(
+            #[weak]
+            menu_popover,
+            #[weak]
+            window,
+            #[strong]
+            client,
+            #[strong]
+            bridge,
+            #[strong]
+            status_label,
+            move |_| {
+                menu_popover.popdown();
+                let Some(transport) = client.borrow().clone() else {
+                    status_label.set_text("Not connected — knowledge base unavailable");
                     return;
                 };
                 let browser = crate::widgets::knowledge_browser::KnowledgeBrowser::new(
-                    &window_ref,
+                    &window,
                     transport,
-                    Rc::clone(&bridge_ref),
+                    Rc::clone(&bridge),
                 );
                 browser.present();
-            });
-        }
+            }
+        ));
 
         // Hamburger menu: Disconnect → close this window, show login screen
-        {
-            let app_ref = app.clone();
-            let window_ref = window.clone();
-            let popover_ref = menu_popover.clone();
-            disconnect_btn.connect_clicked(move |_| {
-                popover_ref.popdown();
-                let login = crate::widgets::login_screen::LoginScreen::new(&app_ref);
+        disconnect_btn.connect_clicked(glib::clone!(
+            #[weak]
+            app,
+            #[weak]
+            window,
+            #[weak]
+            menu_popover,
+            move |_| {
+                menu_popover.popdown();
+                let login = crate::widgets::login_screen::LoginScreen::new(&app);
                 login.present();
-                window_ref.close();
-            });
-        }
+                window.close();
+            }
+        ));
 
         // Debug checkbox toggle → re-fetch conversation with filtering
-        {
-            let client_ref = Rc::clone(&client);
-            let bridge_ref = Rc::clone(&bridge);
-            let state = Rc::clone(&state);
-            debug_check.connect_toggled(move |btn| {
+        debug_check.connect_toggled(glib::clone!(
+            #[strong]
+            client,
+            #[strong]
+            bridge,
+            #[strong]
+            state,
+            move |btn| {
                 state.borrow_mut().debug_enabled = btn.is_active();
                 let conv_id = state.borrow().current_conversation_id.clone();
                 if let Some(conv_id) = conv_id
-                    && let Some(client) = client_ref.borrow().clone()
+                    && let Some(client) = client.borrow().clone()
                 {
-                    let tx = bridge_ref.ui_sender();
-                    bridge_ref.spawn(async move {
+                    let tx = bridge.ui_sender();
+                    bridge.spawn(async move {
                         match client.get_conversation(&conv_id).await {
                             Ok(detail) => {
                                 let _ = tx.send(UiMessage::ConversationLoaded(detail));
@@ -744,8 +799,8 @@ impl AdelieWindow {
                         }
                     });
                 }
-            });
-        }
+            }
+        ));
 
         // Tasks panel: toolbar wiring (#19).
         //
@@ -753,15 +808,17 @@ impl AdelieWindow {
         // routes the user back to the Conversations stack page and loads the
         // task's conversation so the streaming output keeps flowing into the
         // chat view.
-        {
-            let client_ref = Rc::clone(&client);
-            let bridge_ref = Rc::clone(&bridge);
-            tasks_panel.connect_cancel(move |task_id| {
-                let Some(transport) = client_ref.borrow().clone() else {
+        tasks_panel.connect_cancel(glib::clone!(
+            #[strong]
+            client,
+            #[strong]
+            bridge,
+            move |task_id| {
+                let Some(transport) = client.borrow().clone() else {
                     return;
                 };
-                let tx = bridge_ref.ui_sender();
-                bridge_ref.spawn(async move {
+                let tx = bridge.ui_sender();
+                bridge.spawn(async move {
                     let Some(ws) = transport.as_ws() else {
                         let _ = tx.send(UiMessage::Error(
                             "Background tasks require the WebSocket transport".to_string(),
@@ -775,20 +832,23 @@ impl AdelieWindow {
                         let _ = tx.send(UiMessage::Error(format!("Cancel task: {e}")));
                     }
                 });
-            });
-        }
+            }
+        ));
 
-        {
-            let client_ref = Rc::clone(&client);
-            let bridge_ref = Rc::clone(&bridge);
-            let stack_ref = Rc::clone(&stack);
-            tasks_panel.connect_open_conversation(move |conv_id| {
-                stack_ref.set_visible_child_name("conversations");
-                let Some(transport) = client_ref.borrow().clone() else {
+        tasks_panel.connect_open_conversation(glib::clone!(
+            #[strong]
+            client,
+            #[strong]
+            bridge,
+            #[strong]
+            stack,
+            move |conv_id| {
+                stack.set_visible_child_name("conversations");
+                let Some(transport) = client.borrow().clone() else {
                     return;
                 };
-                let tx = bridge_ref.ui_sender();
-                bridge_ref.spawn(async move {
+                let tx = bridge.ui_sender();
+                bridge.spawn(async move {
                     match transport.get_conversation(&conv_id).await {
                         Ok(detail) => {
                             let _ = tx.send(UiMessage::ConversationLoaded(detail));
@@ -798,8 +858,8 @@ impl AdelieWindow {
                         }
                     }
                 });
-            });
-        }
+            }
+        ));
 
         Self { window }
     }
@@ -835,6 +895,12 @@ fn handle_ui_message(
     ui_tx: &mpsc::UnboundedSender<UiMessage>,
 ) {
     match msg {
+        UiMessage::ClientReady(transport) => {
+            // The connection_manager handed us a freshly connected transport.
+            // Stash it so the rest of the UI can issue RPCs; this arrives
+            // before `ConversationsLoaded`, which relies on the client cell.
+            *client.borrow_mut() = Some(transport);
+        }
         UiMessage::ConversationsLoaded(convs) => {
             sidebar.set_conversations(&convs);
             state.borrow_mut().conversations = convs;
@@ -1156,31 +1222,13 @@ pub fn install_app_icon() {
     let cache_root = dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("adele-gtk-icons");
-    let icon_dir = cache_root.join("hicolor").join("512x512").join("apps");
-    let icon_path = icon_dir.join(format!("{ICON_NAME}.png"));
 
-    if let Err(e) = std::fs::create_dir_all(&icon_dir) {
-        tracing::warn!("Failed to create icon dir: {e}");
+    // Resolves to <cache_root>/hicolor/512x512/apps/<ICON_NAME>.png; the
+    // helper creates the parent dirs and writes idempotently.
+    let icon_rel = format!("adele-gtk-icons/hicolor/512x512/apps/{ICON_NAME}.png");
+    if let Err(e) = crate::assets::extract_to_cache(ICON_BYTES, &icon_rel) {
+        tracing::warn!("Failed to install icon: {e}");
         return;
-    }
-    // Use create_new to avoid TOCTOU: the write either atomically creates the
-    // file or harmlessly fails because it already exists.
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&icon_path)
-    {
-        Ok(mut file) => {
-            if let Err(e) = std::io::Write::write_all(&mut file, ICON_BYTES) {
-                tracing::warn!("Failed to write icon: {e}");
-                return;
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => {
-            tracing::warn!("Failed to create icon file: {e}");
-            return;
-        }
     }
 
     let display = gdk::Display::default().expect("display");

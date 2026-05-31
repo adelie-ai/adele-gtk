@@ -1,5 +1,7 @@
 use gtk4::prelude::*;
-use gtk4::{Align, Box as GtkBox, Button, DropDown, Entry, Label, Orientation, StringList, Window};
+use gtk4::{
+    Align, Box as GtkBox, Button, DropDown, Entry, Label, Orientation, StringList, Window, glib,
+};
 
 use crate::credential_store::CredentialStore;
 use crate::profile::{ConnectionProfile, ProtocolConfig};
@@ -131,13 +133,15 @@ pub fn show_setup_dialog<F: Fn(ConnectionProfile) + 'static>(
         ws.set_visible(sel == PROTO_WEBSOCKET);
     };
     apply_visibility(proto_dropdown.selected(), &local_group, &ws_group);
-    {
-        let local_group = local_group.clone();
-        let ws_group = ws_group.clone();
-        proto_dropdown.connect_selected_notify(move |dd| {
+    proto_dropdown.connect_selected_notify(glib::clone!(
+        #[weak]
+        local_group,
+        #[weak]
+        ws_group,
+        move |dd| {
             apply_visibility(dd.selected(), &local_group, &ws_group);
-        });
-    }
+        }
+    ));
 
     // Buttons
     let button_box = GtkBox::new(Orientation::Horizontal, 8);
@@ -162,60 +166,65 @@ pub fn show_setup_dialog<F: Fn(ConnectionProfile) + 'static>(
     dialog.set_child(Some(&content));
 
     // Cancel
-    {
-        let dialog_ref = dialog.clone();
-        cancel_btn.connect_clicked(move |_| {
-            dialog_ref.close();
-        });
-    }
+    cancel_btn.connect_clicked(glib::clone!(
+        #[weak]
+        dialog,
+        move |_| {
+            dialog.close();
+        }
+    ));
 
     // Save
     {
-        let dialog_ref = dialog.clone();
         let existing_id = existing.map(|p| p.id.clone());
-        save_btn.connect_clicked(move |_| {
-            let name = name_entry.text().trim().to_string();
-            if name.is_empty() {
-                status.set_text("Connection name is required");
-                return;
-            }
-
-            let id = existing_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-            let protocol = if proto_dropdown.selected() == PROTO_WEBSOCKET {
-                let url = url_entry.text().trim().to_string();
-                if url.is_empty() {
-                    status.set_text("Server URL is required for WebSocket");
+        save_btn.connect_clicked(glib::clone!(
+            #[weak(rename_to = dialog_ref)]
+            dialog,
+            move |_| {
+                let name = name_entry.text().trim().to_string();
+                if name.is_empty() {
+                    status.set_text("Connection name is required");
                     return;
                 }
-                // Store credentials in the keyring (never in the profile).
-                let username = user_entry.text().trim().to_string();
-                let password = pass_entry.text().to_string();
-                if !username.is_empty() {
-                    let _ = CredentialStore::store_password(&format!("{id}-username"), &username);
-                }
-                if !password.is_empty() {
-                    let _ = CredentialStore::store_password(&id, &password);
-                }
-                ProtocolConfig::Websocket {
-                    url,
-                    subject: "desktop-tui".to_string(),
-                }
-            } else {
-                let raw = sock_entry.text().trim().to_string();
-                let path = if raw.is_empty() {
-                    None
-                } else {
-                    Some(std::path::PathBuf::from(raw))
-                };
-                ProtocolConfig::Local { path }
-            };
 
-            on_save(ConnectionProfile { id, name, protocol });
-            dialog_ref.close();
-        });
+                let id = existing_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+                let protocol = if proto_dropdown.selected() == PROTO_WEBSOCKET {
+                    let url = url_entry.text().trim().to_string();
+                    if url.is_empty() {
+                        status.set_text("Server URL is required for WebSocket");
+                        return;
+                    }
+                    // Store credentials in the keyring (never in the profile).
+                    let username = user_entry.text().trim().to_string();
+                    let password = pass_entry.text().to_string();
+                    if !username.is_empty() {
+                        let _ =
+                            CredentialStore::store_password(&format!("{id}-username"), &username);
+                    }
+                    if !password.is_empty() {
+                        let _ = CredentialStore::store_password(&id, &password);
+                    }
+                    ProtocolConfig::Websocket {
+                        url,
+                        subject: "desktop-tui".to_string(),
+                    }
+                } else {
+                    let raw = sock_entry.text().trim().to_string();
+                    let path = if raw.is_empty() {
+                        None
+                    } else {
+                        Some(std::path::PathBuf::from(raw))
+                    };
+                    ProtocolConfig::Local { path }
+                };
+
+                on_save(ConnectionProfile { id, name, protocol });
+                dialog_ref.close();
+            }
+        ));
     }
 
     dialog.present();

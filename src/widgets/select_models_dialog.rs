@@ -4,7 +4,7 @@ use desktop_assistant_api_model as api;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box as GtkBox, Button, CheckButton, Label, Orientation, ScrolledWindow, Separator,
-    Window,
+    Window, glib,
 };
 
 use crate::selected_models::SelectedModel;
@@ -130,26 +130,33 @@ pub fn show_select_models_dialog<F>(
     btn_row.set_margin_end(16);
 
     let cancel = Button::with_label("Cancel");
-    let dialog_ref = dialog.clone();
-    cancel.connect_clicked(move |_| {
-        dialog_ref.close();
-    });
+    cancel.connect_clicked(glib::clone!(
+        #[weak]
+        dialog,
+        move |_| {
+            dialog.close();
+        }
+    ));
     btn_row.append(&cancel);
 
     let save = Button::with_label("Save");
     save.add_css_class("suggested-action");
-    let dialog_ref = dialog.clone();
-    let checks_ref = std::rc::Rc::clone(&checks);
-    save.connect_clicked(move |_| {
-        let chosen: Vec<SelectedModel> = checks_ref
-            .borrow()
-            .iter()
-            .filter(|&(_model, check)| check.is_active())
-            .map(|(model, _check)| model.clone())
-            .collect();
-        dialog_ref.close();
-        on_save(chosen);
-    });
+    save.connect_clicked(glib::clone!(
+        #[weak(rename_to = dialog_ref)]
+        dialog,
+        #[strong(rename_to = checks_ref)]
+        checks,
+        move |_| {
+            let chosen: Vec<SelectedModel> = checks_ref
+                .borrow()
+                .iter()
+                .filter(|&(_model, check)| check.is_active())
+                .map(|(model, _check)| model.clone())
+                .collect();
+            dialog_ref.close();
+            on_save(chosen);
+        }
+    ));
     btn_row.append(&save);
 
     outer.append(&btn_row);

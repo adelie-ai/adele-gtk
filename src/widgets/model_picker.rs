@@ -4,7 +4,7 @@ use std::rc::Rc;
 use desktop_assistant_api_model as api;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, Label, MenuButton, Orientation, Popover, Separator, Window,
+    Align, Box as GtkBox, Button, Label, MenuButton, Orientation, Popover, Separator, Window, glib,
 };
 
 use crate::selected_models::{SelectedModel, SelectedModelsStore};
@@ -194,64 +194,71 @@ fn rebuild_popover_into(
     let select_btn = Button::with_label("Select Models…");
     select_btn.add_css_class("context-button");
     select_btn.set_halign(Align::Fill);
-    let popover_ref = popover.clone();
-    let popover_to_rebuild = popover.clone();
-    let menu_button_ref = menu_button.clone();
-    let available_ref = Rc::clone(available);
-    let selected_ref = Rc::clone(selected);
-    let active_ref = Rc::clone(active);
-    let store_ref = Rc::clone(store);
-    select_btn.connect_clicked(move |btn| {
-        popover_ref.popdown();
-        let Some(parent) = btn.root().and_then(|r| r.downcast::<Window>().ok()) else {
-            return;
-        };
-        let available_snapshot = available_ref.borrow().clone();
-        let currently_selected = selected_ref.borrow().clone();
-        let selected_for_save = Rc::clone(&selected_ref);
-        let active_for_save = Rc::clone(&active_ref);
-        let store_for_save = Rc::clone(&store_ref);
-        let popover_for_save = popover_to_rebuild.clone();
-        let menu_button_for_save = menu_button_ref.clone();
-        let available_for_save = Rc::clone(&available_ref);
-        show_select_models_dialog(
-            &parent,
-            &available_snapshot,
-            &currently_selected,
-            move |chosen| {
-                if let Err(e) = store_for_save.save(&chosen) {
-                    tracing::warn!("Failed to save selected_models.json: {e}");
-                }
-                // Drop the active selection if it's no longer in the
-                // user's curated list — keeping it would mean the
-                // button reflects a row that isn't shown in the popover.
-                // The conversation's stored selection on the daemon is
-                // untouched: we just stop overriding it from the client.
-                {
-                    let mut active = active_for_save.borrow_mut();
-                    if let Some(sel) = active.as_ref()
-                        && !chosen.iter().any(|c| c == sel)
-                    {
-                        *active = None;
+    select_btn.connect_clicked(glib::clone!(
+        #[weak]
+        popover,
+        #[weak(rename_to = menu_button_ref)]
+        menu_button,
+        #[strong(rename_to = available_ref)]
+        available,
+        #[strong(rename_to = selected_ref)]
+        selected,
+        #[strong(rename_to = active_ref)]
+        active,
+        #[strong(rename_to = store_ref)]
+        store,
+        move |btn| {
+            popover.popdown();
+            let Some(parent) = btn.root().and_then(|r| r.downcast::<Window>().ok()) else {
+                return;
+            };
+            let available_snapshot = available_ref.borrow().clone();
+            let currently_selected = selected_ref.borrow().clone();
+            let selected_for_save = Rc::clone(&selected_ref);
+            let active_for_save = Rc::clone(&active_ref);
+            let store_for_save = Rc::clone(&store_ref);
+            let popover_for_save = popover.clone();
+            let menu_button_for_save = menu_button_ref.clone();
+            let available_for_save = Rc::clone(&available_ref);
+            show_select_models_dialog(
+                &parent,
+                &available_snapshot,
+                &currently_selected,
+                move |chosen| {
+                    if let Err(e) = store_for_save.save(&chosen) {
+                        tracing::warn!("Failed to save selected_models.json: {e}");
                     }
-                }
-                *selected_for_save.borrow_mut() = chosen;
-                rebuild_popover_into(
-                    &popover_for_save,
-                    &menu_button_for_save,
-                    &available_for_save,
-                    &selected_for_save,
-                    &active_for_save,
-                    &store_for_save,
-                );
-                refresh_menu_button_label(
-                    &menu_button_for_save,
-                    &available_for_save,
-                    &active_for_save,
-                );
-            },
-        );
-    });
+                    // Drop the active selection if it's no longer in the
+                    // user's curated list — keeping it would mean the
+                    // button reflects a row that isn't shown in the popover.
+                    // The conversation's stored selection on the daemon is
+                    // untouched: we just stop overriding it from the client.
+                    {
+                        let mut active = active_for_save.borrow_mut();
+                        if let Some(sel) = active.as_ref()
+                            && !chosen.iter().any(|c| c == sel)
+                        {
+                            *active = None;
+                        }
+                    }
+                    *selected_for_save.borrow_mut() = chosen;
+                    rebuild_popover_into(
+                        &popover_for_save,
+                        &menu_button_for_save,
+                        &available_for_save,
+                        &selected_for_save,
+                        &active_for_save,
+                        &store_for_save,
+                    );
+                    refresh_menu_button_label(
+                        &menu_button_for_save,
+                        &available_for_save,
+                        &active_for_save,
+                    );
+                },
+            );
+        }
+    ));
     menu_box.append(&select_btn);
 
     menu_box.append(&Separator::new(Orientation::Horizontal));
@@ -273,16 +280,22 @@ fn rebuild_popover_into(
             btn.add_css_class("context-button");
             btn.set_halign(Align::Fill);
 
-            let active_ref = Rc::clone(active);
-            let popover_ref = popover.clone();
-            let menu_button_ref = menu_button.clone();
-            let available_ref = Rc::clone(available);
             let sel_owned = sel.clone();
-            btn.connect_clicked(move |_| {
-                *active_ref.borrow_mut() = Some(sel_owned.clone());
-                refresh_menu_button_label(&menu_button_ref, &available_ref, &active_ref);
-                popover_ref.popdown();
-            });
+            btn.connect_clicked(glib::clone!(
+                #[strong(rename_to = active_ref)]
+                active,
+                #[weak(rename_to = popover_ref)]
+                popover,
+                #[weak(rename_to = menu_button_ref)]
+                menu_button,
+                #[strong(rename_to = available_ref)]
+                available,
+                move |_| {
+                    *active_ref.borrow_mut() = Some(sel_owned.clone());
+                    refresh_menu_button_label(&menu_button_ref, &available_ref, &active_ref);
+                    popover_ref.popdown();
+                }
+            ));
             menu_box.append(&btn);
         }
     }

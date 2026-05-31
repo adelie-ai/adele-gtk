@@ -79,14 +79,20 @@ fn confirm<F>(
 
     dialog.set_child(Some(&content));
 
-    let dialog_ref = dialog.clone();
-    cancel.connect_clicked(move |_| dialog_ref.close());
+    cancel.connect_clicked(glib::clone!(
+        #[weak]
+        dialog,
+        move |_| dialog.close()
+    ));
 
-    let dialog_ref = dialog.clone();
-    confirm_btn.connect_clicked(move |_| {
-        dialog_ref.close();
-        on_confirm();
-    });
+    confirm_btn.connect_clicked(glib::clone!(
+        #[weak]
+        dialog,
+        move |_| {
+            dialog.close();
+            on_confirm();
+        }
+    ));
 
     dialog.present();
 }
@@ -138,8 +144,11 @@ pub fn show_settings_dialog(
     footer.append(&*status_label);
 
     let close_btn = Button::with_label("Close");
-    let dialog_ref = dialog.clone();
-    close_btn.connect_clicked(move |_| dialog_ref.close());
+    close_btn.connect_clicked(glib::clone!(
+        #[weak]
+        dialog,
+        move |_| dialog.close()
+    ));
     footer.append(&close_btn);
 
     vbox.append(&footer);
@@ -151,13 +160,18 @@ pub fn show_settings_dialog(
     // and after any mutation. Owns its own `list_available_models(None)`
     // fetch so embedding models reach the Purposes tab.
     // ---------------------------------------------------------------
-    let refresh: Rc<dyn Fn()> = {
-        let transport = Arc::clone(&transport);
-        let bridge = Rc::clone(&bridge);
-        let connections_tab = Rc::clone(&connections_tab);
-        let purposes_tab = Rc::clone(&purposes_tab);
-        let status_label = Rc::clone(&status_label);
-        Rc::new(move || {
+    let refresh: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[strong]
+        transport,
+        #[strong]
+        bridge,
+        #[strong]
+        connections_tab,
+        #[strong]
+        purposes_tab,
+        #[strong]
+        status_label,
+        move || {
             let connections_tab = Rc::clone(&connections_tab);
             let purposes_tab = Rc::clone(&purposes_tab);
             let status_label = Rc::clone(&status_label);
@@ -233,21 +247,22 @@ pub fn show_settings_dialog(
                     }
                 }
             });
-        })
-    };
+        }
+    ));
 
     // ---------------------------------------------------------------
     // Connections tab wiring.
     // ---------------------------------------------------------------
-    {
-        let transport = Arc::clone(&transport);
-        let bridge = Rc::clone(&bridge);
-        let refresh = Rc::clone(&refresh);
-        let dialog_weak = dialog.downgrade();
-        connections_tab.connect_add(move |connector| {
-            let Some(parent) = dialog_weak.upgrade() else {
-                return;
-            };
+    connections_tab.connect_add(glib::clone!(
+        #[strong]
+        transport,
+        #[strong]
+        bridge,
+        #[strong]
+        refresh,
+        #[weak(rename_to = parent)]
+        dialog,
+        move |connector| {
             let transport = Arc::clone(&transport);
             let bridge = Rc::clone(&bridge);
             let refresh = Rc::clone(&refresh);
@@ -281,19 +296,21 @@ pub fn show_settings_dialog(
                 // Add-flow never has a connection to refresh yet.
                 |_id| {},
             );
-        });
-    }
+        }
+    ));
 
-    {
-        let transport = Arc::clone(&transport);
-        let bridge = Rc::clone(&bridge);
-        let connections_tab_cfg = Rc::clone(&connections_tab);
-        let refresh = Rc::clone(&refresh);
-        let dialog_weak = dialog.downgrade();
-        connections_tab.connect_configure(move |id| {
-            let Some(parent) = dialog_weak.upgrade() else {
-                return;
-            };
+    connections_tab.connect_configure(glib::clone!(
+        #[strong]
+        transport,
+        #[strong]
+        bridge,
+        #[strong(rename_to = connections_tab_cfg)]
+        connections_tab,
+        #[strong]
+        refresh,
+        #[weak(rename_to = parent)]
+        dialog,
+        move |id| {
             let Some(existing) = connections_tab_cfg.find(&id) else {
                 return;
             };
@@ -362,18 +379,19 @@ pub fn show_settings_dialog(
                     });
                 },
             );
-        });
-    }
+        }
+    ));
 
-    {
-        let transport = Arc::clone(&transport);
-        let bridge = Rc::clone(&bridge);
-        let refresh = Rc::clone(&refresh);
-        let dialog_weak = dialog.downgrade();
-        connections_tab.connect_remove(move |id| {
-            let Some(parent) = dialog_weak.upgrade() else {
-                return;
-            };
+    connections_tab.connect_remove(glib::clone!(
+        #[strong]
+        transport,
+        #[strong]
+        bridge,
+        #[strong]
+        refresh,
+        #[weak(rename_to = parent)]
+        dialog,
+        move |id| {
             let transport_for_confirm = Arc::clone(&transport);
             let bridge_for_confirm = Rc::clone(&bridge);
             let refresh_for_confirm = Rc::clone(&refresh);
@@ -396,17 +414,20 @@ pub fn show_settings_dialog(
                     );
                 },
             );
-        });
-    }
+        }
+    ));
 
     // ---------------------------------------------------------------
     // Purposes tab wiring.
     // ---------------------------------------------------------------
-    {
-        let transport = Arc::clone(&transport);
-        let bridge = Rc::clone(&bridge);
-        let refresh = Rc::clone(&refresh);
-        purposes_tab.connect_set_purpose(move |purpose, config| {
+    purposes_tab.connect_set_purpose(glib::clone!(
+        #[strong]
+        transport,
+        #[strong]
+        bridge,
+        #[strong]
+        refresh,
+        move |purpose, config| {
             let transport = Arc::clone(&transport);
             let refresh = Rc::clone(&refresh);
             let ui_tx = bridge.ui_sender();
@@ -425,14 +446,17 @@ pub fn show_settings_dialog(
                     }
                 }
             });
-        });
-    }
+        }
+    ));
 
-    {
-        let transport = Arc::clone(&transport);
-        let bridge = Rc::clone(&bridge);
-        let purposes_tab_for_cb = Rc::clone(&purposes_tab);
-        purposes_tab.connect_request_models(move |connection_id| {
+    purposes_tab.connect_request_models(glib::clone!(
+        #[strong]
+        transport,
+        #[strong]
+        bridge,
+        #[strong(rename_to = purposes_tab_for_cb)]
+        purposes_tab,
+        move |connection_id| {
             let transport = Arc::clone(&transport);
             let ui_tx = bridge.ui_sender();
             let purposes_tab = Rc::clone(&purposes_tab_for_cb);
@@ -460,8 +484,8 @@ pub fn show_settings_dialog(
                     }
                 }
             });
-        });
-    }
+        }
+    ));
 
     // First refresh.
     refresh();

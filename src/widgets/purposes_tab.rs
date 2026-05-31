@@ -16,7 +16,7 @@ use std::rc::Rc;
 
 use desktop_assistant_api_model as api;
 use gtk4::prelude::*;
-use gtk4::{Align, Box as GtkBox, DropDown, Label, Orientation, Separator, StringList};
+use gtk4::{Align, Box as GtkBox, DropDown, Label, Orientation, Separator, StringList, glib};
 
 type SetPurposeCb = Box<dyn Fn(api::PurposeKindApi, api::PurposeConfigView)>;
 type RequestModelsCb = Box<dyn Fn(String)>;
@@ -140,14 +140,20 @@ impl PurposesTab {
 
             // When connection changes: rebuild models dropdown and emit a
             // write if we're not currently reconciling.
-            {
-                let rows = Rc::clone(&rows);
-                let connections = Rc::clone(&connections);
-                let models_by_connection = Rc::clone(&models_by_connection);
-                let on_set_purpose = Rc::clone(&on_set_purpose);
-                let on_request_models = Rc::clone(&on_request_models);
-                let suppress = Rc::clone(&suppress);
-                connection_dd.connect_selected_notify(move |_| {
+            connection_dd.connect_selected_notify(glib::clone!(
+                #[strong]
+                rows,
+                #[strong]
+                connections,
+                #[strong]
+                models_by_connection,
+                #[strong]
+                on_set_purpose,
+                #[strong]
+                on_request_models,
+                #[strong]
+                suppress,
+                move |_| {
                     if *suppress.borrow() {
                         return;
                     }
@@ -161,32 +167,38 @@ impl PurposesTab {
                         &suppress,
                     );
                     emit_current(purpose, &rows, &on_set_purpose);
-                });
-            }
+                }
+            ));
 
-            {
-                let rows = Rc::clone(&rows);
-                let on_set_purpose = Rc::clone(&on_set_purpose);
-                let suppress = Rc::clone(&suppress);
-                model_dd.connect_selected_notify(move |_| {
+            model_dd.connect_selected_notify(glib::clone!(
+                #[strong]
+                rows,
+                #[strong]
+                on_set_purpose,
+                #[strong]
+                suppress,
+                move |_| {
                     if *suppress.borrow() {
                         return;
                     }
                     emit_current(purpose, &rows, &on_set_purpose);
-                });
-            }
+                }
+            ));
 
-            {
-                let rows = Rc::clone(&rows);
-                let on_set_purpose = Rc::clone(&on_set_purpose);
-                let suppress = Rc::clone(&suppress);
-                effort_dd.connect_selected_notify(move |_| {
+            effort_dd.connect_selected_notify(glib::clone!(
+                #[strong]
+                rows,
+                #[strong]
+                on_set_purpose,
+                #[strong]
+                suppress,
+                move |_| {
                     if *suppress.borrow() {
                         return;
                     }
                     emit_current(purpose, &rows, &on_set_purpose);
-                });
-            }
+                }
+            ));
 
             rows.borrow_mut().insert(purpose.as_key().to_string(), row);
         }
