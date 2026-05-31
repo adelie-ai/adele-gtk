@@ -24,6 +24,7 @@ use crate::widgets::sidebar::Sidebar;
 use crate::widgets::tasks_panel::TasksPanel;
 
 /// Shared mutable state for the window.
+#[derive(Default)]
 struct WindowState {
     conversations: Vec<ConversationSummary>,
     current_conversation_id: Option<String>,
@@ -31,6 +32,362 @@ struct WindowState {
     pending_request_id: Option<String>,
     streaming_buffer: String,
     debug_enabled: bool,
+}
+
+/// A single observable side-effect produced by [`WindowState::apply`].
+///
+/// `apply` is a pure decision function: it mutates `WindowState` and returns
+/// the list of effects to perform, but performs none of them itself (no GTK,
+/// no widget refs, no spawns). The thin executor in [`handle_ui_message`]
+/// walks the returned `Vec<Effect>` in order and performs each against the
+/// real widgets — mirroring the `TasksModel`/`apply` shape already used by
+/// `widgets/tasks_panel.rs`. This keeps the entire state-machine decision
+/// logic unit-testable without a live GTK context.
+///
+/// Effects are emitted in the exact order the legacy `handle_ui_message`
+/// performed them, so the observable behavior is identical.
+enum Effect {
+    /// Stash the freshly connected transport in the window's client cell.
+    SetClient(Arc<TransportClient>),
+    /// Clear the client cell (on disconnect).
+    ClearClient,
+    /// Set the bottom status-bar text verbatim.
+    SetStatusText(String),
+    /// Enable/disable the send button.
+    SetSendSensitive(bool),
+    /// Repaint the sidebar conversation list.
+    SetConversations(Vec<ConversationSummary>),
+    /// Run `ensure_active_conversation` (selection sync + auto-load/-create).
+    /// Kept as an effect because it needs the live client + ui_tx and spawns
+    /// async RPCs; the *decision* to run it lives in `apply`.
+    EnsureActiveConversation,
+    /// Load an (already debug-filtered) conversation into the chat view.
+    LoadConversationIntoChat(ConversationDetail),
+    /// Clear the chat view.
+    ClearChat,
+    /// Set the chat's transient status line.
+    SetChatStatus(String),
+    /// Clear the chat's transient status line.
+    ClearChatStatus,
+    /// Append a streaming chunk to the chat view.
+    ReceiveChunk(String),
+    /// Finalize a streaming response in the chat view.
+    CompleteStreaming(String),
+    /// Apply (or clear, with `None`) the model-picker selection.
+    SetModelSelection(Option<api::ConversationModelSelectionView>),
+    /// Replace the model-picker's available models.
+    SetModels(Vec<api::ModelListing>),
+    /// Show/hide the model picker.
+    SetModelPickerVisible(bool),
+    /// Reveal a passive toast with the given message.
+    ShowToast(String),
+    /// Replace the entire background-task list.
+    TasksReplaceAll(Vec<api::TaskView>),
+    /// A task started.
+    TaskStarted(api::TaskView),
+    /// A task progress update.
+    TaskProgress {
+        id: String,
+        progress_hint: Option<String>,
+    },
+    /// A task log line was appended.
+    TaskLogAppended {
+        id: String,
+        entry: api::TaskLogEntry,
+    },
+    /// A task completed (terminal).
+    TaskCompleted { id: String },
+}
+
+// Manual `Debug` (can't derive: `TransportClient` is not `Debug`, mirroring
+// `UiMessage`). Only `SetClient` needs special handling — it prints a marker
+// instead of the opaque transport; every other variant forwards its fields so
+// test panic messages stay informative.
+impl std::fmt::Debug for Effect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Effect::SetClient(_) => f.debug_tuple("SetClient").field(&"<transport>").finish(),
+            Effect::ClearClient => f.write_str("ClearClient"),
+            Effect::SetStatusText(t) => f.debug_tuple("SetStatusText").field(t).finish(),
+            Effect::SetSendSensitive(b) => f.debug_tuple("SetSendSensitive").field(b).finish(),
+            Effect::SetConversations(c) => f.debug_tuple("SetConversations").field(c).finish(),
+            Effect::EnsureActiveConversation => f.write_str("EnsureActiveConversation"),
+            Effect::LoadConversationIntoChat(d) => {
+                f.debug_tuple("LoadConversationIntoChat").field(d).finish()
+            }
+            Effect::ClearChat => f.write_str("ClearChat"),
+            Effect::SetChatStatus(m) => f.debug_tuple("SetChatStatus").field(m).finish(),
+            Effect::ClearChatStatus => f.write_str("ClearChatStatus"),
+            Effect::ReceiveChunk(c) => f.debug_tuple("ReceiveChunk").field(c).finish(),
+            Effect::CompleteStreaming(c) => f.debug_tuple("CompleteStreaming").field(c).finish(),
+            Effect::SetModelSelection(s) => f.debug_tuple("SetModelSelection").field(s).finish(),
+            Effect::SetModels(m) => f.debug_tuple("SetModels").field(m).finish(),
+            Effect::SetModelPickerVisible(v) => {
+                f.debug_tuple("SetModelPickerVisible").field(v).finish()
+            }
+            Effect::ShowToast(m) => f.debug_tuple("ShowToast").field(m).finish(),
+            Effect::TasksReplaceAll(t) => f.debug_tuple("TasksReplaceAll").field(t).finish(),
+            Effect::TaskStarted(t) => f.debug_tuple("TaskStarted").field(t).finish(),
+            Effect::TaskProgress { id, progress_hint } => f
+                .debug_struct("TaskProgress")
+                .field("id", id)
+                .field("progress_hint", progress_hint)
+                .finish(),
+            Effect::TaskLogAppended { id, entry } => f
+                .debug_struct("TaskLogAppended")
+                .field("id", id)
+                .field("entry", entry)
+                .finish(),
+            Effect::TaskCompleted { id } => {
+                f.debug_struct("TaskCompleted").field("id", id).finish()
+            }
+        }
+    }
+}
+
+impl WindowState {
+    /// Apply a `UiMessage` to the window state, returning the side-effects to
+    /// perform. PURE: mutates `self` and returns effects; performs no GTK
+    /// work and holds no widget refs.
+    ///
+    /// Every `UiMessage` variant is handled here; the executor in
+    /// `handle_ui_message` is a mechanical translation of the returned
+    /// effects into widget calls.
+    fn apply(&mut self, msg: UiMessage) -> Vec<Effect> {
+        match msg {
+            UiMessage::ClientReady(transport) => {
+                // The connection_manager handed us a freshly connected
+                // transport. Stash it so the rest of the UI can issue RPCs;
+                // this arrives before `ConversationsLoaded`, which relies on
+                // the client cell.
+                vec![Effect::SetClient(transport)]
+            }
+            UiMessage::ConversationsLoaded(convs) => {
+                self.conversations = convs.clone();
+                vec![
+                    Effect::SetConversations(convs),
+                    Effect::EnsureActiveConversation,
+                ]
+            }
+            UiMessage::ConversationLoaded(detail) => {
+                let id = detail.id.clone();
+                let filtered = filter_messages(&detail, self.debug_enabled);
+                let selection = detail.model_selection.clone();
+                self.current_conversation = Some(detail);
+                self.current_conversation_id = Some(id);
+                vec![
+                    Effect::SetModelSelection(selection),
+                    Effect::LoadConversationIntoChat(filtered),
+                ]
+            }
+            UiMessage::ConversationCreated { id } => {
+                self.current_conversation_id = Some(id);
+                vec![]
+            }
+            UiMessage::ConversationDeleted { id } => {
+                self.conversations.retain(|c| c.id != id);
+                let is_active = self.current_conversation_id.as_deref() == Some(&id);
+                if is_active {
+                    self.current_conversation_id = None;
+                    self.current_conversation = None;
+                }
+                let convs = self.conversations.clone();
+                let mut effects = vec![Effect::SetConversations(convs)];
+                if is_active {
+                    effects.push(Effect::ClearChat);
+                    effects.push(Effect::EnsureActiveConversation);
+                }
+                effects
+            }
+            UiMessage::ConversationRenamed { id, title } => {
+                for conv in &mut self.conversations {
+                    if conv.id == id {
+                        conv.title = title.clone();
+                    }
+                }
+                vec![Effect::SetConversations(self.conversations.clone())]
+            }
+            UiMessage::PromptSent { task_id: _ } => {
+                // The wire ack carries either a `task_id` (post-#114
+                // `SendMessageAck`) or an empty string (legacy `Ack`). Neither
+                // is the chunk-stream `request_id` — that is daemon-generated
+                // and arrives inside the first `AssistantDelta`. Use the
+                // sentinel until then; `StreamChunk` claims it on first frame.
+                // See issue #31.
+                self.pending_request_id = Some("__pending__".to_string());
+                self.streaming_buffer.clear();
+                vec![]
+            }
+            UiMessage::AssistantStatus {
+                request_id,
+                message,
+            } => {
+                if self.pending_request_id.as_deref() == Some(&request_id)
+                    || self.pending_request_id.as_deref() == Some("__pending__")
+                {
+                    vec![Effect::SetChatStatus(message)]
+                } else {
+                    vec![]
+                }
+            }
+            UiMessage::StreamChunk { request_id, chunk } => {
+                // Claim request ID if pending
+                if self.pending_request_id.as_deref() == Some("__pending__") {
+                    self.pending_request_id = Some(request_id.clone());
+                }
+                if self.pending_request_id.as_deref() == Some(&request_id) {
+                    let first_chunk = self.streaming_buffer.is_empty();
+                    self.streaming_buffer.push_str(&chunk);
+                    let mut effects = Vec::new();
+                    if first_chunk {
+                        effects.push(Effect::ClearChatStatus);
+                    }
+                    effects.push(Effect::ReceiveChunk(chunk));
+                    effects
+                } else {
+                    vec![]
+                }
+            }
+            UiMessage::StreamComplete {
+                request_id,
+                full_response,
+            } => {
+                if self.pending_request_id.as_deref() == Some("__pending__") {
+                    self.pending_request_id = Some(request_id.clone());
+                }
+                if self.pending_request_id.as_deref() == Some(&request_id) {
+                    self.pending_request_id = None;
+                    self.streaming_buffer.clear();
+                    if let Some(ref mut conv) = self.current_conversation {
+                        conv.messages.push(ChatMessage {
+                            role: "assistant".to_string(),
+                            content: full_response.clone(),
+                        });
+                    }
+                    vec![
+                        Effect::ClearChatStatus,
+                        Effect::CompleteStreaming(full_response),
+                    ]
+                } else {
+                    vec![]
+                }
+            }
+            UiMessage::StreamError { request_id, error } => {
+                if self.pending_request_id.as_deref() == Some("__pending__") {
+                    self.pending_request_id = Some(request_id.clone());
+                }
+                if self.pending_request_id.as_deref() == Some(&request_id) {
+                    self.pending_request_id = None;
+                    self.streaming_buffer.clear();
+                    vec![
+                        Effect::ClearChatStatus,
+                        Effect::SetStatusText(format!("Error: {error}")),
+                    ]
+                } else {
+                    vec![]
+                }
+            }
+            UiMessage::TitleChanged {
+                conversation_id,
+                title,
+            } => {
+                for conv in &mut self.conversations {
+                    if conv.id == conversation_id {
+                        conv.title = title.clone();
+                    }
+                }
+                vec![Effect::SetConversations(self.conversations.clone())]
+            }
+            UiMessage::ConversationWarning {
+                conversation_id,
+                warning,
+            } => {
+                // Single variant today — DanglingModelSelection. The daemon has
+                // already cleared its side and fell back; if this is the
+                // currently-open conversation, clear the header picker so it
+                // doesn't show a stale "stuck" model, then surface a passive
+                // toast explaining the fallback.
+                match &warning {
+                    api::ConversationWarning::DanglingModelSelection {
+                        previous_selection,
+                        fallback_to,
+                    } => {
+                        let is_current = self.current_conversation_id.as_deref()
+                            == Some(conversation_id.as_str());
+                        let mut effects = Vec::new();
+                        if is_current {
+                            effects.push(Effect::SetModelSelection(None));
+                            // Also clear the cached detail's selection so a
+                            // later `ModelsLoaded` doesn't re-apply the stale
+                            // dangling selection, contradicting this toast.
+                            if let Some(ref mut conv) = self.current_conversation {
+                                conv.model_selection = None;
+                            }
+                        }
+                        let message = format!(
+                            "The model \"{}\" on connection \"{}\" is no longer available — falling back to \"{}\" on \"{}\".",
+                            previous_selection.model_id,
+                            previous_selection.connection_id,
+                            fallback_to.model_id,
+                            fallback_to.connection_id,
+                        );
+                        effects.push(Effect::ShowToast(message));
+                        effects
+                    }
+                }
+            }
+            UiMessage::StatusUpdate(text) => vec![Effect::SetStatusText(text)],
+            UiMessage::Error(text) => vec![Effect::SetStatusText(format!("Error: {text}"))],
+            UiMessage::ModelsLoaded(listings) => {
+                let visible = !listings.is_empty();
+                let mut effects = vec![Effect::SetModels(listings)];
+                // Re-apply the active conversation's stored selection (if any)
+                // since `set_models` resets the dropdown.
+                if let Some(ref detail) = self.current_conversation {
+                    effects.push(Effect::SetModelSelection(detail.model_selection.clone()));
+                }
+                effects.push(Effect::SetModelPickerVisible(visible));
+                effects
+            }
+            UiMessage::Connected { label } => {
+                vec![Effect::SetStatusText(label), Effect::SetSendSensitive(true)]
+            }
+            UiMessage::TasksLoaded(tasks) => vec![Effect::TasksReplaceAll(tasks)],
+            UiMessage::TaskStarted(task) => vec![Effect::TaskStarted(task)],
+            UiMessage::TaskProgress { id, progress_hint } => {
+                vec![Effect::TaskProgress { id, progress_hint }]
+            }
+            UiMessage::TaskLogAppended { id, entry } => {
+                vec![Effect::TaskLogAppended { id, entry }]
+            }
+            UiMessage::TaskCompleted { id } => vec![Effect::TaskCompleted { id }],
+            UiMessage::Disconnected { reason } => {
+                let mut effects = vec![
+                    Effect::ClearClient,
+                    Effect::SetSendSensitive(false),
+                    Effect::SetStatusText(format!("Disconnected: {reason}")),
+                ];
+
+                // Finalize any in-progress streaming buffer
+                if self.pending_request_id.is_some() {
+                    self.pending_request_id = None;
+                    if !self.streaming_buffer.is_empty() {
+                        self.streaming_buffer.push_str("\n\n[Connection lost]");
+                        let full = self.streaming_buffer.clone();
+                        self.streaming_buffer.clear();
+                        if let Some(ref mut conv) = self.current_conversation {
+                            conv.messages.push(ChatMessage {
+                                role: "assistant".to_string(),
+                                content: full.clone(),
+                            });
+                        }
+                        effects.push(Effect::CompleteStreaming(full));
+                    }
+                }
+                effects
+            }
+        }
+    }
 }
 
 pub struct AdelieWindow {
@@ -894,243 +1251,75 @@ fn handle_ui_message(
     toast_label: &Rc<Label>,
     ui_tx: &mpsc::UnboundedSender<UiMessage>,
 ) {
-    match msg {
-        UiMessage::ClientReady(transport) => {
-            // The connection_manager handed us a freshly connected transport.
-            // Stash it so the rest of the UI can issue RPCs; this arrives
-            // before `ConversationsLoaded`, which relies on the client cell.
-            *client.borrow_mut() = Some(transport);
-        }
-        UiMessage::ConversationsLoaded(convs) => {
-            sidebar.set_conversations(&convs);
-            state.borrow_mut().conversations = convs;
-            ensure_active_conversation(state, sidebar, client, ui_tx);
-        }
-        UiMessage::ConversationLoaded(detail) => {
-            let id = detail.id.clone();
-            let debug = state.borrow().debug_enabled;
-            let filtered = filter_messages(&detail, debug);
-            model_picker.set_selection(detail.model_selection.as_ref());
-            let mut s = state.borrow_mut();
-            s.current_conversation = Some(detail);
-            s.current_conversation_id = Some(id);
-            drop(s);
-            chat_view.borrow_mut().load_conversation(&filtered);
-        }
-        UiMessage::ConversationCreated { id } => {
-            state.borrow_mut().current_conversation_id = Some(id);
-        }
-        UiMessage::ConversationDeleted { id } => {
-            let mut s = state.borrow_mut();
-            s.conversations.retain(|c| c.id != id);
-            let is_active = s.current_conversation_id.as_deref() == Some(&id);
-            if is_active {
-                s.current_conversation_id = None;
-                s.current_conversation = None;
+    // Pure decision: mutate state + compute the effects to perform.
+    let effects = state.borrow_mut().apply(msg);
+
+    // Thin executor: perform each effect against the real widgets, in order.
+    for effect in effects {
+        match effect {
+            Effect::SetClient(transport) => {
+                *client.borrow_mut() = Some(transport);
             }
-            let convs = s.conversations.clone();
-            drop(s);
-            sidebar.set_conversations(&convs);
-            if is_active {
-                chat_view.borrow_mut().clear();
+            Effect::ClearClient => {
+                *client.borrow_mut() = None;
+            }
+            Effect::SetStatusText(text) => {
+                status_label.set_text(&text);
+            }
+            Effect::SetSendSensitive(sensitive) => {
+                input_bar.send_button.set_sensitive(sensitive);
+            }
+            Effect::SetConversations(convs) => {
+                sidebar.set_conversations(&convs);
+            }
+            Effect::EnsureActiveConversation => {
                 ensure_active_conversation(state, sidebar, client, ui_tx);
             }
-        }
-        UiMessage::ConversationRenamed { id, title } => {
-            let mut s = state.borrow_mut();
-            for conv in &mut s.conversations {
-                if conv.id == id {
-                    conv.title = title.clone();
-                }
+            Effect::LoadConversationIntoChat(filtered) => {
+                chat_view.borrow_mut().load_conversation(&filtered);
             }
-            let convs = s.conversations.clone();
-            drop(s);
-            sidebar.set_conversations(&convs);
-        }
-        UiMessage::PromptSent { task_id: _ } => {
-            // The wire ack carries either a `task_id` (post-#114
-            // `SendMessageAck`) or an empty string (legacy `Ack`). Neither
-            // is the chunk-stream `request_id` — that is daemon-generated
-            // and arrives inside the first `AssistantDelta`. Use the
-            // sentinel until then; `StreamChunk` claims it on first frame.
-            // See issue #31.
-            let mut s = state.borrow_mut();
-            s.pending_request_id = Some("__pending__".to_string());
-            s.streaming_buffer.clear();
-        }
-        UiMessage::AssistantStatus {
-            request_id,
-            message,
-        } => {
-            let s = state.borrow();
-            if s.pending_request_id.as_deref() == Some(&request_id)
-                || s.pending_request_id.as_deref() == Some("__pending__")
-            {
-                drop(s);
+            Effect::ClearChat => {
+                chat_view.borrow_mut().clear();
+            }
+            Effect::SetChatStatus(message) => {
                 chat_view.borrow().set_status(&message);
             }
-        }
-        UiMessage::StreamChunk { request_id, chunk } => {
-            let mut s = state.borrow_mut();
-            // Claim request ID if pending
-            if s.pending_request_id.as_deref() == Some("__pending__") {
-                s.pending_request_id = Some(request_id.clone());
+            Effect::ClearChatStatus => {
+                chat_view.borrow().clear_status();
             }
-            if s.pending_request_id.as_deref() == Some(&request_id) {
-                let first_chunk = s.streaming_buffer.is_empty();
-                s.streaming_buffer.push_str(&chunk);
-                drop(s);
-                if first_chunk {
-                    chat_view.borrow().clear_status();
-                }
+            Effect::ReceiveChunk(chunk) => {
                 chat_view.borrow_mut().receive_chunk(&chunk);
             }
-        }
-        UiMessage::StreamComplete {
-            request_id,
-            full_response,
-        } => {
-            let mut s = state.borrow_mut();
-            if s.pending_request_id.as_deref() == Some("__pending__") {
-                s.pending_request_id = Some(request_id.clone());
+            Effect::CompleteStreaming(full) => {
+                chat_view.borrow_mut().complete_streaming(&full);
             }
-            if s.pending_request_id.as_deref() == Some(&request_id) {
-                s.pending_request_id = None;
-                s.streaming_buffer.clear();
-                if let Some(ref mut conv) = s.current_conversation {
-                    conv.messages.push(ChatMessage {
-                        role: "assistant".to_string(),
-                        content: full_response.clone(),
-                    });
-                }
-                drop(s);
-                let cv = chat_view.borrow();
-                cv.clear_status();
-                drop(cv);
-                chat_view.borrow_mut().complete_streaming(&full_response);
+            Effect::SetModelSelection(selection) => {
+                model_picker.set_selection(selection.as_ref());
             }
-        }
-        UiMessage::StreamError { request_id, error } => {
-            let mut s = state.borrow_mut();
-            if s.pending_request_id.as_deref() == Some("__pending__") {
-                s.pending_request_id = Some(request_id.clone());
+            Effect::SetModels(listings) => {
+                model_picker.set_models(&listings);
             }
-            if s.pending_request_id.as_deref() == Some(&request_id) {
-                s.pending_request_id = None;
-                s.streaming_buffer.clear();
-                drop(s);
-                chat_view.borrow().clear_status();
-                status_label.set_text(&format!("Error: {error}"));
+            Effect::SetModelPickerVisible(visible) => {
+                model_picker.set_visible(visible);
             }
-        }
-        UiMessage::TitleChanged {
-            conversation_id,
-            title,
-        } => {
-            let mut s = state.borrow_mut();
-            for conv in &mut s.conversations {
-                if conv.id == conversation_id {
-                    conv.title = title.clone();
-                }
+            Effect::ShowToast(message) => {
+                toast_label.set_text(&message);
+                toast_revealer.set_reveal_child(true);
             }
-            let convs = s.conversations.clone();
-            drop(s);
-            sidebar.set_conversations(&convs);
-        }
-        UiMessage::ConversationWarning {
-            conversation_id,
-            warning,
-        } => {
-            // Single variant today — DanglingModelSelection. The daemon has
-            // already cleared its side and fell back; if this is the
-            // currently-open conversation, clear the header picker so it
-            // doesn't show a stale "stuck" model, then surface a passive
-            // toast explaining the fallback.
-            match &warning {
-                api::ConversationWarning::DanglingModelSelection {
-                    previous_selection,
-                    fallback_to,
-                } => {
-                    let is_current = state.borrow().current_conversation_id.as_deref()
-                        == Some(conversation_id.as_str());
-                    if is_current {
-                        model_picker.set_selection(None);
-                        // Also clear the cached detail's selection so a later
-                        // `ModelsLoaded` doesn't re-apply the stale dangling
-                        // selection, contradicting this toast.
-                        if let Some(ref mut conv) = state.borrow_mut().current_conversation {
-                            conv.model_selection = None;
-                        }
-                    }
-                    let message = format!(
-                        "The model \"{}\" on connection \"{}\" is no longer available — falling back to \"{}\" on \"{}\".",
-                        previous_selection.model_id,
-                        previous_selection.connection_id,
-                        fallback_to.model_id,
-                        fallback_to.connection_id,
-                    );
-                    toast_label.set_text(&message);
-                    toast_revealer.set_reveal_child(true);
-                }
+            Effect::TasksReplaceAll(tasks) => {
+                tasks_panel.replace_all(tasks, now_epoch_ms());
             }
-        }
-        UiMessage::StatusUpdate(text) => {
-            status_label.set_text(&text);
-        }
-        UiMessage::Error(text) => {
-            status_label.set_text(&format!("Error: {text}"));
-        }
-        UiMessage::ModelsLoaded(listings) => {
-            let visible = !listings.is_empty();
-            model_picker.set_models(&listings);
-            // Re-apply the active conversation's stored selection (if any)
-            // since `set_models` resets the dropdown.
-            if let Some(ref detail) = state.borrow().current_conversation {
-                model_picker.set_selection(detail.model_selection.as_ref());
+            Effect::TaskStarted(task) => {
+                tasks_panel.handle_task_started(task, now_epoch_ms());
             }
-            model_picker.set_visible(visible);
-        }
-        UiMessage::Connected { label } => {
-            status_label.set_text(&label);
-            input_bar.send_button.set_sensitive(true);
-        }
-        UiMessage::TasksLoaded(tasks) => {
-            tasks_panel.replace_all(tasks, now_epoch_ms());
-        }
-        UiMessage::TaskStarted(task) => {
-            tasks_panel.handle_task_started(task, now_epoch_ms());
-        }
-        UiMessage::TaskProgress { id, progress_hint } => {
-            tasks_panel.handle_task_progress(id, progress_hint, now_epoch_ms());
-        }
-        UiMessage::TaskLogAppended { id, entry } => {
-            tasks_panel.handle_task_log_appended(id, entry);
-        }
-        UiMessage::TaskCompleted { id } => {
-            tasks_panel.handle_task_completed(id, now_epoch_ms());
-        }
-        UiMessage::Disconnected { reason } => {
-            *client.borrow_mut() = None;
-            input_bar.send_button.set_sensitive(false);
-            status_label.set_text(&format!("Disconnected: {reason}"));
-
-            // Finalize any in-progress streaming buffer
-            let mut s = state.borrow_mut();
-            if s.pending_request_id.is_some() {
-                s.pending_request_id = None;
-                if !s.streaming_buffer.is_empty() {
-                    s.streaming_buffer.push_str("\n\n[Connection lost]");
-                    let full = s.streaming_buffer.clone();
-                    s.streaming_buffer.clear();
-                    if let Some(ref mut conv) = s.current_conversation {
-                        conv.messages.push(ChatMessage {
-                            role: "assistant".to_string(),
-                            content: full.clone(),
-                        });
-                    }
-                    drop(s);
-                    chat_view.borrow_mut().complete_streaming(&full);
-                }
+            Effect::TaskProgress { id, progress_hint } => {
+                tasks_panel.handle_task_progress(id, progress_hint, now_epoch_ms());
+            }
+            Effect::TaskLogAppended { id, entry } => {
+                tasks_panel.handle_task_log_appended(id, entry);
+            }
+            Effect::TaskCompleted { id } => {
+                tasks_panel.handle_task_completed(id, now_epoch_ms());
             }
         }
     }
@@ -1263,5 +1452,586 @@ fn filter_messages(detail: &ConversationDetail, debug: bool) -> ConversationDeta
             .cloned()
             .collect(),
         model_selection: detail.model_selection.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Fixtures --------------------------------------------------------
+
+    fn summary(id: &str, title: &str, archived: bool) -> ConversationSummary {
+        ConversationSummary {
+            id: id.to_string(),
+            title: title.to_string(),
+            message_count: 0,
+            archived,
+        }
+    }
+
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    fn detail(id: &str, messages: Vec<ChatMessage>) -> ConversationDetail {
+        ConversationDetail {
+            id: id.to_string(),
+            title: format!("conv {id}"),
+            messages,
+            model_selection: None,
+        }
+    }
+
+    fn selection(connection_id: &str, model_id: &str) -> api::ConversationModelSelectionView {
+        api::ConversationModelSelectionView {
+            connection_id: connection_id.to_string(),
+            model_id: model_id.to_string(),
+            effort: None,
+        }
+    }
+
+    fn listing(connection_id: &str, model_id: &str) -> api::ModelListing {
+        api::ModelListing {
+            connection_id: connection_id.to_string(),
+            connection_label: connection_id.to_string(),
+            model: api::ModelInfoView {
+                id: model_id.to_string(),
+                display_name: model_id.to_string(),
+                context_limit: None,
+                capabilities: api::ModelCapabilitiesView::default(),
+            },
+        }
+    }
+
+    // --- __pending__ sentinel handoff (#31) ------------------------------
+
+    #[test]
+    fn prompt_sent_sets_pending_sentinel_and_clears_buffer() {
+        let mut state = WindowState {
+            streaming_buffer: "leftover".to_string(),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::PromptSent {
+            task_id: "ack-1".to_string(),
+        });
+        assert!(effects.is_empty(), "PromptSent performs no widget effects");
+        assert_eq!(state.pending_request_id.as_deref(), Some("__pending__"));
+        assert!(state.streaming_buffer.is_empty());
+    }
+
+    #[test]
+    fn first_stream_chunk_claims_real_request_id_from_pending_sentinel() {
+        let mut state = WindowState {
+            pending_request_id: Some("__pending__".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::StreamChunk {
+            request_id: "req-real".to_string(),
+            chunk: "hello".to_string(),
+        });
+        // Sentinel is replaced by the daemon's real request id...
+        assert_eq!(state.pending_request_id.as_deref(), Some("req-real"));
+        assert_eq!(state.streaming_buffer, "hello");
+        // ...and because this is the first chunk, the chat status is cleared
+        // before the chunk is rendered.
+        assert!(
+            matches!(effects.as_slice(), [Effect::ClearChatStatus, Effect::ReceiveChunk(c)] if c == "hello"),
+            "unexpected effects: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn subsequent_stream_chunk_appends_without_clearing_status() {
+        let mut state = WindowState {
+            pending_request_id: Some("req-real".to_string()),
+            streaming_buffer: "hello".to_string(),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::StreamChunk {
+            request_id: "req-real".to_string(),
+            chunk: " world".to_string(),
+        });
+        assert_eq!(state.streaming_buffer, "hello world");
+        // Non-first chunk: only the chunk is rendered, no status clear.
+        assert!(
+            matches!(effects.as_slice(), [Effect::ReceiveChunk(c)] if c == " world"),
+            "unexpected effects: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn stream_chunk_for_unrelated_request_id_is_ignored() {
+        let mut state = WindowState {
+            pending_request_id: Some("req-real".to_string()),
+            streaming_buffer: "hello".to_string(),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::StreamChunk {
+            request_id: "some-other-req".to_string(),
+            chunk: "noise".to_string(),
+        });
+        assert!(effects.is_empty(), "stray chunk must not render");
+        assert_eq!(state.streaming_buffer, "hello", "buffer must be untouched");
+    }
+
+    #[test]
+    fn assistant_status_matches_pending_sentinel_before_request_id_known() {
+        let mut state = WindowState {
+            pending_request_id: Some("__pending__".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::AssistantStatus {
+            request_id: "req-not-yet-claimed".to_string(),
+            message: "Searching...".to_string(),
+        });
+        assert!(
+            matches!(effects.as_slice(), [Effect::SetChatStatus(m)] if m == "Searching..."),
+            "status during the __pending__ window must reach the chat: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn stream_complete_claims_sentinel_appends_message_and_clears_pending() {
+        let mut state = WindowState {
+            pending_request_id: Some("__pending__".to_string()),
+            streaming_buffer: "partial".to_string(),
+            current_conversation: Some(detail("c1", vec![msg("user", "hi")])),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-real".to_string(),
+            full_response: "the answer".to_string(),
+        });
+        assert!(state.pending_request_id.is_none());
+        assert!(state.streaming_buffer.is_empty());
+        let conv = state.current_conversation.as_ref().unwrap();
+        assert_eq!(conv.messages.last().unwrap().role, "assistant");
+        assert_eq!(conv.messages.last().unwrap().content, "the answer");
+        assert!(
+            matches!(effects.as_slice(), [Effect::ClearChatStatus, Effect::CompleteStreaming(c)] if c == "the answer"),
+            "unexpected effects: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn stream_error_clears_pending_and_sets_error_status() {
+        let mut state = WindowState {
+            pending_request_id: Some("req-real".to_string()),
+            streaming_buffer: "partial".to_string(),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::StreamError {
+            request_id: "req-real".to_string(),
+            error: "boom".to_string(),
+        });
+        assert!(state.pending_request_id.is_none());
+        assert!(state.streaming_buffer.is_empty());
+        assert!(
+            matches!(effects.as_slice(), [Effect::ClearChatStatus, Effect::SetStatusText(t)] if t == "Error: boom"),
+            "unexpected effects: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn disconnect_finalizes_in_progress_stream_with_connection_lost_marker() {
+        let mut state = WindowState {
+            pending_request_id: Some("req-real".to_string()),
+            streaming_buffer: "half a thought".to_string(),
+            current_conversation: Some(detail("c1", vec![])),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::Disconnected {
+            reason: "socket closed".to_string(),
+        });
+        assert!(state.pending_request_id.is_none());
+        assert!(state.streaming_buffer.is_empty());
+        // The partial response is committed to the conversation with the marker.
+        let last = state
+            .current_conversation
+            .as_ref()
+            .unwrap()
+            .messages
+            .last()
+            .unwrap();
+        assert_eq!(last.content, "half a thought\n\n[Connection lost]");
+        // Effects: clear client, desensitize send, status text, then finalize.
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::ClearClient,
+                    Effect::SetSendSensitive(false),
+                    Effect::SetStatusText(t),
+                    Effect::CompleteStreaming(c),
+                ] if t == "Disconnected: socket closed" && c == "half a thought\n\n[Connection lost]"
+            ),
+            "unexpected effects: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn disconnect_without_active_stream_does_not_emit_complete_streaming() {
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::Disconnected {
+            reason: "bye".to_string(),
+        });
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::ClearClient,
+                    Effect::SetSendSensitive(false),
+                    Effect::SetStatusText(_)
+                ]
+            ),
+            "no streaming buffer => no CompleteStreaming: {effects:?}"
+        );
+    }
+
+    // --- Archived-list refresh -------------------------------------------
+
+    #[test]
+    fn conversations_loaded_stores_list_and_refreshes_sidebar_then_ensures_active() {
+        // The "show archived" toggle re-fetches and re-delivers the list via
+        // ConversationsLoaded; apply must repaint the sidebar with the new
+        // (possibly archived-including) set and re-run ensure-active.
+        let mut state = WindowState::default();
+        let convs = vec![
+            summary("c1", "Active one", false),
+            summary("c2", "Archived one", true),
+        ];
+        let effects = state.apply(UiMessage::ConversationsLoaded(convs.clone()));
+        assert_eq!(state.conversations.len(), 2);
+        assert_eq!(state.conversations[1].id, "c2");
+        assert!(state.conversations[1].archived);
+        match effects.as_slice() {
+            [
+                Effect::SetConversations(got),
+                Effect::EnsureActiveConversation,
+            ] => {
+                assert_eq!(got.len(), 2);
+                assert_eq!(got[1].id, "c2");
+            }
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deleting_active_conversation_clears_chat_and_re_ensures_active() {
+        let mut state = WindowState {
+            conversations: vec![summary("c1", "one", false), summary("c2", "two", false)],
+            current_conversation_id: Some("c1".to_string()),
+            current_conversation: Some(detail("c1", vec![])),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::ConversationDeleted {
+            id: "c1".to_string(),
+        });
+        assert_eq!(state.conversations.len(), 1);
+        assert_eq!(state.conversations[0].id, "c2");
+        assert!(state.current_conversation_id.is_none());
+        assert!(state.current_conversation.is_none());
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::SetConversations(_),
+                    Effect::ClearChat,
+                    Effect::EnsureActiveConversation
+                ]
+            ),
+            "deleting the active conversation must clear chat + re-ensure: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn deleting_inactive_conversation_only_refreshes_sidebar() {
+        let mut state = WindowState {
+            conversations: vec![summary("c1", "one", false), summary("c2", "two", false)],
+            current_conversation_id: Some("c1".to_string()),
+            current_conversation: Some(detail("c1", vec![])),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::ConversationDeleted {
+            id: "c2".to_string(),
+        });
+        assert!(state.current_conversation_id.as_deref() == Some("c1"));
+        assert!(
+            matches!(effects.as_slice(), [Effect::SetConversations(got)] if got.len() == 1),
+            "deleting an inactive conversation must not touch the chat: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn rename_updates_matching_conversation_title_and_refreshes_sidebar() {
+        let mut state = WindowState {
+            conversations: vec![summary("c1", "old", false), summary("c2", "keep", false)],
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::ConversationRenamed {
+            id: "c1".to_string(),
+            title: "new title".to_string(),
+        });
+        assert_eq!(state.conversations[0].title, "new title");
+        assert_eq!(state.conversations[1].title, "keep");
+        match effects.as_slice() {
+            [Effect::SetConversations(got)] => assert_eq!(got[0].title, "new title"),
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn title_changed_signal_updates_matching_conversation_and_refreshes_sidebar() {
+        let mut state = WindowState {
+            conversations: vec![summary("c1", "untitled", false)],
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::TitleChanged {
+            conversation_id: "c1".to_string(),
+            title: "Auto Title".to_string(),
+        });
+        assert_eq!(state.conversations[0].title, "Auto Title");
+        assert!(matches!(effects.as_slice(), [Effect::SetConversations(_)]));
+    }
+
+    // --- Debug filter ----------------------------------------------------
+
+    #[test]
+    fn conversation_loaded_hides_tool_messages_when_debug_off() {
+        let mut state = WindowState {
+            debug_enabled: false,
+            ..Default::default()
+        };
+        let d = detail(
+            "c1",
+            vec![
+                msg("user", "hi"),
+                msg("tool", "tool noise"),
+                msg("assistant", "answer"),
+                msg("assistant", "   "), // empty (tool-calls only) assistant
+            ],
+        );
+        let effects = state.apply(UiMessage::ConversationLoaded(d));
+        // The cached (unfiltered) conversation keeps all 4 messages...
+        assert_eq!(
+            state.current_conversation.as_ref().unwrap().messages.len(),
+            4
+        );
+        // ...but the chat view receives only user + non-empty assistant.
+        match effects.as_slice() {
+            [
+                Effect::SetModelSelection(_),
+                Effect::LoadConversationIntoChat(filtered),
+            ] => {
+                let roles: Vec<&str> = filtered.messages.iter().map(|m| m.role.as_str()).collect();
+                assert_eq!(roles, vec!["user", "assistant"]);
+                assert_eq!(filtered.messages[1].content, "answer");
+            }
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conversation_loaded_shows_tool_messages_when_debug_on() {
+        let mut state = WindowState {
+            debug_enabled: true,
+            ..Default::default()
+        };
+        let d = detail(
+            "c1",
+            vec![
+                msg("user", "hi"),
+                msg("tool", "tool noise"),
+                msg("assistant", "   "),
+            ],
+        );
+        let effects = state.apply(UiMessage::ConversationLoaded(d));
+        match effects.as_slice() {
+            [
+                Effect::SetModelSelection(_),
+                Effect::LoadConversationIntoChat(filtered),
+            ] => {
+                // Debug on: nothing is filtered out.
+                assert_eq!(filtered.messages.len(), 3);
+            }
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conversation_loaded_sets_active_id_and_applies_stored_model_selection() {
+        let mut state = WindowState::default();
+        let mut d = detail("c9", vec![msg("user", "hi")]);
+        d.model_selection = Some(selection("work", "claude"));
+        let effects = state.apply(UiMessage::ConversationLoaded(d));
+        assert_eq!(state.current_conversation_id.as_deref(), Some("c9"));
+        match effects.as_slice() {
+            [
+                Effect::SetModelSelection(Some(sel)),
+                Effect::LoadConversationIntoChat(_),
+            ] => {
+                assert_eq!(sel.connection_id, "work");
+                assert_eq!(sel.model_id, "claude");
+            }
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    // --- Model-picker re-application -------------------------------------
+
+    #[test]
+    fn models_loaded_reapplies_active_conversation_selection_and_shows_picker() {
+        let mut conv = detail("c1", vec![]);
+        conv.model_selection = Some(selection("work", "claude"));
+        let mut state = WindowState {
+            current_conversation: Some(conv),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::ModelsLoaded(vec![listing("work", "claude")]));
+        // set_models resets the dropdown, so apply must re-emit the stored
+        // selection, then make the picker visible (non-empty list).
+        match effects.as_slice() {
+            [
+                Effect::SetModels(models),
+                Effect::SetModelSelection(Some(sel)),
+                Effect::SetModelPickerVisible(true),
+            ] => {
+                assert_eq!(models.len(), 1);
+                assert_eq!(sel.model_id, "claude");
+            }
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn models_loaded_empty_list_hides_picker_and_skips_reapply_when_no_conversation() {
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::ModelsLoaded(Vec::new()));
+        match effects.as_slice() {
+            [
+                Effect::SetModels(models),
+                Effect::SetModelPickerVisible(false),
+            ] => {
+                assert!(models.is_empty());
+            }
+            other => panic!("unexpected effects (no conversation => no reapply): {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dangling_model_warning_for_current_conversation_clears_picker_and_cached_selection() {
+        let mut conv = detail("c1", vec![]);
+        conv.model_selection = Some(selection("old", "gone"));
+        let mut state = WindowState {
+            current_conversation: Some(conv),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let warning = api::ConversationWarning::DanglingModelSelection {
+            previous_selection: selection("old", "gone"),
+            fallback_to: selection("work", "claude"),
+        };
+        let effects = state.apply(UiMessage::ConversationWarning {
+            conversation_id: "c1".to_string(),
+            warning,
+        });
+        // Cached selection must be cleared so a later ModelsLoaded doesn't
+        // re-apply the stale dangling selection, contradicting the toast.
+        assert!(
+            state
+                .current_conversation
+                .as_ref()
+                .unwrap()
+                .model_selection
+                .is_none()
+        );
+        match effects.as_slice() {
+            [Effect::SetModelSelection(None), Effect::ShowToast(message)] => {
+                assert!(message.contains("gone"));
+                assert!(message.contains("claude"));
+            }
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dangling_model_warning_for_other_conversation_only_toasts() {
+        let mut conv = detail("c1", vec![]);
+        conv.model_selection = Some(selection("old", "gone"));
+        let mut state = WindowState {
+            current_conversation: Some(conv),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let warning = api::ConversationWarning::DanglingModelSelection {
+            previous_selection: selection("old", "gone"),
+            fallback_to: selection("work", "claude"),
+        };
+        let effects = state.apply(UiMessage::ConversationWarning {
+            conversation_id: "c2-not-current".to_string(),
+            warning,
+        });
+        // Not the current conversation: don't touch the picker or cached
+        // selection — only surface the advisory toast.
+        assert!(
+            state
+                .current_conversation
+                .as_ref()
+                .unwrap()
+                .model_selection
+                .is_some()
+        );
+        assert!(
+            matches!(effects.as_slice(), [Effect::ShowToast(_)]),
+            "unexpected effects: {effects:?}"
+        );
+    }
+
+    // --- Simple passthrough variants -------------------------------------
+
+    #[test]
+    fn status_update_sets_status_text_verbatim() {
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::StatusUpdate("Connecting".to_string()));
+        assert!(matches!(effects.as_slice(), [Effect::SetStatusText(t)] if t == "Connecting"));
+    }
+
+    #[test]
+    fn error_message_is_prefixed_in_status_bar() {
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::Error("nope".to_string()));
+        assert!(matches!(effects.as_slice(), [Effect::SetStatusText(t)] if t == "Error: nope"));
+    }
+
+    #[test]
+    fn connected_sets_label_and_enables_send() {
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::Connected {
+            label: "Local daemon".to_string(),
+        });
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::SetStatusText(t), Effect::SetSendSensitive(true)] if t == "Local daemon"
+            ),
+            "unexpected effects: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn conversation_created_sets_active_id_without_effects() {
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::ConversationCreated {
+            id: "new-c".to_string(),
+        });
+        assert_eq!(state.current_conversation_id.as_deref(), Some("new-c"));
+        assert!(effects.is_empty());
     }
 }
