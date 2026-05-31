@@ -45,6 +45,12 @@ struct Row {
     model_list: StringList,
     model_values: Rc<RefCell<Vec<String>>>,
     effort_dd: DropDown,
+    /// Preserved per-purpose context-window override (#51). The UI doesn't
+    /// edit this field, but `SetPurpose` is a full replace, so we remember
+    /// whatever the daemon reported and send it back unchanged on emit —
+    /// otherwise touching a dropdown would silently wipe an override set
+    /// elsewhere (TUI/config).
+    max_context_tokens: Rc<RefCell<Option<u64>>>,
 }
 
 pub struct PurposesTab {
@@ -129,6 +135,7 @@ impl PurposesTab {
                 model_list,
                 model_values: Rc::new(RefCell::new(Vec::new())),
                 effort_dd: effort_dd.clone(),
+                max_context_tokens: Rc::new(RefCell::new(None)),
             };
 
             // When connection changes: rebuild models dropdown and emit a
@@ -361,6 +368,10 @@ fn apply_purpose_config(
         return;
     };
 
+    // Remember the daemon's context-window override so a later emit can send
+    // it back unchanged (the UI doesn't edit this field).
+    *row.max_context_tokens.borrow_mut() = cfg.max_context_tokens;
+
     if let Some(idx) = row
         .connection_values
         .borrow()
@@ -416,10 +427,10 @@ fn emit_current(
         connection,
         model,
         effort,
-        // Context-window override (#51) isn't exposed in this UI yet; leave
-        // it unset so the daemon uses its curated table / universal
-        // fallback.
-        max_context_tokens: None,
+        // Context-window override (#51) isn't editable in this UI, but
+        // `SetPurpose` is a full replace — preserve whatever the daemon
+        // last reported so we don't clobber an override set elsewhere.
+        max_context_tokens: *row.max_context_tokens.borrow(),
     };
     if let Some(ref cb) = *on_set_purpose.borrow() {
         cb(purpose, config);

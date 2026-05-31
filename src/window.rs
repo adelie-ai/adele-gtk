@@ -989,6 +989,12 @@ fn handle_ui_message(
                         == Some(conversation_id.as_str());
                     if is_current {
                         model_picker.set_selection(None);
+                        // Also clear the cached detail's selection so a later
+                        // `ModelsLoaded` doesn't re-apply the stale dangling
+                        // selection, contradicting this toast.
+                        if let Some(ref mut conv) = state.borrow_mut().current_conversation {
+                            conv.model_selection = None;
+                        }
                     }
                     let message = format!(
                         "The model \"{}\" on connection \"{}\" is no longer available — falling back to \"{}\" on \"{}\".",

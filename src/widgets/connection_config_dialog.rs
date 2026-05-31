@@ -105,6 +105,7 @@ pub fn show_configure_dialog<FSave, FRefresh>(
     FSave: Fn(String, api::ConnectionConfigView) + 'static,
     FRefresh: Fn(String) + 'static,
 {
+    let is_edit = existing.is_some();
     let title = match &existing {
         Some((id, _)) => format!("Edit {} connection: {id}", connector.label()),
         None => format!("Add {} connection", connector.label()),
@@ -136,6 +137,20 @@ pub fn show_configure_dialog<FSave, FRefresh>(
         id_entry.set_sensitive(false);
     }
     content.append(&id_entry);
+
+    // Stopgap warning (edit only): the daemon's `ConnectionView` doesn't echo
+    // non-secret config back, so we pre-fill an empty config and `Update` is a
+    // full replace. Until the daemon echoes config, saving an edit without
+    // re-entering every field silently wipes the omitted ones.
+    if is_edit {
+        let edit_warning = Label::new(Some(
+            "Editing replaces all fields — re-enter any you want to keep.",
+        ));
+        edit_warning.set_halign(Align::Start);
+        edit_warning.set_wrap(true);
+        edit_warning.add_css_class("dim-label");
+        content.append(&edit_warning);
+    }
 
     content.append(&Separator::new(Orientation::Horizontal));
 
@@ -281,16 +296,18 @@ pub fn show_configure_dialog<FSave, FRefresh>(
         }
     }
 
-    // Bedrock-only: "Refresh models" button. Only useful when editing (we
-    // need a valid id) — the handler saves first, then refreshes.
-    if connector == ConnectorType::Bedrock {
+    // Bedrock-only: "Refresh models" button. Only meaningful when editing an
+    // existing connection (the Add path has nothing saved to refresh and wires
+    // a no-op callback), so only show it there. Refresh calls the refresh
+    // callback directly — it does NOT save the dialog's current fields.
+    if connector == ConnectorType::Bedrock && is_edit {
         content.append(&Separator::new(Orientation::Horizontal));
         let btn_row = GtkBox::new(Orientation::Horizontal, 8);
         let refresh_btn = Button::with_label("Refresh models");
         refresh_btn.set_tooltip_text(Some(
             "Re-query Bedrock's ListFoundationModels and update the cached model list.",
         ));
-        let note = Label::new(Some("(Saves first, then refreshes.)"));
+        let note = Label::new(Some("(Refreshes the model list for the saved connection.)"));
         note.add_css_class("dim-label");
         btn_row.append(&refresh_btn);
         btn_row.append(&note);
