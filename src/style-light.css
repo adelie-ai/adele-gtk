@@ -1,0 +1,198 @@
+/* Adelie GTK Client Styles — LIGHT overrides.
+ *
+ * These rules mirror the accent / background / border / selection colours of
+ * the dark palette in `style.css` with light-mode equivalents, and are applied
+ * (via a higher-priority CssProvider in `crate::theme`) only when the system /
+ * GTK preference is light. The dark `style.css` is the default and is left
+ * untouched; only the colour-bearing properties are re-asserted here so the
+ * chrome stays legible and on-brand in light mode.
+ *
+ * Colour map (dark -> light):
+ *   window bg      #1a1d2e -> #f7f8fb   window fg      #e0e0e0 -> #1a1d2e
+ *   surface bg     #232740 -> #ffffff   border         #3a3f5c -> #cdd3e0
+ *   brand teal     #84dac1 -> #178a6e   header blue    #88d6f0 -> #1f6f97
+ *   selection bg   #4866b4 -> #3a57a8   selection fg   #f5f8ff -> #ffffff
+ *   dim/status     #7c8494 -> #5b6473   hover bg       #3a3f5c -> #e6eaf3
+ *   toast/sep      #2a2e45 -> #eceef4   log bg         #181b29 -> #f0f2f7
+ */
+
+window {
+    background-color: #f7f8fb;
+    color: #1a1d2e;
+}
+
+.brand-title {
+    color: #178a6e;
+}
+
+.sidebar-header {
+    color: #1f6f97;
+}
+
+.conversation-list row:selected {
+    background-color: #3a57a8;
+    color: #ffffff;
+}
+
+.dim-label {
+    color: #5b6473;
+}
+
+.input-textview {
+    background-color: #ffffff;
+    color: #1a1d2e;
+    caret-color: #178a6e;
+}
+
+.input-textview text {
+    background-color: #ffffff;
+    color: #1a1d2e;
+}
+
+.status-bar {
+    color: #5b6473;
+}
+
+.toast-row {
+    background-color: #eceef4;
+    color: #1a1d2e;
+}
+
+.debug-check {
+    color: #1a1d2e;
+}
+
+separator {
+    background-color: #dde1ea;
+}
+
+paned > separator {
+    background-color: #dde1ea;
+}
+
+popover > contents,
+popover.menu > contents {
+    background-color: #ffffff;
+    color: #1a1d2e;
+    border: 1px solid #cdd3e0;
+}
+
+popover > arrow {
+    background-color: #ffffff;
+    border: 1px solid #cdd3e0;
+}
+
+popover modelbutton,
+popover modelbutton label {
+    color: #1a1d2e;
+}
+
+popover modelbutton:hover {
+    background-color: #e6eaf3;
+    color: #1a1d2e;
+}
+
+popover modelbutton:disabled,
+popover modelbutton:disabled label {
+    color: #5b6473;
+}
+
+.context-popover > contents {
+    background-color: #ffffff;
+    color: #1a1d2e;
+    border: 1px solid #cdd3e0;
+}
+
+.context-button {
+    color: #1a1d2e;
+}
+
+.context-button:hover {
+    background-color: #e6eaf3;
+    color: #1a1d2e;
+}
+
+.context-button:disabled,
+.context-button:disabled label {
+    color: #5b6473;
+}
+
+dropdown > popover > contents {
+    background-color: #ffffff;
+    border: 1px solid #cdd3e0;
+}
+
+dropdown listview > row {
+    color: #1a1d2e;
+}
+
+dropdown listview > row:hover {
+    background-color: #e6eaf3;
+    color: #1a1d2e;
+}
+
+dropdown listview > row:selected {
+    background-color: #3a57a8;
+    color: #ffffff;
+}
+
+dropdown > button {
+    color: #1a1d2e;
+}
+
+entry {
+    background-color: #ffffff;
+    color: #1a1d2e;
+    border: 1px solid #cdd3e0;
+    caret-color: #178a6e;
+}
+
+entry:focus {
+    border-color: #3a57a8;
+}
+
+.sidebar-stack-switcher button {
+    color: #1a1d2e;
+}
+
+.sidebar-stack-switcher button:checked {
+    background-color: #3a57a8;
+    color: #ffffff;
+}
+
+.task-list row:selected {
+    background-color: #3a57a8;
+    color: #ffffff;
+}
+
+/* Status dots: keep the semantic hues but darken the neutral/amber ones so
+   they read against the light log/list surfaces. */
+.task-dot-pending {
+    background-color: #9a7d00; /* amber, darkened for light bg */
+}
+
+.task-dot-running {
+    background-color: #2e8f4f; /* green */
+}
+
+.task-dot-completed {
+    background-color: #5b6473; /* neutral grey for "done" */
+}
+
+.task-dot-failed {
+    background-color: #c2403c; /* red */
+}
+
+.task-dot-cancelled {
+    background-color: #8b93a3; /* dim grey */
+}
+
+.task-log-view {
+    background-color: #f0f2f7;
+    color: #2a2e3a;
+}
+
+.task-log-view text {
+    background-color: #f0f2f7;
+    color: #2a2e3a;
+}

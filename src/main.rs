@@ -16,6 +16,7 @@ mod markdown;
 mod oauth;
 mod profile;
 mod selected_models;
+mod theme;
 #[cfg(feature = "linux")]
 mod webview;
 mod widgets;

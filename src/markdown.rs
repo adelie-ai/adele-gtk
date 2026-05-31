@@ -348,6 +348,84 @@ body {{
     0%, 100% {{ opacity: 0.4; }}
     50% {{ opacity: 1; }}
 }}
+
+/* Light theme. WebKitGTK drives `prefers-color-scheme` from the GTK dark
+   preference, so this block applies whenever the app is not in dark mode. The
+   dark palette above remains the default; these rules override only the
+   colour-bearing properties so chat content stays legible and on-brand in
+   light mode. Mirrors the GTK light palette in `style-light.css`:
+   bg #1a1d2e->#ffffff, fg #e0e0e0->#1a1d2e, surface #232740->#f0f2f7,
+   border #3a3f5c->#cdd3e0, user accent #ffbd59->#9a6b00,
+   assistant accent #5cce9a->#178a6e, link #7aa3ff->#2456c8. */
+@media (prefers-color-scheme: light) {{
+    body {{
+        background: #ffffff;
+        color: #1a1d2e;
+    }}
+
+    .avatar-fallback {{
+        background: #d6dae6;
+        color: #555c6b;
+    }}
+
+    .user-message .bubble {{
+        background: rgba(154, 107, 0, 0.07);
+        border-left-color: #9a6b00;
+    }}
+
+    .user-message .label {{
+        color: #9a6b00;
+    }}
+
+    .assistant-message .bubble {{
+        background: rgba(23, 138, 110, 0.07);
+        border-left-color: #178a6e;
+    }}
+
+    .assistant-message .label {{
+        color: #178a6e;
+    }}
+
+    .assistant-message.streaming .bubble {{
+        border-left-color: #1f9e7c;
+    }}
+
+    .assistant-message.streaming .label {{
+        color: #1f9e7c;
+    }}
+
+    .content pre {{
+        background: #f0f2f7;
+    }}
+
+    .content :not(pre) > code {{
+        background: #f0f2f7;
+    }}
+
+    .content th, .content td {{
+        border: 1px solid #cdd3e0;
+    }}
+
+    .content th {{
+        background: #f0f2f7;
+    }}
+
+    .content a {{
+        color: #2456c8;
+    }}
+
+    .cursor {{
+        color: #1f9e7c;
+    }}
+
+    #status-indicator {{
+        color: #555c6b;
+    }}
+
+    #status-indicator .dot {{
+        background: #1f9e7c;
+    }}
+}}
 </style>
 </head>
 <body>

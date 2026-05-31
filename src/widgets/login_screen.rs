@@ -31,14 +31,10 @@ impl LoginScreen {
         // Install app icon
         window::install_app_icon();
 
-        // Apply CSS
-        let provider = gtk4::CssProvider::new();
-        provider.load_from_data(include_str!("../style.css"));
-        gtk4::style_context_add_provider_for_display(
-            &gdk::Display::default().expect("display"),
-            &provider,
-            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
+        // Apply theme-aware CSS (see `crate::theme`): the dark palette is
+        // installed unconditionally and the light overrides are layered on
+        // only when the system/GTK preference is light.
+        crate::theme::install_for_display(&gdk::Display::default().expect("display"));
 
         let outer = GtkBox::new(Orientation::Vertical, 0);
         outer.set_margin_start(24);
