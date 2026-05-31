@@ -13,7 +13,9 @@ use desktop_assistant_client_common::{AssistantCommands, TransportClient};
 
 /// Resolve the WebSocket client, erroring on transports that can't carry
 /// these management commands (D-Bus).
-fn ws(transport: &TransportClient) -> Result<&desktop_assistant_client_common::ws_client::WsClient> {
+fn ws(
+    transport: &TransportClient,
+) -> Result<&desktop_assistant_client_common::ws_client::WsClient> {
     transport
         .as_ws()
         .ok_or_else(|| anyhow!("named-connection management requires a WebSocket transport"))
@@ -36,7 +38,9 @@ pub async fn list_connections(transport: &TransportClient) -> Result<Vec<api::Co
         .await?;
     match result {
         api::CommandResult::Connections(list) => Ok(list),
-        other => Err(anyhow!("unexpected response for ListConnections: {other:?}")),
+        other => Err(anyhow!(
+            "unexpected response for ListConnections: {other:?}"
+        )),
     }
 }
 
@@ -62,11 +66,7 @@ pub async fn update_connection(
     expect_ack("UpdateConnection", result)
 }
 
-pub async fn delete_connection(
-    transport: &TransportClient,
-    id: String,
-    force: bool,
-) -> Result<()> {
+pub async fn delete_connection(transport: &TransportClient, id: String, force: bool) -> Result<()> {
     let result = ws(transport)?
         .send_command(api::Command::DeleteConnection { id, force })
         .await?;

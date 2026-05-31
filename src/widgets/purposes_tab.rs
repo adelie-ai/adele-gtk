@@ -105,7 +105,8 @@ impl PurposesTab {
             row_widget.append(&label);
 
             let connection_list = StringList::new(&[]);
-            let connection_dd = DropDown::new(Some(connection_list.clone()), gtk4::Expression::NONE);
+            let connection_dd =
+                DropDown::new(Some(connection_list.clone()), gtk4::Expression::NONE);
             connection_dd.set_hexpand(true);
             row_widget.append(&connection_dd);
 
