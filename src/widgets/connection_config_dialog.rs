@@ -88,6 +88,140 @@ fn text_opt(entry: &Entry) -> Option<String> {
     if t.is_empty() { None } else { Some(t) }
 }
 
+/// Declarative description of one form field for a connector. `initial` holds
+/// the value to pre-fill from echoed config (always `None` for secret fields —
+/// raw secrets are never round-tripped through the API). Pure data so the
+/// pre-fill mapping can be unit-tested without constructing GTK widgets.
+struct FieldSpec {
+    label: &'static str,
+    name: &'static str,
+    placeholder: Option<&'static str>,
+    initial: Option<String>,
+    secret: bool,
+}
+
+/// Compute the ordered field specs for `connector`, pre-filling `initial` from
+/// the echoed non-secret `config` when its variant matches the connector. A
+/// `None` config (create path / older daemon that omits `config`) or a
+/// mismatched variant yields blank fields. No field carries a secret value.
+fn field_specs(
+    connector: ConnectorType,
+    config: Option<&api::ConnectionConfigView>,
+) -> Vec<FieldSpec> {
+    match connector {
+        ConnectorType::Anthropic => {
+            let (base_url, api_key_env) = match config {
+                Some(api::ConnectionConfigView::Anthropic {
+                    base_url,
+                    api_key_env,
+                }) => (base_url.clone(), api_key_env.clone()),
+                _ => (None, None),
+            };
+            vec![
+                FieldSpec {
+                    label: "Base URL (optional override)",
+                    name: "base_url",
+                    placeholder: Some("https://api.anthropic.com"),
+                    initial: base_url,
+                    secret: false,
+                },
+                FieldSpec {
+                    label: "API key env var (e.g. ANTHROPIC_API_KEY)",
+                    name: "api_key_env",
+                    placeholder: Some("ANTHROPIC_API_KEY"),
+                    initial: api_key_env,
+                    secret: false,
+                },
+            ]
+        }
+        ConnectorType::OpenAi => {
+            let (base_url, api_key_env) = match config {
+                Some(api::ConnectionConfigView::OpenAi {
+                    base_url,
+                    api_key_env,
+                }) => (base_url.clone(), api_key_env.clone()),
+                _ => (None, None),
+            };
+            vec![
+                FieldSpec {
+                    label: "Base URL (for OpenAI-compatible providers)",
+                    name: "base_url",
+                    placeholder: Some("https://api.openai.com/v1"),
+                    initial: base_url,
+                    secret: false,
+                },
+                FieldSpec {
+                    label: "API key env var (e.g. OPENAI_API_KEY)",
+                    name: "api_key_env",
+                    placeholder: Some("OPENAI_API_KEY"),
+                    initial: api_key_env,
+                    secret: false,
+                },
+            ]
+        }
+        ConnectorType::Bedrock => {
+            let (aws_profile, region, base_url) = match config {
+                Some(api::ConnectionConfigView::Bedrock {
+                    aws_profile,
+                    region,
+                    base_url,
+                }) => (aws_profile.clone(), region.clone(), base_url.clone()),
+                _ => (None, None, None),
+            };
+            vec![
+                FieldSpec {
+                    label: "AWS profile (optional)",
+                    name: "aws_profile",
+                    placeholder: Some("default"),
+                    initial: aws_profile,
+                    secret: false,
+                },
+                FieldSpec {
+                    label: "Region",
+                    name: "region",
+                    placeholder: Some("us-west-2"),
+                    initial: region,
+                    secret: false,
+                },
+                FieldSpec {
+                    label: "Base URL override (optional)",
+                    name: "base_url",
+                    placeholder: None,
+                    initial: base_url,
+                    secret: false,
+                },
+            ]
+        }
+        ConnectorType::Ollama => {
+            let base_url = match config {
+                Some(api::ConnectionConfigView::Ollama { base_url }) => base_url.clone(),
+                _ => None,
+            };
+            vec![FieldSpec {
+                label: "Base URL",
+                name: "base_url",
+                placeholder: Some("http://localhost:11434"),
+                initial: base_url,
+                secret: false,
+            }]
+        }
+    }
+}
+
+/// Trailing dim-label hint shown under the fields for connectors that read an
+/// API key from a named env var.
+fn connector_hint(connector: ConnectorType) -> Option<&'static str> {
+    match connector {
+        ConnectorType::Anthropic => Some(
+            "The daemon reads the API key from the named env var. Set it in your daemon environment (systemd unit, shell, etc.).",
+        ),
+        ConnectorType::OpenAi => Some(
+            "The daemon reads the API key from the named env var. Set it in your daemon environment.",
+        ),
+        ConnectorType::Bedrock | ConnectorType::Ollama => None,
+    }
+}
+
 /// Show the Configure dialog. `existing` distinguishes edit (Some) from
 /// create (None). `on_save` is called with the final `(id, config)` pair
 /// when the user clicks Save; the dialog closes on its own.
@@ -138,20 +272,6 @@ pub fn show_configure_dialog<FSave, FRefresh>(
     }
     content.append(&id_entry);
 
-    // Stopgap warning (edit only): the daemon's `ConnectionView` doesn't echo
-    // non-secret config back, so we pre-fill an empty config and `Update` is a
-    // full replace. Until the daemon echoes config, saving an edit without
-    // re-entering every field silently wipes the omitted ones.
-    if is_edit {
-        let edit_warning = Label::new(Some(
-            "Editing replaces all fields — re-enter any you want to keep.",
-        ));
-        edit_warning.set_halign(Align::Start);
-        edit_warning.set_wrap(true);
-        edit_warning.add_css_class("dim-label");
-        content.append(&edit_warning);
-    }
-
     content.append(&Separator::new(Orientation::Horizontal));
 
     // Per-connector field map: we track entries by name in a Vec so the
@@ -188,112 +308,25 @@ pub fn show_configure_dialog<FSave, FRefresh>(
         });
     };
 
+    // Pre-fill the per-connector fields from the echoed non-secret config (or
+    // leave them blank on the create path / older daemons). Computed by a pure
+    // helper so the pre-fill mapping is unit-testable without a GTK display.
     let existing_config = existing.as_ref().map(|(_, c)| c.clone());
-    match connector {
-        ConnectorType::Anthropic => {
-            let (base_url, api_key_env) = match &existing_config {
-                Some(api::ConnectionConfigView::Anthropic {
-                    base_url,
-                    api_key_env,
-                }) => (base_url.clone(), api_key_env.clone()),
-                _ => (None, None),
-            };
-            add_field(
-                "Base URL (optional override)",
-                "base_url",
-                Some("https://api.anthropic.com"),
-                base_url.as_deref(),
-                false,
-            );
-            add_field(
-                "API key env var (e.g. ANTHROPIC_API_KEY)",
-                "api_key_env",
-                Some("ANTHROPIC_API_KEY"),
-                api_key_env.as_deref(),
-                false,
-            );
-            let hint = Label::new(Some(
-                "The daemon reads the API key from the named env var. Set it in your daemon environment (systemd unit, shell, etc.).",
-            ));
-            hint.set_halign(Align::Start);
-            hint.set_wrap(true);
-            hint.add_css_class("dim-label");
-            content.append(&hint);
-        }
-        ConnectorType::OpenAi => {
-            let (base_url, api_key_env) = match &existing_config {
-                Some(api::ConnectionConfigView::OpenAi {
-                    base_url,
-                    api_key_env,
-                }) => (base_url.clone(), api_key_env.clone()),
-                _ => (None, None),
-            };
-            add_field(
-                "Base URL (for OpenAI-compatible providers)",
-                "base_url",
-                Some("https://api.openai.com/v1"),
-                base_url.as_deref(),
-                false,
-            );
-            add_field(
-                "API key env var (e.g. OPENAI_API_KEY)",
-                "api_key_env",
-                Some("OPENAI_API_KEY"),
-                api_key_env.as_deref(),
-                false,
-            );
-            let hint = Label::new(Some(
-                "The daemon reads the API key from the named env var. Set it in your daemon environment.",
-            ));
-            hint.set_halign(Align::Start);
-            hint.set_wrap(true);
-            hint.add_css_class("dim-label");
-            content.append(&hint);
-        }
-        ConnectorType::Bedrock => {
-            let (aws_profile, region, base_url) = match &existing_config {
-                Some(api::ConnectionConfigView::Bedrock {
-                    aws_profile,
-                    region,
-                    base_url,
-                }) => (aws_profile.clone(), region.clone(), base_url.clone()),
-                _ => (None, None, None),
-            };
-            add_field(
-                "AWS profile (optional)",
-                "aws_profile",
-                Some("default"),
-                aws_profile.as_deref(),
-                false,
-            );
-            add_field(
-                "Region",
-                "region",
-                Some("us-west-2"),
-                region.as_deref(),
-                false,
-            );
-            add_field(
-                "Base URL override (optional)",
-                "base_url",
-                None,
-                base_url.as_deref(),
-                false,
-            );
-        }
-        ConnectorType::Ollama => {
-            let base_url = match &existing_config {
-                Some(api::ConnectionConfigView::Ollama { base_url }) => base_url.clone(),
-                _ => None,
-            };
-            add_field(
-                "Base URL",
-                "base_url",
-                Some("http://localhost:11434"),
-                base_url.as_deref(),
-                false,
-            );
-        }
+    for spec in field_specs(connector, existing_config.as_ref()) {
+        add_field(
+            spec.label,
+            spec.name,
+            spec.placeholder,
+            spec.initial.as_deref(),
+            spec.secret,
+        );
+    }
+    if let Some(hint_text) = connector_hint(connector) {
+        let hint = Label::new(Some(hint_text));
+        hint.set_halign(Align::Start);
+        hint.set_wrap(true);
+        hint.add_css_class("dim-label");
+        content.append(&hint);
     }
 
     // Bedrock-only: "Refresh models" button. Only meaningful when editing an
@@ -446,5 +479,74 @@ mod tests {
             ConnectorType::OpenAi.empty_config(),
             api::ConnectionConfigView::OpenAi { .. }
         ));
+    }
+
+    /// Look up a field's pre-fill value by name within a spec list.
+    fn initial_of<'a>(specs: &'a [FieldSpec], name: &str) -> Option<&'a str> {
+        specs
+            .iter()
+            .find(|f| f.name == name)
+            .and_then(|f| f.initial.as_deref())
+    }
+
+    #[test]
+    fn field_specs_prefill_from_echoed_anthropic_config() {
+        let config = api::ConnectionConfigView::Anthropic {
+            base_url: Some("https://proxy.example/v1".to_string()),
+            api_key_env: Some("MY_ANTHROPIC_KEY".to_string()),
+        };
+        let specs = field_specs(ConnectorType::Anthropic, Some(&config));
+        assert_eq!(
+            initial_of(&specs, "base_url"),
+            Some("https://proxy.example/v1")
+        );
+        // `api_key_env` is the env-var *name*, not the secret — it pre-fills.
+        assert_eq!(initial_of(&specs, "api_key_env"), Some("MY_ANTHROPIC_KEY"));
+        // No field is ever marked secret, and none carries a raw credential.
+        assert!(specs.iter().all(|f| !f.secret));
+    }
+
+    #[test]
+    fn field_specs_prefill_from_echoed_bedrock_config() {
+        let config = api::ConnectionConfigView::Bedrock {
+            aws_profile: Some("prod".to_string()),
+            region: Some("eu-central-1".to_string()),
+            base_url: None,
+        };
+        let specs = field_specs(ConnectorType::Bedrock, Some(&config));
+        assert_eq!(initial_of(&specs, "aws_profile"), Some("prod"));
+        assert_eq!(initial_of(&specs, "region"), Some("eu-central-1"));
+        assert_eq!(initial_of(&specs, "base_url"), None);
+        assert!(specs.iter().all(|f| !f.secret));
+    }
+
+    #[test]
+    fn field_specs_blank_when_config_is_none() {
+        // Create path / older daemon that omits `config`: every field blank.
+        for connector in [
+            ConnectorType::Anthropic,
+            ConnectorType::OpenAi,
+            ConnectorType::Bedrock,
+            ConnectorType::Ollama,
+        ] {
+            let specs = field_specs(connector, None);
+            assert!(
+                specs.iter().all(|f| f.initial.is_none()),
+                "{connector:?} should have no pre-filled fields when config is None",
+            );
+        }
+    }
+
+    #[test]
+    fn field_specs_blank_on_variant_mismatch() {
+        // A config whose variant doesn't match the connector must not leak
+        // values across connector types.
+        let bedrock = api::ConnectionConfigView::Bedrock {
+            aws_profile: Some("prod".to_string()),
+            region: Some("us-east-1".to_string()),
+            base_url: None,
+        };
+        let specs = field_specs(ConnectorType::Anthropic, Some(&bedrock));
+        assert!(specs.iter().all(|f| f.initial.is_none()));
     }
 }
