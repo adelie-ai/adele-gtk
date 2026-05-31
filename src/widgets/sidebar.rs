@@ -5,7 +5,7 @@ use desktop_assistant_client_common::ConversationSummary;
 use gtk4::prelude::*;
 use gtk4::{
     Box as GtkBox, Button, CheckButton, GestureClick, Image, Label, ListBox, ListBoxRow,
-    Orientation, Popover, ScrolledWindow, SelectionMode,
+    Orientation, Popover, ScrolledWindow, SelectionMode, glib,
 };
 
 type IndexCallback = Box<dyn Fn(usize)>;
@@ -99,15 +99,16 @@ impl Sidebar {
         let on_show_archived_toggled: Rc<RefCell<Option<ToggleCallback>>> =
             Rc::new(RefCell::new(None));
 
-        {
-            let cb = Rc::clone(&on_show_archived_toggled);
-            show_archived_check.connect_toggled(move |check| {
+        show_archived_check.connect_toggled(glib::clone!(
+            #[strong(rename_to = cb)]
+            on_show_archived_toggled,
+            move |check| {
                 let active = check.is_active();
                 if let Some(ref f) = *cb.borrow() {
                     f(active);
                 }
-            });
-        }
+            }
+        ));
 
         Self {
             container,
@@ -175,64 +176,83 @@ impl Sidebar {
             // Right-click context menu
             let gesture = GestureClick::new();
             gesture.set_button(3); // secondary (right) click
-            let on_rename = Rc::clone(&self.on_rename);
-            let on_delete = Rc::clone(&self.on_delete);
-            let on_archive = Rc::clone(&self.on_archive);
             let is_archived = conv.archived;
-            gesture.connect_pressed(move |gesture, _n_press, x, y| {
-                let Some(widget) = gesture.widget() else {
-                    return;
-                };
+            gesture.connect_pressed(glib::clone!(
+                #[strong(rename_to = on_rename)]
+                self.on_rename,
+                #[strong(rename_to = on_delete)]
+                self.on_delete,
+                #[strong(rename_to = on_archive)]
+                self.on_archive,
+                move |gesture, _n_press, x, y| {
+                    let Some(widget) = gesture.widget() else {
+                        return;
+                    };
 
-                let popover = Popover::new();
-                popover.add_css_class("context-popover");
-                popover.set_parent(&widget);
-                popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-                popover.set_has_arrow(false);
+                    let popover = Popover::new();
+                    popover.add_css_class("context-popover");
+                    popover.set_parent(&widget);
+                    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
+                        x as i32, y as i32, 1, 1,
+                    )));
+                    popover.set_has_arrow(false);
 
-                let menu_box = GtkBox::new(Orientation::Vertical, 0);
+                    let menu_box = GtkBox::new(Orientation::Vertical, 0);
 
-                let rename_btn = Button::with_label("Rename");
-                rename_btn.add_css_class("context-button");
-                let on_rename_inner = Rc::clone(&on_rename);
-                let popover_ref = popover.clone();
-                rename_btn.connect_clicked(move |_| {
-                    popover_ref.popdown();
-                    if let Some(ref cb) = *on_rename_inner.borrow() {
-                        cb(idx);
-                    }
-                });
-                menu_box.append(&rename_btn);
+                    let rename_btn = Button::with_label("Rename");
+                    rename_btn.add_css_class("context-button");
+                    rename_btn.connect_clicked(glib::clone!(
+                        #[strong(rename_to = on_rename_inner)]
+                        on_rename,
+                        #[weak]
+                        popover,
+                        move |_| {
+                            popover.popdown();
+                            if let Some(ref cb) = *on_rename_inner.borrow() {
+                                cb(idx);
+                            }
+                        }
+                    ));
+                    menu_box.append(&rename_btn);
 
-                let archive_label = if is_archived { "Unarchive" } else { "Archive" };
-                let archive_btn = Button::with_label(archive_label);
-                archive_btn.add_css_class("context-button");
-                let on_archive_inner = Rc::clone(&on_archive);
-                let popover_ref = popover.clone();
-                archive_btn.connect_clicked(move |_| {
-                    popover_ref.popdown();
-                    if let Some(ref cb) = *on_archive_inner.borrow() {
-                        cb(idx);
-                    }
-                });
-                menu_box.append(&archive_btn);
+                    let archive_label = if is_archived { "Unarchive" } else { "Archive" };
+                    let archive_btn = Button::with_label(archive_label);
+                    archive_btn.add_css_class("context-button");
+                    archive_btn.connect_clicked(glib::clone!(
+                        #[strong(rename_to = on_archive_inner)]
+                        on_archive,
+                        #[weak]
+                        popover,
+                        move |_| {
+                            popover.popdown();
+                            if let Some(ref cb) = *on_archive_inner.borrow() {
+                                cb(idx);
+                            }
+                        }
+                    ));
+                    menu_box.append(&archive_btn);
 
-                let delete_btn = Button::with_label("Delete");
-                delete_btn.add_css_class("context-button");
-                delete_btn.add_css_class("destructive-action");
-                let on_delete_inner = Rc::clone(&on_delete);
-                let popover_ref = popover.clone();
-                delete_btn.connect_clicked(move |_| {
-                    popover_ref.popdown();
-                    if let Some(ref cb) = *on_delete_inner.borrow() {
-                        cb(idx);
-                    }
-                });
-                menu_box.append(&delete_btn);
+                    let delete_btn = Button::with_label("Delete");
+                    delete_btn.add_css_class("context-button");
+                    delete_btn.add_css_class("destructive-action");
+                    delete_btn.connect_clicked(glib::clone!(
+                        #[strong(rename_to = on_delete_inner)]
+                        on_delete,
+                        #[weak]
+                        popover,
+                        move |_| {
+                            popover.popdown();
+                            if let Some(ref cb) = *on_delete_inner.borrow() {
+                                cb(idx);
+                            }
+                        }
+                    ));
+                    menu_box.append(&delete_btn);
 
-                popover.set_child(Some(&menu_box));
-                popover.popup();
-            });
+                    popover.set_child(Some(&menu_box));
+                    popover.popup();
+                }
+            ));
             row.add_controller(gesture);
 
             self.list_box.append(&row);

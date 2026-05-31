@@ -14,7 +14,7 @@ use desktop_assistant_api_model as api;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box as GtkBox, Button, Label, ListBox, ListBoxRow, Orientation, ScrolledWindow,
-    SelectionMode, TextBuffer, TextView, WrapMode,
+    SelectionMode, TextBuffer, TextView, WrapMode, glib,
 };
 
 // --- Pure-Rust model (no GTK types) ---------------------------------------
@@ -326,77 +326,93 @@ impl TasksPanel {
     }
 
     fn wire_selection(&self) {
-        let model = Rc::clone(&self.model);
-        let log_buffer = self.log_buffer.clone();
-        let cancel_button = self.cancel_button.clone();
-        let open_btn = self.open_conversation_button.clone();
-        self.list_box.connect_row_selected(move |_, row| {
-            let Some(row) = row else {
-                log_buffer.set_text("");
-                cancel_button.set_sensitive(false);
-                open_btn.set_sensitive(false);
-                return;
-            };
-            let idx = row.index() as usize;
-            let m = model.borrow();
-            let Some(task) = m.get(idx) else {
-                cancel_button.set_sensitive(false);
-                open_btn.set_sensitive(false);
-                return;
-            };
-            // Cancel only applies to non-terminal states.
-            let cancellable = matches!(
-                task.status,
-                api::TaskStatus::Pending | api::TaskStatus::Running
-            );
-            cancel_button.set_sensitive(cancellable);
-            open_btn.set_sensitive(conversation_id_for(&task.kind).is_some());
+        self.list_box.connect_row_selected(glib::clone!(
+            #[strong(rename_to = model)]
+            self.model,
+            #[weak(rename_to = log_buffer)]
+            self.log_buffer,
+            #[weak(rename_to = cancel_button)]
+            self.cancel_button,
+            #[weak(rename_to = open_btn)]
+            self.open_conversation_button,
+            move |_, row| {
+                let Some(row) = row else {
+                    log_buffer.set_text("");
+                    cancel_button.set_sensitive(false);
+                    open_btn.set_sensitive(false);
+                    return;
+                };
+                let idx = row.index() as usize;
+                let m = model.borrow();
+                let Some(task) = m.get(idx) else {
+                    cancel_button.set_sensitive(false);
+                    open_btn.set_sensitive(false);
+                    return;
+                };
+                // Cancel only applies to non-terminal states.
+                let cancellable = matches!(
+                    task.status,
+                    api::TaskStatus::Pending | api::TaskStatus::Running
+                );
+                cancel_button.set_sensitive(cancellable);
+                open_btn.set_sensitive(conversation_id_for(&task.kind).is_some());
 
-            let text = m
-                .logs_for(&task.id.0)
-                .iter()
-                .map(format_log_line)
-                .collect::<Vec<_>>()
-                .join("\n");
-            log_buffer.set_text(&text);
-        });
+                let text = m
+                    .logs_for(&task.id.0)
+                    .iter()
+                    .map(format_log_line)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                log_buffer.set_text(&text);
+            }
+        ));
     }
 
     fn wire_toolbar(&self) {
-        let model = Rc::clone(&self.model);
-        let list_box = self.list_box.clone();
-        let on_cancel = Rc::clone(&self.on_cancel);
-        self.cancel_button.connect_clicked(move |_| {
-            let Some(row) = list_box.selected_row() else {
-                return;
-            };
-            let idx = row.index() as usize;
-            let id = match model.borrow().get(idx) {
-                Some(t) => t.id.0.clone(),
-                None => return,
-            };
-            if let Some(ref cb) = *on_cancel.borrow() {
-                cb(id);
+        self.cancel_button.connect_clicked(glib::clone!(
+            #[strong(rename_to = model)]
+            self.model,
+            #[weak(rename_to = list_box)]
+            self.list_box,
+            #[strong(rename_to = on_cancel)]
+            self.on_cancel,
+            move |_| {
+                let Some(row) = list_box.selected_row() else {
+                    return;
+                };
+                let idx = row.index() as usize;
+                let id = match model.borrow().get(idx) {
+                    Some(t) => t.id.0.clone(),
+                    None => return,
+                };
+                if let Some(ref cb) = *on_cancel.borrow() {
+                    cb(id);
+                }
             }
-        });
+        ));
 
-        let model = Rc::clone(&self.model);
-        let list_box = self.list_box.clone();
-        let on_open = Rc::clone(&self.on_open_conversation);
-        self.open_conversation_button.connect_clicked(move |_| {
-            let Some(row) = list_box.selected_row() else {
-                return;
-            };
-            let idx = row.index() as usize;
-            let conv_id = match model.borrow().get(idx) {
-                Some(t) => conversation_id_for(&t.kind),
-                None => None,
-            };
-            let Some(conv_id) = conv_id else { return };
-            if let Some(ref cb) = *on_open.borrow() {
-                cb(conv_id);
+        self.open_conversation_button.connect_clicked(glib::clone!(
+            #[strong(rename_to = model)]
+            self.model,
+            #[weak(rename_to = list_box)]
+            self.list_box,
+            #[strong(rename_to = on_open)]
+            self.on_open_conversation,
+            move |_| {
+                let Some(row) = list_box.selected_row() else {
+                    return;
+                };
+                let idx = row.index() as usize;
+                let conv_id = match model.borrow().get(idx) {
+                    Some(t) => conversation_id_for(&t.kind),
+                    None => None,
+                };
+                let Some(conv_id) = conv_id else { return };
+                if let Some(ref cb) = *on_open.borrow() {
+                    cb(conv_id);
+                }
             }
-        });
+        ));
     }
 
     pub fn connect_cancel<F: Fn(String) + 'static>(&self, f: F) {

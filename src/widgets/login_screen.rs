@@ -127,150 +127,181 @@ impl LoginScreen {
         let populate: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
 
         {
-            let profiles = Rc::clone(&profiles);
-            let list_box = Rc::clone(&list_box);
-            let empty_label = Rc::clone(&empty_label);
-            let connect_btn = Rc::clone(&connect_btn);
-            let status_label = Rc::clone(&status_label);
-            let window_ref = window_ref.clone();
-            let populate_self = Rc::clone(&populate);
+            let f: Rc<dyn Fn()> = Rc::new(glib::clone!(
+                #[strong]
+                profiles,
+                #[strong]
+                list_box,
+                #[strong]
+                empty_label,
+                #[strong]
+                connect_btn,
+                #[strong]
+                status_label,
+                #[weak]
+                window_ref,
+                #[strong(rename_to = populate_self)]
+                populate,
+                move || {
+                    // Clear existing rows
+                    while let Some(child) = list_box.first_child() {
+                        list_box.remove(&child);
+                    }
 
-            let f: Rc<dyn Fn()> = Rc::new(move || {
-                // Clear existing rows
-                while let Some(child) = list_box.first_child() {
-                    list_box.remove(&child);
-                }
+                    let profs = profiles.borrow();
+                    empty_label.set_visible(profs.is_empty());
+                    connect_btn.set_sensitive(!profs.is_empty());
 
-                let profs = profiles.borrow();
-                empty_label.set_visible(profs.is_empty());
-                connect_btn.set_sensitive(!profs.is_empty());
+                    for (idx, profile) in profs.iter().enumerate() {
+                        let row = ListBoxRow::new();
+                        let hbox = GtkBox::new(Orientation::Horizontal, 8);
+                        hbox.set_margin_start(12);
+                        hbox.set_margin_end(12);
+                        hbox.set_margin_top(8);
+                        hbox.set_margin_bottom(8);
 
-                for (idx, profile) in profs.iter().enumerate() {
-                    let row = ListBoxRow::new();
-                    let hbox = GtkBox::new(Orientation::Horizontal, 8);
-                    hbox.set_margin_start(12);
-                    hbox.set_margin_end(12);
-                    hbox.set_margin_top(8);
-                    hbox.set_margin_bottom(8);
+                        let name_label = Label::new(Some(&profile.name));
+                        name_label.set_halign(Align::Start);
+                        name_label.set_hexpand(true);
+                        hbox.append(&name_label);
 
-                    let name_label = Label::new(Some(&profile.name));
-                    name_label.set_halign(Align::Start);
-                    name_label.set_hexpand(true);
-                    hbox.append(&name_label);
-
-                    let detail = match &profile.protocol {
-                        ProtocolConfig::Local { path: Some(p) } => {
-                            format!("local · {}", p.display())
-                        }
-                        ProtocolConfig::Local { path: None } => "Local socket".to_string(),
-                        ProtocolConfig::Websocket { url, .. } => url.clone(),
-                    };
-                    let url_label = Label::new(Some(&detail));
-                    url_label.add_css_class("dim-label");
-                    url_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                    url_label.set_max_width_chars(30);
-                    hbox.append(&url_label);
-
-                    row.set_child(Some(&hbox));
-
-                    // Right-click context menu
-                    let gesture = GestureClick::new();
-                    gesture.set_button(3);
-                    let profiles_ref = Rc::clone(&profiles);
-                    let status_ref = Rc::clone(&status_label);
-                    let window_inner = window_ref.clone();
-                    let populate_inner = Rc::clone(&populate_self);
-                    gesture.connect_pressed(move |gesture, _n, x, y| {
-                        let Some(widget) = gesture.widget() else {
-                            return;
+                        let detail = match &profile.protocol {
+                            ProtocolConfig::Local { path: Some(p) } => {
+                                format!("local · {}", p.display())
+                            }
+                            ProtocolConfig::Local { path: None } => "Local socket".to_string(),
+                            ProtocolConfig::Websocket { url, .. } => url.clone(),
                         };
+                        let url_label = Label::new(Some(&detail));
+                        url_label.add_css_class("dim-label");
+                        url_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                        url_label.set_max_width_chars(30);
+                        hbox.append(&url_label);
 
-                        let popover = Popover::new();
-                        popover.add_css_class("context-popover");
-                        popover.set_parent(&widget);
-                        popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
-                            x as i32, y as i32, 1, 1,
-                        )));
-                        popover.set_has_arrow(false);
+                        row.set_child(Some(&hbox));
 
-                        let menu_box = GtkBox::new(Orientation::Vertical, 0);
+                        // Right-click context menu
+                        let gesture = GestureClick::new();
+                        gesture.set_button(3);
+                        gesture.connect_pressed(glib::clone!(
+                            #[strong]
+                            profiles,
+                            #[strong(rename_to = status_ref)]
+                            status_label,
+                            #[weak(rename_to = window_inner)]
+                            window_ref,
+                            #[strong(rename_to = populate_inner)]
+                            populate_self,
+                            move |gesture, _n, x, y| {
+                                let Some(widget) = gesture.widget() else {
+                                    return;
+                                };
 
-                        // Edit button
-                        let edit_btn = Button::with_label("Edit");
-                        edit_btn.add_css_class("context-button");
-                        let profiles_inner = Rc::clone(&profiles_ref);
-                        let popover_ref = popover.clone();
-                        let window_edit = window_inner.clone();
-                        let populate_edit = Rc::clone(&populate_inner);
-                        edit_btn.connect_clicked(move |_| {
-                            popover_ref.popdown();
-                            let profile = {
-                                let profs = profiles_inner.borrow();
-                                profs.get(idx).cloned()
-                            };
-                            if let Some(profile) = profile {
-                                let profiles_save = Rc::clone(&profiles_inner);
-                                let populate_save = Rc::clone(&populate_edit);
-                                setup_dialog::show_setup_dialog(
-                                    &window_edit,
-                                    Some(&profile),
-                                    move |updated| {
-                                        let store = ProfileStore::new();
-                                        let _ = store.update(&updated);
-                                        *profiles_save.borrow_mut() =
-                                            store.load().unwrap_or_default();
-                                        if let Some(ref f) = *populate_save.borrow() {
-                                            f();
+                                let popover = Popover::new();
+                                popover.add_css_class("context-popover");
+                                popover.set_parent(&widget);
+                                popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
+                                    x as i32, y as i32, 1, 1,
+                                )));
+                                popover.set_has_arrow(false);
+
+                                let menu_box = GtkBox::new(Orientation::Vertical, 0);
+
+                                // Edit button
+                                let edit_btn = Button::with_label("Edit");
+                                edit_btn.add_css_class("context-button");
+                                edit_btn.connect_clicked(glib::clone!(
+                                    #[strong(rename_to = profiles_inner)]
+                                    profiles,
+                                    #[weak]
+                                    popover,
+                                    #[weak(rename_to = window_edit)]
+                                    window_inner,
+                                    #[strong(rename_to = populate_edit)]
+                                    populate_inner,
+                                    move |_| {
+                                        popover.popdown();
+                                        let profile = {
+                                            let profs = profiles_inner.borrow();
+                                            profs.get(idx).cloned()
+                                        };
+                                        if let Some(profile) = profile {
+                                            setup_dialog::show_setup_dialog(
+                                                &window_edit,
+                                                Some(&profile),
+                                                glib::clone!(
+                                                    #[strong(rename_to = profiles_save)]
+                                                    profiles_inner,
+                                                    #[strong(rename_to = populate_save)]
+                                                    populate_edit,
+                                                    move |updated| {
+                                                        let store = ProfileStore::new();
+                                                        let _ = store.update(&updated);
+                                                        *profiles_save.borrow_mut() =
+                                                            store.load().unwrap_or_default();
+                                                        if let Some(ref f) = *populate_save.borrow()
+                                                        {
+                                                            f();
+                                                        }
+                                                    }
+                                                ),
+                                            );
                                         }
-                                    },
-                                );
+                                    }
+                                ));
+                                menu_box.append(&edit_btn);
+
+                                // Delete button
+                                let delete_btn = Button::with_label("Delete");
+                                delete_btn.add_css_class("context-button");
+                                delete_btn.add_css_class("destructive-action");
+                                delete_btn.connect_clicked(glib::clone!(
+                                    #[strong(rename_to = profiles_inner)]
+                                    profiles,
+                                    #[weak]
+                                    popover,
+                                    #[strong(rename_to = status_inner)]
+                                    status_ref,
+                                    #[strong(rename_to = populate_del)]
+                                    populate_inner,
+                                    move |_| {
+                                        popover.popdown();
+                                        let profile_id = {
+                                            let profs = profiles_inner.borrow();
+                                            profs.get(idx).map(|p| p.id.clone())
+                                        };
+                                        if let Some(id) = profile_id {
+                                            let _ = CredentialStore::delete_credentials(&id);
+                                            let store = ProfileStore::new();
+                                            let _ = store.delete(&id);
+                                            let new_profiles = store.load().unwrap_or_default();
+                                            *profiles_inner.borrow_mut() = new_profiles;
+                                            status_inner.set_text("Connection deleted");
+                                            if let Some(ref f) = *populate_del.borrow() {
+                                                f();
+                                            }
+                                        }
+                                    }
+                                ));
+                                menu_box.append(&delete_btn);
+
+                                popover.set_child(Some(&menu_box));
+                                popover.popup();
                             }
-                        });
-                        menu_box.append(&edit_btn);
+                        ));
+                        row.add_controller(gesture);
 
-                        // Delete button
-                        let delete_btn = Button::with_label("Delete");
-                        delete_btn.add_css_class("context-button");
-                        delete_btn.add_css_class("destructive-action");
-                        let profiles_inner = Rc::clone(&profiles_ref);
-                        let popover_ref = popover.clone();
-                        let status_inner = Rc::clone(&status_ref);
-                        let populate_del = Rc::clone(&populate_inner);
-                        delete_btn.connect_clicked(move |_| {
-                            popover_ref.popdown();
-                            let profile_id = {
-                                let profs = profiles_inner.borrow();
-                                profs.get(idx).map(|p| p.id.clone())
-                            };
-                            if let Some(id) = profile_id {
-                                let _ = CredentialStore::delete_credentials(&id);
-                                let store = ProfileStore::new();
-                                let _ = store.delete(&id);
-                                let new_profiles = store.load().unwrap_or_default();
-                                *profiles_inner.borrow_mut() = new_profiles;
-                                status_inner.set_text("Connection deleted");
-                                if let Some(ref f) = *populate_del.borrow() {
-                                    f();
-                                }
-                            }
-                        });
-                        menu_box.append(&delete_btn);
+                        list_box.append(&row);
+                    }
 
-                        popover.set_child(Some(&menu_box));
-                        popover.popup();
-                    });
-                    row.add_controller(gesture);
-
-                    list_box.append(&row);
+                    // Select first row if any
+                    if !profs.is_empty()
+                        && let Some(first_row) = list_box.row_at_index(0)
+                    {
+                        list_box.select_row(Some(&first_row));
+                    }
                 }
-
-                // Select first row if any
-                if !profs.is_empty()
-                    && let Some(first_row) = list_box.row_at_index(0)
-                {
-                    list_box.select_row(Some(&first_row));
-                }
-            });
+            ));
 
             *populate.borrow_mut() = Some(Rc::clone(&f));
         }
@@ -283,40 +314,57 @@ impl LoginScreen {
         }
 
         // Enable connect button when a row is selected
-        {
-            let connect_btn = Rc::clone(&connect_btn);
-            list_box.connect_row_selected(move |_, row| {
+        list_box.connect_row_selected(glib::clone!(
+            #[strong]
+            connect_btn,
+            move |_, row| {
                 connect_btn.set_sensitive(row.is_some());
-            });
-        }
+            }
+        ));
 
         // Add Connection button
-        {
-            let window_ref = window_ref.clone();
-            let profiles = Rc::clone(&profiles);
-            let populate = Rc::clone(&populate);
-            add_btn.connect_clicked(move |_| {
-                let profiles = Rc::clone(&profiles);
-                let populate = Rc::clone(&populate);
-                setup_dialog::show_setup_dialog(&window_ref, None, move |profile| {
-                    let store = ProfileStore::new();
-                    let _ = store.add(profile);
-                    *profiles.borrow_mut() = store.load().unwrap_or_default();
-                    if let Some(ref f) = *populate.borrow() {
-                        f();
-                    }
-                });
-            });
-        }
+        add_btn.connect_clicked(glib::clone!(
+            #[weak]
+            window_ref,
+            #[strong]
+            profiles,
+            #[strong]
+            populate,
+            move |_| {
+                setup_dialog::show_setup_dialog(
+                    &window_ref,
+                    None,
+                    glib::clone!(
+                        #[strong]
+                        profiles,
+                        #[strong]
+                        populate,
+                        move |profile| {
+                            let store = ProfileStore::new();
+                            let _ = store.add(profile);
+                            *profiles.borrow_mut() = store.load().unwrap_or_default();
+                            if let Some(ref f) = *populate.borrow() {
+                                f();
+                            }
+                        }
+                    ),
+                );
+            }
+        ));
 
         // Connect button
-        {
-            let profiles = Rc::clone(&profiles);
-            let list_box = Rc::clone(&list_box);
-            let status_label = Rc::clone(&status_label);
-            let app_ref = app.clone();
-            let window_ref = window_ref.clone();
-            connect_btn.connect_clicked(move |btn| {
+        connect_btn.connect_clicked(glib::clone!(
+            #[strong]
+            profiles,
+            #[strong]
+            list_box,
+            #[strong]
+            status_label,
+            #[weak(rename_to = app_ref)]
+            app,
+            #[weak]
+            window_ref,
+            move |btn| {
                 let Some(row) = list_box.selected_row() else {
                     return;
                 };
@@ -364,8 +412,8 @@ impl LoginScreen {
                         }
                     }
                 });
-            });
-        }
+            }
+        ));
 
         Self { window }
     }

@@ -16,7 +16,7 @@ use std::rc::Rc;
 
 use desktop_assistant_api_model as api;
 use gtk4::prelude::*;
-use gtk4::{Align, Box as GtkBox, Button, Entry, Label, Orientation, Separator, Window};
+use gtk4::{Align, Box as GtkBox, Button, Entry, Label, Orientation, Separator, Window, glib};
 
 /// Which connector type this dialog is configuring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,15 +313,18 @@ pub fn show_configure_dialog<FSave, FRefresh>(
         btn_row.append(&note);
         content.append(&btn_row);
 
-        let id_entry_ref = id_entry.clone();
         let refresh_cb = Rc::new(on_refresh_models);
-        refresh_btn.connect_clicked(move |_| {
-            let id = id_entry_ref.text().trim().to_string();
-            if id.is_empty() {
-                return;
+        refresh_btn.connect_clicked(glib::clone!(
+            #[weak(rename_to = id_entry_ref)]
+            id_entry,
+            move |_| {
+                let id = id_entry_ref.text().trim().to_string();
+                if id.is_empty() {
+                    return;
+                }
+                refresh_cb(id);
             }
-            refresh_cb(id);
-        });
+        ));
     }
 
     content.append(&Separator::new(Orientation::Horizontal));
@@ -345,56 +348,65 @@ pub fn show_configure_dialog<FSave, FRefresh>(
     content.append(&btn_box);
     dialog.set_child(Some(&content));
 
-    let dialog_ref = dialog.clone();
-    cancel_btn.connect_clicked(move |_| dialog_ref.close());
+    cancel_btn.connect_clicked(glib::clone!(
+        #[weak]
+        dialog,
+        move |_| dialog.close()
+    ));
 
     let save_cb = Rc::new(on_save);
-    let dialog_ref = dialog.clone();
-    let fields_for_save = Rc::clone(&fields);
-    save_btn.connect_clicked(move |_| {
-        let id = id_entry.text().trim().to_string();
-        if id.is_empty() {
-            status.set_text("Connection id is required");
-            return;
+    save_btn.connect_clicked(glib::clone!(
+        #[weak(rename_to = dialog_ref)]
+        dialog,
+        #[strong(rename_to = fields_for_save)]
+        fields,
+        #[weak]
+        id_entry,
+        move |_| {
+            let id = id_entry.text().trim().to_string();
+            if id.is_empty() {
+                status.set_text("Connection id is required");
+                return;
+            }
+            if !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                status.set_text("Id may only contain letters, digits, '-', and '_'");
+                return;
+            }
+
+            let by_name = |n: &str| -> Option<String> {
+                fields_for_save
+                    .borrow()
+                    .iter()
+                    .find(|f| f.name == n)
+                    .and_then(|f| text_opt(&f.entry))
+            };
+
+            let config = match connector {
+                ConnectorType::Anthropic => api::ConnectionConfigView::Anthropic {
+                    base_url: by_name("base_url"),
+                    api_key_env: by_name("api_key_env"),
+                },
+                ConnectorType::OpenAi => api::ConnectionConfigView::OpenAi {
+                    base_url: by_name("base_url"),
+                    api_key_env: by_name("api_key_env"),
+                },
+                ConnectorType::Bedrock => api::ConnectionConfigView::Bedrock {
+                    aws_profile: by_name("aws_profile"),
+                    region: by_name("region"),
+                    base_url: by_name("base_url"),
+                },
+                ConnectorType::Ollama => api::ConnectionConfigView::Ollama {
+                    base_url: by_name("base_url"),
+                },
+            };
+
+            save_cb(id, config);
+            dialog_ref.close();
         }
-        if !id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            status.set_text("Id may only contain letters, digits, '-', and '_'");
-            return;
-        }
-
-        let by_name = |n: &str| -> Option<String> {
-            fields_for_save
-                .borrow()
-                .iter()
-                .find(|f| f.name == n)
-                .and_then(|f| text_opt(&f.entry))
-        };
-
-        let config = match connector {
-            ConnectorType::Anthropic => api::ConnectionConfigView::Anthropic {
-                base_url: by_name("base_url"),
-                api_key_env: by_name("api_key_env"),
-            },
-            ConnectorType::OpenAi => api::ConnectionConfigView::OpenAi {
-                base_url: by_name("base_url"),
-                api_key_env: by_name("api_key_env"),
-            },
-            ConnectorType::Bedrock => api::ConnectionConfigView::Bedrock {
-                aws_profile: by_name("aws_profile"),
-                region: by_name("region"),
-                base_url: by_name("base_url"),
-            },
-            ConnectorType::Ollama => api::ConnectionConfigView::Ollama {
-                base_url: by_name("base_url"),
-            },
-        };
-
-        save_cb(id, config);
-        dialog_ref.close();
-    });
+    ));
 
     dialog.present();
 }
