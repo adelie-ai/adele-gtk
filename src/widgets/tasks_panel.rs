@@ -29,6 +29,11 @@ pub struct TaskRowViewModel {
     /// `task-dot-running`, `task-dot-completed`, `task-dot-failed`,
     /// `task-dot-cancelled`.
     pub status_class: String,
+    /// Human-readable status, e.g. `"Running"` / `"Failed"` — so the dot
+    /// colour isn't the only signal of what the task is doing.
+    pub status_text: String,
+    /// Short label for the task kind: `"Chat"`, `"Subagent"`, or `"Agent"`.
+    pub kind_label: String,
     /// Human-readable elapsed time, e.g. `"3s"`, `"4m 12s"`, `"1h 2m"`.
     pub age_text: String,
     /// Conversation id the task is associated with, if any. Drives the
@@ -46,6 +51,8 @@ pub fn view_model_for(task: &api::TaskView, now_ms: i64) -> TaskRowViewModel {
         id: task.id.0.clone(),
         title: task.title.clone(),
         status_class: status_class_for(task.status),
+        status_text: status_text_for(task.status).to_string(),
+        kind_label: kind_label_for(&task.kind).to_string(),
         age_text: format_age(task.started_at, task.ended_at, now_ms),
         conversation_id: conversation_id_for(&task.kind),
     }
@@ -60,6 +67,24 @@ fn status_class_for(status: api::TaskStatus) -> String {
         api::TaskStatus::Cancelled => "task-dot-cancelled",
     }
     .to_string()
+}
+
+fn status_text_for(status: api::TaskStatus) -> &'static str {
+    match status {
+        api::TaskStatus::Pending => "Pending",
+        api::TaskStatus::Running => "Running",
+        api::TaskStatus::Completed => "Completed",
+        api::TaskStatus::Failed => "Failed",
+        api::TaskStatus::Cancelled => "Cancelled",
+    }
+}
+
+fn kind_label_for(kind: &api::TaskKind) -> &'static str {
+    match kind {
+        api::TaskKind::Conversation { .. } => "Chat",
+        api::TaskKind::Subagent { .. } => "Subagent",
+        api::TaskKind::Standalone { .. } => "Agent",
+    }
 }
 
 fn conversation_id_for(kind: &api::TaskKind) -> Option<String> {
@@ -525,10 +550,18 @@ fn build_row(vm: &TaskRowViewModel, progress_hint: Option<&str>) -> ListBoxRow {
     let vbox = GtkBox::new(Orientation::Vertical, 2);
     vbox.set_hexpand(true);
 
+    // Title line: a dim kind badge ("Chat" / "Subagent" / "Agent") + the
+    // title, so the row says what *kind* of work this is, not just its name.
+    let title_row = GtkBox::new(Orientation::Horizontal, 6);
+    let kind_badge = Label::new(Some(&vm.kind_label));
+    kind_badge.add_css_class("dim-label");
+    title_row.append(&kind_badge);
     let title_label = Label::new(Some(&vm.title));
     title_label.set_halign(Align::Start);
+    title_label.set_hexpand(true);
     title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    vbox.append(&title_label);
+    title_row.append(&title_label);
+    vbox.append(&title_row);
 
     if let Some(hint) = progress_hint {
         let hint_label = Label::new(Some(hint));
@@ -538,6 +571,12 @@ fn build_row(vm: &TaskRowViewModel, progress_hint: Option<&str>) -> ListBoxRow {
         vbox.append(&hint_label);
     }
     hbox.append(&vbox);
+
+    // Readable status ("Running" / "Failed" / …) next to the age, so the
+    // colour dot isn't the only cue for what's happening.
+    let status_label = Label::new(Some(&vm.status_text));
+    status_label.add_css_class("dim-label");
+    hbox.append(&status_label);
 
     let age_label = Label::new(Some(&vm.age_text));
     age_label.add_css_class("dim-label");
@@ -594,6 +633,41 @@ mod tests {
         assert_eq!(vm.status_class, "task-dot-running");
         assert_eq!(vm.age_text, "12s");
         assert_eq!(vm.conversation_id.as_deref(), Some("conv-9"));
+        // The row now also carries a readable status + kind label so it
+        // conveys what's happening, not just the title (#57).
+        assert_eq!(vm.status_text, "Running");
+        assert_eq!(vm.kind_label, "Agent");
+    }
+
+    #[test]
+    fn status_text_and_kind_label_cover_all_variants() {
+        assert_eq!(status_text_for(api::TaskStatus::Pending), "Pending");
+        assert_eq!(status_text_for(api::TaskStatus::Running), "Running");
+        assert_eq!(status_text_for(api::TaskStatus::Completed), "Completed");
+        assert_eq!(status_text_for(api::TaskStatus::Failed), "Failed");
+        assert_eq!(status_text_for(api::TaskStatus::Cancelled), "Cancelled");
+
+        assert_eq!(
+            kind_label_for(&api::TaskKind::Conversation {
+                conversation_id: "c".into(),
+            }),
+            "Chat"
+        );
+        assert_eq!(
+            kind_label_for(&api::TaskKind::Subagent {
+                parent_task_id: api::TaskId("p".into()),
+                conversation_id: "c".into(),
+                name: "child".into(),
+            }),
+            "Subagent"
+        );
+        assert_eq!(
+            kind_label_for(&api::TaskKind::Standalone {
+                name: "agent".into(),
+                conversation_id: "c".into(),
+            }),
+            "Agent"
+        );
     }
 
     #[test]
