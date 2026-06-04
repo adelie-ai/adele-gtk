@@ -541,9 +541,22 @@ impl AdelieWindow {
 
         // Toggle for the conversation side pane (issue #60). Wired to the
         // revealer once it's constructed below.
-        let side_pane_toggle = Button::from_icon_name("sidebar-show-right-symbolic");
+        //
+        // Themed-icon fallback chain so the toggle renders across icon themes:
+        // Breeze (KDE) lacks the GNOME `sidebar-show-*-symbolic` names (it shows
+        // a broken glyph), so prefer Breeze's `tools-symbolic` (a wrench), then
+        // fall back to `applications-utilities-symbolic` /
+        // `applications-engineering-symbolic`, which exist in both Breeze and
+        // Adwaita.
+        let toggle_icon = gtk4::gio::ThemedIcon::from_names(&[
+            "tools-symbolic",
+            "applications-utilities-symbolic",
+            "applications-engineering-symbolic",
+        ]);
+        let side_pane_toggle = Button::new();
+        side_pane_toggle.set_child(Some(&gtk4::Image::from_gicon(&toggle_icon)));
         side_pane_toggle.add_css_class("flat");
-        side_pane_toggle.set_tooltip_text(Some("Toggle conversation panel"));
+        side_pane_toggle.set_tooltip_text(Some("Tasks & scratchpad for this conversation"));
         header_bar.append(&side_pane_toggle);
 
         // Hamburger menu button
