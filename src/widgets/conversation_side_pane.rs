@@ -24,7 +24,7 @@ use desktop_assistant_api_model as api;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box as GtkBox, Button, CheckButton, Entry, Label, ListBox, ListBoxRow, Orientation,
-    Popover, ScrolledWindow, SelectionMode, Separator,
+    PolicyType, Popover, ScrolledWindow, SelectionMode, Separator,
 };
 
 use crate::widgets::tasks_panel::TaskRowViewModel;
@@ -135,6 +135,9 @@ impl ConversationSidePane {
     pub fn new() -> Self {
         let container = GtkBox::new(Orientation::Vertical, 0);
         container.set_size_request(300, -1);
+        // The pane is a fixed-width column: it must not grow to fit its content
+        // (long notes/goals wrap instead — see the labels below).
+        container.set_hexpand(false);
         container.add_css_class("side-pane");
 
         let heading = Label::new(Some("This conversation"));
@@ -152,6 +155,9 @@ impl ConversationSidePane {
         let tasks_scrolled = ScrolledWindow::new();
         tasks_scrolled.set_vexpand(true);
         tasks_scrolled.set_min_content_height(100);
+        // Never scroll horizontally: wide rows wrap/ellipsize to the column
+        // width instead of stretching it or growing a horizontal scrollbar.
+        tasks_scrolled.set_policy(PolicyType::Never, PolicyType::Automatic);
         let tasks_list = ListBox::new();
         tasks_list.set_selection_mode(SelectionMode::None);
         tasks_list.add_css_class("side-pane-tasks");
@@ -174,7 +180,13 @@ impl ConversationSidePane {
         let goal_label = Label::new(None);
         goal_label.add_css_class("side-pane-goal");
         goal_label.set_halign(Align::Start);
+        goal_label.set_xalign(0.0);
         goal_label.set_wrap(true);
+        goal_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        // The goal sits directly in the column (not in a scrolled window), so
+        // cap its natural width or a long goal drags the whole column wide. It
+        // wraps within the column; the full text is also on the tooltip.
+        goal_label.set_max_width_chars(32);
         goal_label.set_margin_start(12);
         goal_label.set_margin_end(12);
         goal_label.set_margin_bottom(4);
@@ -184,6 +196,7 @@ impl ConversationSidePane {
         let notes_scrolled = ScrolledWindow::new();
         notes_scrolled.set_vexpand(true);
         notes_scrolled.set_min_content_height(140);
+        notes_scrolled.set_policy(PolicyType::Never, PolicyType::Automatic);
         let notes_list = ListBox::new();
         notes_list.set_selection_mode(SelectionMode::None);
         notes_list.add_css_class("side-pane-notes");
@@ -237,10 +250,12 @@ impl ConversationSidePane {
         match goal_note(&notes) {
             Some(goal) => {
                 self.goal_label.set_text(&format!("Goal: {}", goal.content));
+                self.goal_label.set_tooltip_text(Some(&goal.content));
                 self.goal_label.set_visible(true);
             }
             None => {
                 self.goal_label.set_text("");
+                self.goal_label.set_tooltip_text(None);
                 self.goal_label.set_visible(false);
             }
         }
@@ -285,6 +300,7 @@ impl ConversationSidePane {
         text.set_halign(Align::Start);
         text.set_hexpand(true);
         text.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        text.set_tooltip_text(Some(&vm.title));
         hbox.append(&text);
 
         // Cancel is only meaningful for in-flight tasks.
@@ -335,16 +351,23 @@ impl ConversationSidePane {
             hbox.append(&check);
         }
 
+        // Keys are short handles; ellipsize a stray long one so it can't widen
+        // the row.
         let key_label = Label::new(Some(&note.key));
         key_label.add_css_class("side-pane-note-key");
         key_label.set_halign(Align::Start);
+        key_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        key_label.set_max_width_chars(16);
         hbox.append(&key_label);
 
         let content = Label::new(Some(&note.content));
         content.set_halign(Align::Start);
         content.set_hexpand(true);
         content.set_wrap(true);
+        content.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         content.set_xalign(0.0);
+        // Full text on hover (the label itself wraps to the column width).
+        content.set_tooltip_text(Some(&note.content));
         if note.done {
             content.add_css_class("side-pane-note-done");
         }
