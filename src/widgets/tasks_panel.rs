@@ -530,6 +530,26 @@ impl TasksPanel {
     pub fn model(&self) -> std::cell::Ref<'_, TasksModel> {
         self.model.borrow()
     }
+
+    /// Project the current tasks into row view-models, filtered to
+    /// `conversation_id` (or all tasks when `None`). The conversation side pane
+    /// (issue #60) uses this to render only the active conversation's tasks
+    /// without duplicating the authoritative `TasksModel`.
+    pub fn task_view_models_for(
+        &self,
+        conversation_id: Option<&str>,
+        now_ms: i64,
+    ) -> Vec<TaskRowViewModel> {
+        self.model
+            .borrow()
+            .iter()
+            .map(|task| view_model_for(task, now_ms))
+            .filter(|vm| match conversation_id {
+                Some(cid) => vm.conversation_id.as_deref() == Some(cid),
+                None => true,
+            })
+            .collect()
+    }
 }
 
 fn build_row(vm: &TaskRowViewModel, progress_hint: Option<&str>) -> ListBoxRow {
