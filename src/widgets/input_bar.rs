@@ -1,12 +1,38 @@
 use gtk4::prelude::*;
-use gtk4::{Box as GtkBox, Button, Orientation, ScrolledWindow, TextView, WrapMode};
+use gtk4::{Box as GtkBox, Button, Image, Orientation, ScrolledWindow, TextView, WrapMode};
 
-/// Input bar widget with a text view and send button.
+use crate::voice_client::VoiceState;
+
+/// Input bar widget with a record/mic button, a text view, and a send button.
 pub struct InputBar {
     pub container: GtkBox,
     pub text_view: TextView,
     pub send_button: Button,
+    /// Push-to-talk button: starts a dictation turn on the voice daemon
+    /// (`PushToTalk`). Hidden until the voice service is found on the bus
+    /// (graceful degradation — see [`InputBar::set_voice_available`]).
+    pub mic_button: Button,
+    /// The mic icon, swapped between resting and active glyphs as the pipeline
+    /// state changes.
+    mic_image: Image,
 }
+
+/// Themed-icon fallback chain for the resting (idle) mic glyph. Breeze (KDE),
+/// Adwaita and most icon themes ship at least one of these; listing several
+/// avoids a broken glyph on a theme that lacks the first.
+const MIC_IDLE_ICONS: &[&str] = &[
+    "audio-input-microphone-symbolic",
+    "microphone-sensitivity-high-symbolic",
+    "audio-input-microphone",
+];
+
+/// Icon shown while the pipeline is actively listening/processing/speaking —
+/// a "recording" dot so the active turn reads at a glance.
+const MIC_ACTIVE_ICONS: &[&str] = &[
+    "media-record-symbolic",
+    "audio-input-microphone-high-symbolic",
+    "media-record",
+];
 
 impl InputBar {
     pub fn new() -> Self {
@@ -15,6 +41,18 @@ impl InputBar {
         container.set_margin_end(8);
         container.set_margin_top(4);
         container.set_margin_bottom(8);
+
+        // Push-to-talk button, left of the text entry. Starts hidden; the
+        // window reveals it once the voice daemon is found on the bus.
+        let mic_image = Image::from_gicon(&gtk4::gio::ThemedIcon::from_names(MIC_IDLE_ICONS));
+        let mic_button = Button::new();
+        mic_button.set_child(Some(&mic_image));
+        mic_button.add_css_class("mic-button");
+        mic_button.set_valign(gtk4::Align::End);
+        mic_button.set_margin_bottom(4);
+        mic_button.set_tooltip_text(Some("Hold a conversation — click to start talking"));
+        mic_button.set_visible(false);
+        container.append(&mic_button);
 
         let scrolled = ScrolledWindow::new();
         scrolled.set_hexpand(true);
@@ -41,7 +79,37 @@ impl InputBar {
             container,
             text_view,
             send_button,
+            mic_button,
+            mic_image,
         }
+    }
+
+    /// Show or hide the mic button based on whether the voice daemon is
+    /// reachable. Hidden when absent so the user isn't offered a dead control
+    /// (graceful degradation per issue #59).
+    pub fn set_voice_available(&self, available: bool) {
+        self.mic_button.set_visible(available);
+    }
+
+    /// Reflect the voice pipeline state on the mic button: a CSS class drives
+    /// the accent while active, the icon swaps to a record glyph, and the
+    /// tooltip explains the current phase.
+    pub fn reflect_voice_state(&self, state: VoiceState) {
+        let active = !matches!(state, VoiceState::Idle);
+        if active {
+            self.mic_button.add_css_class("mic-active");
+            self.mic_image
+                .set_from_gicon(&gtk4::gio::ThemedIcon::from_names(MIC_ACTIVE_ICONS));
+        } else {
+            self.mic_button.remove_css_class("mic-active");
+            self.mic_image
+                .set_from_gicon(&gtk4::gio::ThemedIcon::from_names(MIC_IDLE_ICONS));
+        }
+        let tooltip = match state {
+            VoiceState::Idle => "Hold a conversation — click to start talking".to_string(),
+            other => format!("Voice: {}", other.label()),
+        };
+        self.mic_button.set_tooltip_text(Some(&tooltip));
     }
 
     /// Get the current text content and clear the input.

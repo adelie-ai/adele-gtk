@@ -17,6 +17,7 @@ mod oauth;
 mod profile;
 mod selected_models;
 mod theme;
+mod voice_client;
 #[cfg(feature = "linux")]
 mod webview;
 mod widgets;

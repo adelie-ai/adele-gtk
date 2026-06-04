@@ -78,6 +78,13 @@ window {
     background-color: #e6eaf3;
 }
 
+/* Push-to-talk button (issue #59): flat at rest, accent-tinted while the
+   voice pipeline is active. Mirrors the dark rule with the light accent. */
+.mic-button.mic-active {
+    background-color: #178a6e;
+    color: #ffffff;
+}
+
 .status-bar {
     color: #5b6473;
 }

@@ -55,6 +55,20 @@ window {
     padding-right: 16px;
 }
 
+/* Push-to-talk button in the chat input bar (issue #59). Flat at rest;
+   tinted with the accent while the voice pipeline is active
+   (listening/processing/speaking) so an in-progress turn reads at a glance. */
+.mic-button {
+    border-radius: 6px;
+    min-height: 36px;
+    min-width: 36px;
+}
+
+.mic-button.mic-active {
+    background-color: #84dac1;
+    color: #1b1e2e;
+}
+
 .status-bar {
     color: #8f99ae;
     font-size: 12px;

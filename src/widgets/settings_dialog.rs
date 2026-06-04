@@ -27,10 +27,12 @@ use tokio::sync::mpsc;
 
 use crate::async_bridge::{AsyncBridge, UiMessage};
 use crate::management_client;
+use crate::voice_client::VoiceController;
 
 use super::connection_config_dialog::{ConnectorType, show_configure_dialog};
 use super::connections_tab::ConnectionsTab;
 use super::purposes_tab::PurposesTab;
+use super::voice_tab::VoiceTab;
 
 /// Minimal yes/no confirmation dialog. We avoid GTK4's `AlertDialog`
 /// (gated behind the `v4_10` feature) to keep the feature floor low.
@@ -100,10 +102,16 @@ fn confirm<F>(
 /// Present the Settings dialog modally against `parent`, using `transport`
 /// for all RPC traffic. `bridge` provides the tokio runtime + the shared
 /// ui-message channel so errors propagate back to the window status bar.
+///
+/// `voice` is the handle to the standalone voice daemon (a *separate* D-Bus
+/// service from `transport`'s orchestrator); it backs the Voice tab's wake-word
+/// toggle and voice picker. The tab degrades gracefully when the daemon is
+/// absent.
 pub fn show_settings_dialog(
     parent: &impl IsA<Window>,
     transport: Arc<TransportClient>,
     bridge: Rc<AsyncBridge>,
+    voice: VoiceController,
 ) {
     let dialog = Window::builder()
         .title("Settings")
@@ -121,12 +129,14 @@ pub fn show_settings_dialog(
 
     let connections_tab = Rc::new(ConnectionsTab::new());
     let purposes_tab = Rc::new(PurposesTab::new());
+    let voice_tab = Rc::new(VoiceTab::new());
 
     notebook.append_page(
         &connections_tab.container,
         Some(&Label::new(Some("Connections"))),
     );
     notebook.append_page(&purposes_tab.container, Some(&Label::new(Some("Purposes"))));
+    notebook.append_page(&voice_tab.container, Some(&Label::new(Some("Voice"))));
 
     vbox.append(&notebook);
 
@@ -494,10 +504,106 @@ pub fn show_settings_dialog(
         }
     ));
 
+    // ---------------------------------------------------------------
+    // Voice tab wiring (separate D-Bus service — see `voice_client`).
+    // ---------------------------------------------------------------
+    wire_voice_tab(&voice_tab, &voice, &bridge);
+
     // First refresh.
     refresh();
 
     dialog.present();
+}
+
+/// Snapshot of the voice daemon's state used to hydrate the Voice tab in one
+/// hop back to the GTK main thread. `available == false` means the daemon has
+/// no owner on the bus; the tab then shows its "unavailable" message.
+struct VoiceSnapshot {
+    available: bool,
+    enabled: bool,
+    voices: Vec<crate::voice_client::VoiceInfo>,
+    current_voice: Option<String>,
+}
+
+/// Wire the Voice tab's toggle/dropdown to the [`VoiceController`] and hydrate
+/// it from the daemon's current state.
+///
+/// Writes (`SetEnabled` / `SetVoice`) are dispatched on the Tokio runtime;
+/// failures go to the window status bar via the bridge's ui-sender. Hydration
+/// fetches availability + enabled + voices in one task and applies the result
+/// on the GTK main thread. Graceful: when the daemon is absent the tab is
+/// disabled with an explanatory message instead of erroring.
+fn wire_voice_tab(voice_tab: &Rc<VoiceTab>, voice: &VoiceController, bridge: &Rc<AsyncBridge>) {
+    // Toggle "Hey Adele" → SetEnabled.
+    voice_tab.connect_set_enabled(glib::clone!(
+        #[strong]
+        voice,
+        #[strong]
+        bridge,
+        move |enabled| {
+            let voice = voice.clone();
+            let ui_tx = bridge.ui_sender();
+            crate::async_bridge::spawn_on_runtime(async move {
+                if let Err(e) = voice.set_enabled(enabled).await {
+                    let _ = ui_tx.send(UiMessage::Error(format!("Set wake word: {e}")));
+                }
+            });
+        }
+    ));
+
+    // Pick a voice → SetVoice (default speaker -1).
+    voice_tab.connect_set_voice(glib::clone!(
+        #[strong]
+        voice,
+        #[strong]
+        bridge,
+        move |voice_id| {
+            let voice = voice.clone();
+            let ui_tx = bridge.ui_sender();
+            crate::async_bridge::spawn_on_runtime(async move {
+                if let Err(e) = voice.set_voice(voice_id, -1).await {
+                    let _ = ui_tx.send(UiMessage::Error(format!("Set voice: {e}")));
+                }
+            });
+        }
+    ));
+
+    // Hydrate from the daemon. One task fetches the snapshot; the result is
+    // applied on the GTK main thread via a short-lived channel.
+    let (tx, mut rx) = mpsc::unbounded_channel::<VoiceSnapshot>();
+    let voice_for_fetch = voice.clone();
+    bridge.spawn(async move {
+        let available = voice_for_fetch.is_available().await;
+        let snapshot = if available {
+            VoiceSnapshot {
+                available: true,
+                enabled: voice_for_fetch.get_enabled().await.unwrap_or(false),
+                voices: voice_for_fetch.list_voices().await.unwrap_or_default(),
+                current_voice: voice_for_fetch.get_voice().await.map(|v| v.id),
+            }
+        } else {
+            VoiceSnapshot {
+                available: false,
+                enabled: false,
+                voices: Vec::new(),
+                current_voice: None,
+            }
+        };
+        let _ = tx.send(snapshot);
+    });
+
+    let voice_tab = Rc::clone(voice_tab);
+    glib::spawn_future_local(async move {
+        if let Some(snapshot) = rx.recv().await {
+            if !snapshot.available {
+                voice_tab.set_unavailable();
+                return;
+            }
+            voice_tab.set_available();
+            voice_tab.set_enabled_state(snapshot.enabled);
+            voice_tab.set_voices(&snapshot.voices, snapshot.current_voice.as_deref());
+        }
+    });
 }
 
 /// Issue a `DeleteConnection` call. On refusal (purposes still reference
