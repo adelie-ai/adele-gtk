@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use crate::async_bridge::{AsyncBridge, UiMessage, connection_manager};
 use crate::management_client;
 use crate::widgets::chat_view::ChatView;
+use crate::widgets::conversation_side_pane::{ConversationSidePane, SidePaneAction};
 use crate::widgets::input_bar::InputBar;
 use crate::widgets::model_picker::ModelPicker;
 use crate::widgets::sidebar::Sidebar;
@@ -101,6 +102,17 @@ enum Effect {
     },
     /// A task completed (terminal).
     TaskCompleted { id: String },
+
+    // --- Conversation side pane (issue #60) -------------------------------
+    /// Fetch the scratchpad for the given conversation (async RPC + ui_tx),
+    /// mirroring `EnsureActiveConversation`. The reply arrives as
+    /// `UiMessage::ConversationScratchpadLoaded`.
+    FetchScratchpad(String),
+    /// Replace the side pane's scratchpad notes (empty clears it).
+    SidePaneSetScratchpad(Vec<api::ScratchpadNoteView>),
+    /// Recompute the side pane's task list from the authoritative `TasksModel`,
+    /// filtered to the active conversation.
+    RefreshSidePaneTasks,
 }
 
 // Manual `Debug` (can't derive: `TransportClient` is not `Debug`, mirroring
@@ -146,6 +158,11 @@ impl std::fmt::Debug for Effect {
             Effect::TaskCompleted { id } => {
                 f.debug_struct("TaskCompleted").field("id", id).finish()
             }
+            Effect::FetchScratchpad(c) => f.debug_tuple("FetchScratchpad").field(c).finish(),
+            Effect::SidePaneSetScratchpad(n) => {
+                f.debug_tuple("SidePaneSetScratchpad").field(n).finish()
+            }
+            Effect::RefreshSidePaneTasks => f.write_str("RefreshSidePaneTasks"),
         }
     }
 }
@@ -179,10 +196,16 @@ impl WindowState {
                 let filtered = filter_messages(&detail, self.debug_enabled);
                 let selection = detail.model_selection.clone();
                 self.current_conversation = Some(detail);
-                self.current_conversation_id = Some(id);
+                self.current_conversation_id = Some(id.clone());
                 vec![
                     Effect::SetModelSelection(selection),
                     Effect::LoadConversationIntoChat(filtered),
+                    // Rebind the side pane to the new conversation: clear stale
+                    // notes until the fetch returns, refresh the filtered task
+                    // list, and fetch this conversation's scratchpad.
+                    Effect::SidePaneSetScratchpad(Vec::new()),
+                    Effect::RefreshSidePaneTasks,
+                    Effect::FetchScratchpad(id),
                 ]
             }
             UiMessage::ConversationCreated { id } => {
@@ -200,6 +223,8 @@ impl WindowState {
                 let mut effects = vec![Effect::SetConversations(convs)];
                 if is_active {
                     effects.push(Effect::ClearChat);
+                    effects.push(Effect::SidePaneSetScratchpad(Vec::new()));
+                    effects.push(Effect::RefreshSidePaneTasks);
                     effects.push(Effect::EnsureActiveConversation);
                 }
                 effects
@@ -269,10 +294,18 @@ impl WindowState {
                             content: full_response.clone(),
                         });
                     }
-                    vec![
+                    let mut effects = vec![
                         Effect::ClearChatStatus,
                         Effect::CompleteStreaming(full_response),
-                    ]
+                    ];
+                    // The turn may have changed the scratchpad (Adele's todos);
+                    // refresh the pane. (The live `ScratchpadChanged` event also
+                    // covers this, but a turn-boundary refetch is a cheap
+                    // backstop if the event was missed.)
+                    if let Some(id) = self.current_conversation_id.clone() {
+                        effects.push(Effect::FetchScratchpad(id));
+                    }
+                    effects
                 } else {
                     vec![]
                 }
@@ -365,15 +398,45 @@ impl WindowState {
             UiMessage::Connected { label } => {
                 vec![Effect::SetStatusText(label), Effect::SetSendSensitive(true)]
             }
-            UiMessage::TasksLoaded(tasks) => vec![Effect::TasksReplaceAll(tasks)],
-            UiMessage::TaskStarted(task) => vec![Effect::TaskStarted(task)],
+            UiMessage::TasksLoaded(tasks) => {
+                vec![Effect::TasksReplaceAll(tasks), Effect::RefreshSidePaneTasks]
+            }
+            UiMessage::TaskStarted(task) => {
+                vec![Effect::TaskStarted(task), Effect::RefreshSidePaneTasks]
+            }
             UiMessage::TaskProgress { id, progress_hint } => {
-                vec![Effect::TaskProgress { id, progress_hint }]
+                vec![
+                    Effect::TaskProgress { id, progress_hint },
+                    Effect::RefreshSidePaneTasks,
+                ]
             }
             UiMessage::TaskLogAppended { id, entry } => {
+                // Log lines don't change the row set, so the side pane (which
+                // shows no logs) needs no refresh here.
                 vec![Effect::TaskLogAppended { id, entry }]
             }
-            UiMessage::TaskCompleted { id } => vec![Effect::TaskCompleted { id }],
+            UiMessage::TaskCompleted { id } => {
+                vec![Effect::TaskCompleted { id }, Effect::RefreshSidePaneTasks]
+            }
+            UiMessage::ConversationScratchpadLoaded {
+                conversation_id,
+                notes,
+            } => {
+                // Apply only if it's still the active conversation (a fetch may
+                // race a conversation switch).
+                if self.current_conversation_id.as_deref() == Some(conversation_id.as_str()) {
+                    vec![Effect::SidePaneSetScratchpad(notes)]
+                } else {
+                    vec![]
+                }
+            }
+            UiMessage::ScratchpadChanged { conversation_id } => {
+                if self.current_conversation_id.as_deref() == Some(conversation_id.as_str()) {
+                    vec![Effect::FetchScratchpad(conversation_id)]
+                } else {
+                    vec![]
+                }
+            }
             UiMessage::Disconnected { reason } => {
                 let mut effects = vec![
                     Effect::ClearClient,
@@ -476,6 +539,13 @@ impl AdelieWindow {
         spacer.set_hexpand(true);
         header_bar.append(&spacer);
 
+        // Toggle for the conversation side pane (issue #60). Wired to the
+        // revealer once it's constructed below.
+        let side_pane_toggle = Button::from_icon_name("sidebar-show-right-symbolic");
+        side_pane_toggle.add_css_class("flat");
+        side_pane_toggle.set_tooltip_text(Some("Toggle conversation panel"));
+        header_bar.append(&side_pane_toggle);
+
         // Hamburger menu button
         let menu_button = MenuButton::new();
         menu_button.set_icon_name("open-menu-symbolic");
@@ -514,8 +584,18 @@ impl AdelieWindow {
         let header_sep = Separator::new(Orientation::Horizontal);
         right_box.append(&header_sep);
 
+        // The chat column and the conversation side pane sit side by side below
+        // the (full-width) header, so the pane stays visible while chatting.
+        let body = GtkBox::new(Orientation::Horizontal, 0);
+        body.set_hexpand(true);
+        body.set_vexpand(true);
+
+        let chat_column = GtkBox::new(Orientation::Vertical, 0);
+        chat_column.set_hexpand(true);
+        chat_column.set_vexpand(true);
+
         let chat_view = ChatView::new();
-        right_box.append(&chat_view.container);
+        chat_column.append(&chat_view.container);
 
         // Passive toast for advisory warnings (e.g. a dangling model
         // selection cleared by the daemon). The revealer is always in the
@@ -544,14 +624,14 @@ impl AdelieWindow {
         ));
         toast_row.append(&toast_dismiss);
         toast_revealer.set_child(Some(&toast_row));
-        right_box.append(&toast_revealer);
+        chat_column.append(&toast_revealer);
 
         let input_sep = Separator::new(Orientation::Horizontal);
-        right_box.append(&input_sep);
+        chat_column.append(&input_sep);
 
         let input_bar = InputBar::new();
         input_bar.send_button.set_sensitive(false); // disabled until connected
-        right_box.append(&input_bar.container);
+        chat_column.append(&input_bar.container);
 
         let status_bar = GtkBox::new(Orientation::Horizontal, 0);
         status_bar.set_margin_top(4);
@@ -570,7 +650,29 @@ impl AdelieWindow {
         debug_check.add_css_class("debug-check");
         status_bar.append(&debug_check);
 
-        right_box.append(&status_bar);
+        chat_column.append(&status_bar);
+
+        // Conversation side pane (issue #60): tasks + scratchpad for the active
+        // conversation, revealed from the right via the header toggle. The
+        // divider lives inside the revealer so it only shows when revealed.
+        let side_pane = ConversationSidePane::new();
+        let side_revealer = Revealer::new();
+        side_revealer.set_transition_type(RevealerTransitionType::SlideLeft);
+        side_revealer.set_reveal_child(false);
+        let side_box = GtkBox::new(Orientation::Horizontal, 0);
+        side_box.append(&Separator::new(Orientation::Vertical));
+        side_box.append(&side_pane.container);
+        side_revealer.set_child(Some(&side_box));
+
+        body.append(&chat_column);
+        body.append(&side_revealer);
+        right_box.append(&body);
+
+        side_pane_toggle.connect_clicked(glib::clone!(
+            #[weak]
+            side_revealer,
+            move |_| side_revealer.set_reveal_child(!side_revealer.reveals_child())
+        ));
 
         paned.set_end_child(Some(&right_box));
         paned.set_resize_end_child(true);
@@ -594,6 +696,7 @@ impl AdelieWindow {
         let status_label = Rc::new(status_label);
         let model_picker = Rc::new(model_picker);
         let tasks_panel = Rc::new(tasks_panel);
+        let side_pane = Rc::new(side_pane);
         let stack = Rc::new(stack);
         let toast_revealer = Rc::new(toast_revealer);
         let toast_label = Rc::new(toast_label);
@@ -620,6 +723,8 @@ impl AdelieWindow {
             #[strong]
             tasks_panel,
             #[strong]
+            side_pane,
+            #[strong]
             toast_revealer,
             #[strong]
             toast_label,
@@ -634,6 +739,7 @@ impl AdelieWindow {
                     &input_bar,
                     &model_picker,
                     &tasks_panel,
+                    &side_pane,
                     &toast_revealer,
                     &toast_label,
                     ui_tx,
@@ -641,6 +747,63 @@ impl AdelieWindow {
             }
         ));
         let bridge = Rc::new(bridge);
+
+        // Wire the side pane's interactions to daemon commands. Edits/toggles/
+        // deletes issue scratchpad commands; the daemon's `ScratchpadChanged`
+        // event then refreshes the pane (issue #60).
+        side_pane.set_on_action(glib::clone!(
+            #[strong]
+            state,
+            #[strong]
+            client,
+            move |action: SidePaneAction| {
+                let Some(conv) = state.borrow().current_conversation_id.clone() else {
+                    return;
+                };
+                let Some(transport) = client.borrow().clone() else {
+                    return;
+                };
+                crate::async_bridge::spawn_on_runtime(async move {
+                    let Some(cmds) = transport.as_commands() else {
+                        return;
+                    };
+                    let result = match action {
+                        SidePaneAction::SetNote {
+                            key,
+                            content,
+                            note_type,
+                            sequence,
+                            done,
+                        } => cmds
+                            .set_scratchpad_note(&conv, &key, &content, &note_type, sequence, done)
+                            .await
+                            .map(|_| ()),
+                        SidePaneAction::DeleteNote { key } => {
+                            cmds.delete_scratchpad_notes(&conv, vec![key], false).await
+                        }
+                    };
+                    if let Err(e) = result {
+                        tracing::warn!("scratchpad action failed: {e}");
+                    }
+                });
+            }
+        ));
+        side_pane.set_on_cancel_task(glib::clone!(
+            #[strong]
+            client,
+            move |id: String| {
+                let Some(transport) = client.borrow().clone() else {
+                    return;
+                };
+                crate::async_bridge::spawn_on_runtime(async move {
+                    if let Some(cmds) = transport.as_commands() {
+                        let _ = cmds
+                            .send_command(api::Command::CancelBackgroundTask { id })
+                            .await;
+                    }
+                });
+            }
+        ));
 
         // Spawn persistent connection manager (connect → forward → reconnect).
         // It now delivers the freshly connected transport to the main thread
@@ -1277,6 +1440,7 @@ fn handle_ui_message(
     input_bar: &Rc<InputBar>,
     model_picker: &Rc<ModelPicker>,
     tasks_panel: &Rc<TasksPanel>,
+    side_pane: &Rc<ConversationSidePane>,
     toast_revealer: &Rc<Revealer>,
     toast_label: &Rc<Label>,
     ui_tx: &mpsc::UnboundedSender<UiMessage>,
@@ -1353,6 +1517,38 @@ fn handle_ui_message(
             }
             Effect::TaskCompleted { id } => {
                 tasks_panel.handle_task_completed(id, now_epoch_ms());
+            }
+            Effect::FetchScratchpad(conversation_id) => {
+                if let Some(transport) = client.borrow().clone() {
+                    let tx = ui_tx.clone();
+                    crate::async_bridge::spawn_on_runtime(async move {
+                        let Some(cmds) = transport.as_commands() else {
+                            return;
+                        };
+                        match cmds
+                            .get_conversation_scratchpad(&conversation_id, None)
+                            .await
+                        {
+                            Ok(notes) => {
+                                let _ = tx.send(UiMessage::ConversationScratchpadLoaded {
+                                    conversation_id,
+                                    notes,
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!("get_conversation_scratchpad failed: {e}");
+                            }
+                        }
+                    });
+                }
+            }
+            Effect::SidePaneSetScratchpad(notes) => {
+                side_pane.set_scratchpad(notes);
+            }
+            Effect::RefreshSidePaneTasks => {
+                let conv = state.borrow().current_conversation_id.clone();
+                let rows = tasks_panel.task_view_models_for(conv.as_deref(), now_epoch_ms());
+                side_pane.set_tasks(&rows);
             }
         }
     }
@@ -1646,7 +1842,14 @@ mod tests {
         assert_eq!(conv.messages.last().unwrap().role, "assistant");
         assert_eq!(conv.messages.last().unwrap().content, "the answer");
         assert!(
-            matches!(effects.as_slice(), [Effect::ClearChatStatus, Effect::CompleteStreaming(c)] if c == "the answer"),
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::ClearChatStatus,
+                    Effect::CompleteStreaming(c),
+                    Effect::FetchScratchpad(conv),
+                ] if c == "the answer" && conv == "c1"
+            ),
             "unexpected effects: {effects:?}"
         );
     }
@@ -1776,11 +1979,77 @@ mod tests {
                 [
                     Effect::SetConversations(_),
                     Effect::ClearChat,
+                    Effect::SidePaneSetScratchpad(_),
+                    Effect::RefreshSidePaneTasks,
                     Effect::EnsureActiveConversation
                 ]
             ),
-            "deleting the active conversation must clear chat + re-ensure: {effects:?}"
+            "deleting the active conversation must clear chat + side pane + re-ensure: {effects:?}"
         );
+    }
+
+    fn note_view(key: &str) -> api::ScratchpadNoteView {
+        api::ScratchpadNoteView {
+            id: format!("id-{key}"),
+            key: key.to_string(),
+            content: "x".to_string(),
+            note_type: "note".to_string(),
+            sequence: None,
+            done: false,
+            updated_at: "t".to_string(),
+        }
+    }
+
+    #[test]
+    fn scratchpad_loaded_applies_only_for_active_conversation() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        // Matching conversation → set the pane.
+        let effects = state.apply(UiMessage::ConversationScratchpadLoaded {
+            conversation_id: "c1".to_string(),
+            notes: vec![note_view("goal")],
+        });
+        assert!(
+            matches!(effects.as_slice(), [Effect::SidePaneSetScratchpad(n)] if n.len() == 1),
+            "unexpected: {effects:?}"
+        );
+        // A fetch that resolves after a conversation switch is ignored.
+        let effects = state.apply(UiMessage::ConversationScratchpadLoaded {
+            conversation_id: "stale".to_string(),
+            notes: vec![note_view("goal")],
+        });
+        assert!(effects.is_empty(), "stale scratchpad must be dropped");
+    }
+
+    #[test]
+    fn scratchpad_changed_refetches_only_for_active_conversation() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::ScratchpadChanged {
+            conversation_id: "c1".to_string(),
+        });
+        assert!(matches!(effects.as_slice(), [Effect::FetchScratchpad(c)] if c == "c1"));
+        let effects = state.apply(UiMessage::ScratchpadChanged {
+            conversation_id: "other".to_string(),
+        });
+        assert!(
+            effects.is_empty(),
+            "a change to another conversation is ignored"
+        );
+    }
+
+    #[test]
+    fn tasks_loaded_also_refreshes_the_side_pane() {
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::TasksLoaded(vec![]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::TasksReplaceAll(_), Effect::RefreshSidePaneTasks]
+        ));
     }
 
     #[test]
@@ -1861,6 +2130,9 @@ mod tests {
             [
                 Effect::SetModelSelection(_),
                 Effect::LoadConversationIntoChat(filtered),
+                Effect::SidePaneSetScratchpad(_),
+                Effect::RefreshSidePaneTasks,
+                Effect::FetchScratchpad(_),
             ] => {
                 let roles: Vec<&str> = filtered.messages.iter().map(|m| m.role.as_str()).collect();
                 assert_eq!(roles, vec!["user", "assistant"]);
@@ -1889,6 +2161,9 @@ mod tests {
             [
                 Effect::SetModelSelection(_),
                 Effect::LoadConversationIntoChat(filtered),
+                Effect::SidePaneSetScratchpad(_),
+                Effect::RefreshSidePaneTasks,
+                Effect::FetchScratchpad(_),
             ] => {
                 // Debug on: nothing is filtered out.
                 assert_eq!(filtered.messages.len(), 3);
@@ -1908,9 +2183,13 @@ mod tests {
             [
                 Effect::SetModelSelection(Some(sel)),
                 Effect::LoadConversationIntoChat(_),
+                Effect::SidePaneSetScratchpad(_),
+                Effect::RefreshSidePaneTasks,
+                Effect::FetchScratchpad(conv),
             ] => {
                 assert_eq!(sel.connection_id, "work");
                 assert_eq!(sel.model_id, "claude");
+                assert_eq!(conv, "c9");
             }
             other => panic!("unexpected effects: {other:?}"),
         }

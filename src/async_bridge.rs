@@ -128,6 +128,22 @@ pub enum UiMessage {
     TaskCompleted {
         id: String,
     },
+
+    // --- Conversation scratchpad (issue #60) ------------------------------
+    /// The scratchpad notes for a conversation, fetched via
+    /// `GetConversationScratchpad` after a load / turn-complete / change event.
+    /// The window applies it to the side pane only when it matches the active
+    /// conversation.
+    ConversationScratchpadLoaded {
+        conversation_id: String,
+        notes: Vec<api::ScratchpadNoteView>,
+    },
+    /// A conversation's scratchpad changed (the LLM's tools or a client command
+    /// mutated it). Carried from `SignalEvent::ScratchpadChanged`; the window
+    /// re-fetches when it matches the active conversation.
+    ScratchpadChanged {
+        conversation_id: String,
+    },
 }
 
 // Manual `Debug` (can't derive: `TransportClient` is not `Debug`). Only
@@ -233,6 +249,18 @@ impl std::fmt::Debug for UiMessage {
             UiMessage::TaskCompleted { id } => {
                 f.debug_struct("TaskCompleted").field("id", id).finish()
             }
+            UiMessage::ConversationScratchpadLoaded {
+                conversation_id,
+                notes,
+            } => f
+                .debug_struct("ConversationScratchpadLoaded")
+                .field("conversation_id", conversation_id)
+                .field("notes", notes)
+                .finish(),
+            UiMessage::ScratchpadChanged { conversation_id } => f
+                .debug_struct("ScratchpadChanged")
+                .field("conversation_id", conversation_id)
+                .finish(),
         }
     }
 }
@@ -520,6 +548,9 @@ fn signal_to_ui_message(signal: SignalEvent) -> UiMessage {
         }
         SignalEvent::TaskLogAppended { id, entry } => UiMessage::TaskLogAppended { id, entry },
         SignalEvent::TaskCompleted { id, .. } => UiMessage::TaskCompleted { id },
+        SignalEvent::ScratchpadChanged { conversation_id } => {
+            UiMessage::ScratchpadChanged { conversation_id }
+        }
         SignalEvent::Disconnected { reason } => UiMessage::Disconnected { reason },
     }
 }

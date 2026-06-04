@@ -258,3 +258,36 @@ entry:focus {
     background-color: #f0f2f7;
     color: #2a2e3a;
 }
+
+/* Conversation side pane (issue #60) */
+.side-pane-heading {
+    font-weight: bold;
+    font-size: 13px;
+}
+
+.side-pane-section {
+    font-weight: bold;
+    color: #5b6472;
+    font-size: 12px;
+}
+
+.side-pane-group {
+    font-weight: bold;
+    color: #7c8494;
+    font-size: 11px;
+}
+
+.side-pane-goal {
+    color: #2b303b;
+    font-style: italic;
+}
+
+.side-pane-note-key {
+    color: #7c8494;
+    font-size: 12px;
+}
+
+.side-pane-note-done {
+    color: #9aa3b2;
+    text-decoration: line-through;
+}
