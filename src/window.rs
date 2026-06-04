@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::async_bridge::{AsyncBridge, UiMessage, connection_manager};
 use crate::management_client;
+use crate::voice_client::{VoiceController, VoiceState};
 use crate::widgets::chat_view::ChatView;
 use crate::widgets::conversation_side_pane::{ConversationSidePane, SidePaneAction};
 use crate::widgets::input_bar::InputBar;
@@ -761,6 +762,15 @@ impl AdelieWindow {
         ));
         let bridge = Rc::new(bridge);
 
+        // Voice controls (issue #59). The voice daemon is a *separate* D-Bus
+        // service (`org.desktopAssistant.Voice`); it has no relationship to the
+        // orchestrator transport above. We connect once, share the handle so
+        // both the mic button and the Settings → Voice tab can drive it, and
+        // gate the UI on the daemon actually owning its bus name (graceful
+        // degradation when it isn't running / models aren't provisioned).
+        let voice: Rc<RefCell<Option<VoiceController>>> = Rc::new(RefCell::new(None));
+        wire_voice_controls(&voice, &input_bar, &bridge);
+
         // Wire the side pane's interactions to daemon commands. Edits/toggles/
         // deletes issue scratchpad commands; the daemon's `ScratchpadChanged`
         // event then refreshes the pane (issue #60).
@@ -1236,6 +1246,8 @@ impl AdelieWindow {
             bridge,
             #[strong]
             status_label,
+            #[strong]
+            voice,
             move |_| {
                 menu_popover.popdown();
                 let Some(transport) = client.borrow().clone() else {
@@ -1248,10 +1260,20 @@ impl AdelieWindow {
                     );
                     return;
                 }
+                // The Voice tab talks to its own daemon, so hand the dialog a
+                // controller regardless of which orchestrator transport we're
+                // on. When voice hasn't connected yet (or has no session bus),
+                // fall back to an inert controller — the tab then shows its
+                // "unavailable" state.
+                let voice_handle = match voice.borrow().clone() {
+                    Some(v) => v,
+                    None => VoiceController::unavailable(),
+                };
                 crate::widgets::settings_dialog::show_settings_dialog(
                     &window,
                     Arc::clone(&transport),
                     Rc::clone(&bridge),
+                    voice_handle,
                 );
                 // The user may have added/removed connections; re-query the
                 // aggregated model list so the header picker reflects the new
@@ -1430,6 +1452,88 @@ impl AdelieWindow {
     pub fn present(&self) {
         self.window.present();
     }
+}
+
+/// Connect to the voice daemon and wire the input bar's mic button + state
+/// reflection (issue #59).
+///
+/// Connecting is async (session bus + proxy build), so it runs on the Tokio
+/// runtime; the resulting [`VoiceController`] is delivered back to the GTK main
+/// thread, stored in `voice` (shared with the Settings → Voice tab), and used
+/// to:
+/// - show the mic button only when the daemon owns its bus name
+///   (graceful degradation when it's absent), and
+/// - keep the button's state in sync with the daemon's `StateChanged` signal.
+///
+/// The mic button fires `PushToTalk`, which starts a dictation turn even when
+/// the always-on wake word is off.
+fn wire_voice_controls(
+    voice: &Rc<RefCell<Option<VoiceController>>>,
+    input_bar: &Rc<InputBar>,
+    bridge: &Rc<AsyncBridge>,
+) {
+    // Mic button → PushToTalk. The controller may not be connected yet; a
+    // click before then is a harmless no-op (the button is hidden until the
+    // daemon is confirmed present anyway).
+    input_bar.mic_button.connect_clicked(glib::clone!(
+        #[strong]
+        voice,
+        #[strong]
+        bridge,
+        move |_| {
+            let Some(controller) = voice.borrow().clone() else {
+                return;
+            };
+            let ui_tx = bridge.ui_sender();
+            crate::async_bridge::spawn_on_runtime(async move {
+                if let Err(e) = controller.push_to_talk().await {
+                    let _ = ui_tx.send(UiMessage::Error(format!("Voice: {e}")));
+                }
+            });
+        }
+    ));
+
+    // Connect + probe + subscribe. The controller and the initial availability
+    // are delivered to the main thread; the state listener then streams
+    // `VoiceState` updates over its own channel.
+    let (ready_tx, mut ready_rx) = mpsc::unbounded_channel::<(VoiceController, bool)>();
+    let (state_tx, mut state_rx) = mpsc::unbounded_channel::<VoiceState>();
+    crate::async_bridge::spawn_on_runtime(async move {
+        let controller = VoiceController::connect().await;
+        let available = controller.is_available().await;
+        // Subscribe to state changes regardless of the initial probe: the
+        // daemon may be activated on demand after we connect.
+        controller.spawn_state_listener(state_tx);
+        let _ = ready_tx.send((controller, available));
+    });
+
+    // Apply the connected controller + initial availability on the main thread.
+    glib::spawn_future_local(glib::clone!(
+        #[strong]
+        voice,
+        #[strong]
+        input_bar,
+        async move {
+            if let Some((controller, available)) = ready_rx.recv().await {
+                *voice.borrow_mut() = Some(controller);
+                input_bar.set_voice_available(available);
+            }
+        }
+    ));
+
+    // Reflect every pipeline-state change on the mic button. A non-Idle state
+    // also implies the daemon is present, so reveal the button if a state
+    // arrives before (or instead of) the initial availability probe.
+    glib::spawn_future_local(glib::clone!(
+        #[strong]
+        input_bar,
+        async move {
+            while let Some(state) = state_rx.recv().await {
+                input_bar.set_voice_available(true);
+                input_bar.reflect_voice_state(state);
+            }
+        }
+    ));
 }
 
 /// Current wall-clock time in epoch milliseconds. Centralized so the

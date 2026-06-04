@@ -12,3 +12,4 @@ pub mod settings_dialog;
 pub mod setup_dialog;
 pub mod sidebar;
 pub mod tasks_panel;
+pub mod voice_tab;
