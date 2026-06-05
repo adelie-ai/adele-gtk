@@ -166,6 +166,13 @@ impl InputBar {
         text
     }
 
+    /// Replace the input's text. Used by the embedded voice path (issue #65) to
+    /// drop a dictated transcript into the box before sending it like a typed
+    /// message.
+    pub fn set_text(&self, text: &str) {
+        self.text_view.buffer().set_text(text);
+    }
+
     /// Get the current text content without clearing.
     // Read-only counterpart to `take_text` (which is used). Part of the public
     // InputBar API; not yet called from `window.rs` but kept for the input-bar

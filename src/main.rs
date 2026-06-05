@@ -18,6 +18,8 @@ mod profile;
 mod selected_models;
 mod theme;
 mod voice_client;
+mod voice_config;
+mod voice_embedded;
 #[cfg(feature = "linux")]
 mod webview;
 mod widgets;

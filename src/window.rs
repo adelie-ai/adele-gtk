@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -715,6 +715,33 @@ impl AdelieWindow {
         let toast_revealer = Rc::new(toast_revealer);
         let toast_label = Rc::new(toast_label);
 
+        // Voice config (issue #65): pick between the standalone voice daemon
+        // (default; `org.desktopAssistant.Voice` over D-Bus) and an in-process
+        // embedded engine. Loaded once from `~/.config/adele-gtk/voice.toml`; an
+        // absent/partial file resolves to the daemon mode, so existing users see
+        // no change. When embedded, `embedded_voice` is the in-process engine
+        // (lazily initialized on first mic use — no models load, no mic opens,
+        // at startup); `None` on the daemon path.
+        let voice_config = crate::voice_config::VoiceConfig::load();
+        let embedded_voice: Rc<Option<crate::voice_embedded::EmbeddedVoice>> =
+            Rc::new(if voice_config.is_embedded() {
+                Some(crate::voice_embedded::EmbeddedVoice::new(
+                    crate::voice_embedded::EmbeddedConfig {
+                        audio: voice_config.audio.clone(),
+                        vad: voice_config.vad.clone(),
+                        stt: voice_config.stt.clone(),
+                        tts: voice_config.tts.clone(),
+                    },
+                ))
+            } else {
+                None
+            });
+        // Set when a turn was started by the embedded mic button, so only
+        // voice-initiated replies are spoken (a typed message stays silent).
+        // Lives outside `WindowState` to keep `apply()` pure; the reply-playback
+        // hook reads + clears it in the effect executor.
+        let voice_reply_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
         // Client wrapped in Arc for async tasks, Rc<RefCell<>> for GTK thread
         let client: Rc<RefCell<Option<Arc<TransportClient>>>> = Rc::new(RefCell::new(None));
 
@@ -742,6 +769,10 @@ impl AdelieWindow {
             toast_revealer,
             #[strong]
             toast_label,
+            #[strong]
+            embedded_voice,
+            #[strong]
+            voice_reply_pending,
             move |msg, ui_tx| {
                 handle_ui_message(
                     msg,
@@ -756,6 +787,8 @@ impl AdelieWindow {
                     &side_pane,
                     &toast_revealer,
                     &toast_label,
+                    &embedded_voice,
+                    &voice_reply_pending,
                     ui_tx,
                 );
             }
@@ -769,7 +802,15 @@ impl AdelieWindow {
         // gate the UI on the daemon actually owning its bus name (graceful
         // degradation when it isn't running / models aren't provisioned).
         let voice: Rc<RefCell<Option<VoiceController>>> = Rc::new(RefCell::new(None));
-        wire_voice_controls(&voice, &input_bar, &bridge, &state);
+        // The daemon controls are wired only on the daemon path. In embedded
+        // mode the mic button is driven in-process (wired in the send block
+        // below, where it can reuse the send action) and shown immediately,
+        // since there is no daemon to probe for.
+        if embedded_voice.is_some() {
+            input_bar.set_voice_available(true);
+        } else {
+            wire_voice_controls(&voice, &input_bar, &bridge, &state);
+        }
 
         // Wire the side pane's interactions to daemon commands. Edits/toggles/
         // deletes issue scratchpad commands; the daemon's `ScratchpadChanged`
@@ -1214,6 +1255,22 @@ impl AdelieWindow {
                 }
             ));
             input_bar.text_view.add_controller(key_controller);
+
+            // Embedded voice (issue #65): when the in-process engine is active,
+            // the mic button dictates locally and sends via the same
+            // `send_action` as a typed message. Wired here (inside the send
+            // block) so it can reuse `send_action`; the daemon path wires the
+            // mic separately in `wire_voice_controls`.
+            if let Some(engine) = (*embedded_voice).clone() {
+                wire_embedded_mic(
+                    engine,
+                    &input_bar,
+                    &send_action,
+                    &state,
+                    &bridge,
+                    &voice_reply_pending,
+                );
+            }
         }
 
         // Hamburger menu: Switch Connection → open the picker in a new
@@ -1561,6 +1618,144 @@ fn wire_voice_controls(
     ));
 }
 
+/// Wire the mic button to the **embedded** in-process voice engine (issue #65).
+///
+/// This is the no-daemon path: a click runs [`EmbeddedVoice::dictate`] locally
+/// (mic → Silero VAD endpoint → Whisper), drops the transcript into the input
+/// box, and fires the same `send_action` a typed message uses — so the spoken
+/// prompt lands in the active conversation through the app's normal assistant
+/// path. The reply is spoken by the `CompleteStreaming` hook (gated on
+/// `voice_reply_pending`, set here before the send).
+///
+/// A click **while a reply is playing barges in** (stops playback) instead of
+/// starting a new turn, mirroring the daemon mic button. The button reflects
+/// `Listening` for the duration of the capture, then returns to `Idle`.
+///
+/// All voice work runs on the Tokio runtime; only the transcript crosses back
+/// to the GTK thread (via a oneshot) to touch widgets and call `send_action`.
+fn wire_embedded_mic(
+    engine: crate::voice_embedded::EmbeddedVoice,
+    input_bar: &Rc<InputBar>,
+    send_action: &Rc<impl Fn() + 'static>,
+    state: &Rc<RefCell<WindowState>>,
+    bridge: &Rc<AsyncBridge>,
+    voice_reply_pending: &Rc<Cell<bool>>,
+) {
+    // Guards against a second click starting an overlapping dictation while one
+    // is already in flight (the mic stream + Whisper are single-shot per turn).
+    let dictating = Rc::new(Cell::new(false));
+
+    input_bar.mic_button.connect_clicked(glib::clone!(
+        #[strong]
+        engine,
+        #[strong]
+        input_bar,
+        #[strong]
+        send_action,
+        #[strong]
+        state,
+        #[strong]
+        bridge,
+        #[strong]
+        voice_reply_pending,
+        #[strong]
+        dictating,
+        move |_| {
+            if dictating.get() {
+                return; // a capture is already running
+            }
+
+            // Require an open conversation before dictating, so the spoken
+            // prompt has somewhere to go (matches the typed-send guard).
+            if state.borrow().current_conversation_id.is_none() {
+                return;
+            }
+
+            let ui_tx = bridge.ui_sender();
+
+            // Barge-in: if a reply is currently playing, the click stops it
+            // rather than starting a new turn. `is_playing` is async (the engine
+            // lives on the runtime), so probe there; if not playing, dictate.
+            let (decision_tx, decision_rx) = mpsc::unbounded_channel::<bool>();
+            crate::async_bridge::spawn_on_runtime(glib::clone!(
+                #[strong]
+                engine,
+                async move {
+                    if engine.is_playing().await {
+                        if let Err(e) = engine.stop_speaking().await {
+                            let _ = ui_tx.send(UiMessage::Error(format!("Voice: {e}")));
+                        }
+                        let _ = decision_tx.send(false); // barged in; don't dictate
+                    } else {
+                        let _ = decision_tx.send(true); // proceed to dictate
+                    }
+                }
+            ));
+
+            // Back on the GTK thread: if we should dictate, run the capture and
+            // feed the transcript into the send path.
+            glib::spawn_future_local(glib::clone!(
+                #[strong]
+                engine,
+                #[strong]
+                input_bar,
+                #[strong]
+                send_action,
+                #[strong]
+                voice_reply_pending,
+                #[strong]
+                dictating,
+                #[strong]
+                bridge,
+                async move {
+                    let mut decision_rx = decision_rx;
+                    let Some(true) = decision_rx.recv().await else {
+                        return; // barged in (or channel dropped) — no capture
+                    };
+
+                    dictating.set(true);
+                    input_bar.reflect_voice_state(VoiceState::Listening);
+
+                    // Run the (blocking-ish) capture on the runtime; the
+                    // transcript comes back over a oneshot.
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let ui_tx = bridge.ui_sender();
+                    crate::async_bridge::spawn_on_runtime(glib::clone!(
+                        #[strong]
+                        engine,
+                        async move {
+                            let result = engine.dictate().await;
+                            let _ = tx.send(result);
+                        }
+                    ));
+
+                    let result = rx.await;
+                    dictating.set(false);
+                    input_bar.reflect_voice_state(VoiceState::Idle);
+
+                    match result {
+                        Ok(Ok(Some(text))) => {
+                            // Mark the turn as voice-initiated so its reply is
+                            // spoken, then drop the transcript into the input
+                            // box and send it like a typed message.
+                            voice_reply_pending.set(true);
+                            input_bar.set_text(&text);
+                            send_action();
+                        }
+                        // No speech / near-silent capture — nothing to send.
+                        Ok(Ok(None)) => {}
+                        Ok(Err(e)) => {
+                            let _ = ui_tx.send(UiMessage::Error(format!("Voice: {e}")));
+                        }
+                        // The capture task was dropped before replying.
+                        Err(_) => {}
+                    }
+                }
+            ));
+        }
+    ));
+}
+
 /// Current wall-clock time in epoch milliseconds. Centralized so the
 /// task-panel callers all use the same units as `TaskView.started_at`.
 fn now_epoch_ms() -> i64 {
@@ -1585,8 +1780,19 @@ fn handle_ui_message(
     side_pane: &Rc<ConversationSidePane>,
     toast_revealer: &Rc<Revealer>,
     toast_label: &Rc<Label>,
+    embedded_voice: &Rc<Option<crate::voice_embedded::EmbeddedVoice>>,
+    voice_reply_pending: &Rc<Cell<bool>>,
     ui_tx: &mpsc::UnboundedSender<UiMessage>,
 ) {
+    // Embedded voice (issue #65): a voice turn that ends in an error never
+    // reaches `CompleteStreaming`, so clear the "speak the reply" flag here on a
+    // stream error. Otherwise the flag would leak onto the next (possibly typed)
+    // turn and speak a reply the user didn't dictate. The successful path clears
+    // it in the `CompleteStreaming` effect below.
+    if matches!(msg, UiMessage::StreamError { .. }) {
+        voice_reply_pending.set(false);
+    }
+
     // Pure decision: mutate state + compute the effects to perform.
     let effects = state.borrow_mut().apply(msg);
 
@@ -1628,6 +1834,25 @@ fn handle_ui_message(
             }
             Effect::CompleteStreaming(full) => {
                 chat_view.borrow_mut().complete_streaming(&full);
+                // Embedded voice (issue #65): speak the reply only when this
+                // turn was started by the embedded mic button (so typed
+                // messages stay silent). The flag is consumed here; on the
+                // daemon path `embedded_voice` is `None` and the daemon speaks
+                // its own replies, so this is a no-op.
+                let engine = if voice_reply_pending.replace(false) {
+                    (**embedded_voice).clone()
+                } else {
+                    None
+                };
+                if let Some(engine) = engine {
+                    let ui_tx = ui_tx.clone();
+                    let reply = full.clone();
+                    crate::async_bridge::spawn_on_runtime(async move {
+                        if let Err(e) = engine.say(&reply).await {
+                            let _ = ui_tx.send(UiMessage::Error(format!("Voice: {e}")));
+                        }
+                    });
+                }
             }
             Effect::SetModelSelection(selection) => {
                 model_picker.set_selection(selection.as_ref());
