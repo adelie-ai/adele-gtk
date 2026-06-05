@@ -23,6 +23,7 @@ open = "5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "1"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -49,3 +50,22 @@ path = "../desktop-assistant/crates/client-common"
 
 [dependencies.desktop-assistant-api-model]
 path = "../desktop-assistant/crates/api-model"
+
+# The embeddable voice module (adelie-ai/voice phase 1). Path-dep, mirroring the
+# desktop-assistant deps above: a `../voice` symlink under `.worktrees/adele-gtk/`
+# points at the voice checkout, and Cargo resolves the module's transitive
+# adapter crates (core/tts/…) via the voice workspace automatically. Powers the
+# in-app embedded dictation/playback path (issue #65) as an alternative to the
+# voice daemon's D-Bus surface.
+[dependencies.adele-voice-module]
+path = "../voice/crates/module"
+
+# The concrete VAD + STT adapters, only so the embedded engine can name the
+# `Dictation<SileroVad, WhisperStt>` returned by `build_dictation` for its
+# stored field. Same `../voice` symlink path-dep as the module above; no extra
+# crates enter the graph (they're already transitive deps of the module).
+[dependencies.adele-voice-vad-silero]
+path = "../voice/crates/vad-silero"
+
+[dependencies.adele-voice-stt-whisper]
+path = "../voice/crates/stt-whisper"
