@@ -1,3 +1,6 @@
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gtk4::prelude::*;
 use gtk4::{Box as GtkBox, Button, Image, Orientation, ScrolledWindow, TextView, WrapMode};
 
@@ -8,31 +11,64 @@ pub struct InputBar {
     pub container: GtkBox,
     pub text_view: TextView,
     pub send_button: Button,
-    /// Push-to-talk button: starts a dictation turn on the voice daemon
-    /// (`PushToTalk`). Hidden until the voice service is found on the bus
-    /// (graceful degradation — see [`InputBar::set_voice_available`]).
+    /// Push-to-talk button: starts a dictation turn on the voice daemon,
+    /// routed into the active conversation (`PushToTalkInConversation`) or the
+    /// daemon's own session (`PushToTalk`) when none is open. Hidden until the
+    /// voice service is found on the bus (graceful degradation — see
+    /// [`InputBar::set_voice_available`]).
     pub mic_button: Button,
-    /// The mic icon, swapped between resting and active glyphs as the pipeline
-    /// state changes.
+    /// The mic icon, swapped per pipeline state to mirror the plasmoid's glyphs.
     mic_image: Image,
+    /// The last pipeline state reflected on the button. The window's click
+    /// handler reads it to decide barge-in (click while `Speaking` →
+    /// `StopSpeaking`, otherwise start a push-to-talk turn).
+    state: Rc<Cell<VoiceState>>,
 }
 
-/// Themed-icon fallback chain for the resting (idle) mic glyph. Breeze (KDE),
-/// Adwaita and most icon themes ship at least one of these; listing several
-/// avoids a broken glyph on a theme that lacks the first.
+/// Themed-icon fallback chain for the **resting (Idle)** mic glyph. The first
+/// entry mirrors the plasmoid (`audio-input-microphone-muted`); the rest are
+/// fallbacks so a theme missing the muted glyph still renders a mic.
 const MIC_IDLE_ICONS: &[&str] = &[
+    "audio-input-microphone-muted-symbolic",
+    "audio-input-microphone-muted",
+    "microphone-sensitivity-muted-symbolic",
     "audio-input-microphone-symbolic",
-    "microphone-sensitivity-high-symbolic",
-    "audio-input-microphone",
 ];
 
-/// Icon shown while the pipeline is actively listening/processing/speaking —
-/// a "recording" dot so the active turn reads at a glance.
-const MIC_ACTIVE_ICONS: &[&str] = &[
-    "media-record-symbolic",
-    "audio-input-microphone-high-symbolic",
-    "media-record",
+/// Icon shown while **Listening** — an open mic (plasmoid: `audio-input-microphone`).
+const MIC_LISTENING_ICONS: &[&str] = &[
+    "audio-input-microphone-symbolic",
+    "audio-input-microphone",
+    "microphone-sensitivity-high-symbolic",
 ];
+
+/// Icon shown while **Processing** ("Thinking…") — a refresh/spinner glyph
+/// (plasmoid: `view-refresh-symbolic`).
+const MIC_PROCESSING_ICONS: &[&str] = &["view-refresh-symbolic", "content-loading-symbolic"];
+
+/// Icon shown while **Speaking** — a speaker (plasmoid: `audio-volume-high`).
+const MIC_SPEAKING_ICONS: &[&str] = &["audio-volume-high-symbolic", "audio-volume-high"];
+
+/// The themed-icon fallback chain for a given pipeline state.
+fn mic_icons_for(state: VoiceState) -> &'static [&'static str] {
+    match state {
+        VoiceState::Idle => MIC_IDLE_ICONS,
+        VoiceState::Listening => MIC_LISTENING_ICONS,
+        VoiceState::Processing => MIC_PROCESSING_ICONS,
+        VoiceState::Speaking => MIC_SPEAKING_ICONS,
+    }
+}
+
+/// The mic button's tooltip for a given state, mirroring the plasmoid: "Stop
+/// speaking" while Speaking (the click barges in), otherwise "Push to talk"
+/// with the in-progress phase appended.
+fn mic_tooltip_for(state: VoiceState) -> String {
+    match state {
+        VoiceState::Speaking => "Stop speaking".to_string(),
+        VoiceState::Idle => "Push to talk".to_string(),
+        other => format!("Push to talk — {}", other.label()),
+    }
+}
 
 impl InputBar {
     pub fn new() -> Self {
@@ -50,7 +86,7 @@ impl InputBar {
         mic_button.add_css_class("mic-button");
         mic_button.set_valign(gtk4::Align::End);
         mic_button.set_margin_bottom(4);
-        mic_button.set_tooltip_text(Some("Hold a conversation — click to start talking"));
+        mic_button.set_tooltip_text(Some(&mic_tooltip_for(VoiceState::Idle)));
         mic_button.set_visible(false);
         container.append(&mic_button);
 
@@ -81,6 +117,7 @@ impl InputBar {
             send_button,
             mic_button,
             mic_image,
+            state: Rc::new(Cell::new(VoiceState::Idle)),
         }
     }
 
@@ -91,25 +128,32 @@ impl InputBar {
         self.mic_button.set_visible(available);
     }
 
-    /// Reflect the voice pipeline state on the mic button: a CSS class drives
-    /// the accent while active, the icon swaps to a record glyph, and the
-    /// tooltip explains the current phase.
+    /// Reflect the voice pipeline state on the mic button: the icon swaps to
+    /// the per-state glyph (mirroring the plasmoid), a CSS class drives the
+    /// accent while a turn is active, and the tooltip explains the current
+    /// phase. The state is also cached for the click handler's barge-in check
+    /// (see [`InputBar::current_state`]).
     pub fn reflect_voice_state(&self, state: VoiceState) {
-        let active = !matches!(state, VoiceState::Idle);
-        if active {
-            self.mic_button.add_css_class("mic-active");
-            self.mic_image
-                .set_from_gicon(&gtk4::gio::ThemedIcon::from_names(MIC_ACTIVE_ICONS));
-        } else {
+        self.state.set(state);
+
+        // Highlight while a turn is in flight (anything but resting Idle).
+        if matches!(state, VoiceState::Idle) {
             self.mic_button.remove_css_class("mic-active");
-            self.mic_image
-                .set_from_gicon(&gtk4::gio::ThemedIcon::from_names(MIC_IDLE_ICONS));
+        } else {
+            self.mic_button.add_css_class("mic-active");
         }
-        let tooltip = match state {
-            VoiceState::Idle => "Hold a conversation — click to start talking".to_string(),
-            other => format!("Voice: {}", other.label()),
-        };
-        self.mic_button.set_tooltip_text(Some(&tooltip));
+
+        self.mic_image
+            .set_from_gicon(&gtk4::gio::ThemedIcon::from_names(mic_icons_for(state)));
+        self.mic_button
+            .set_tooltip_text(Some(&mic_tooltip_for(state)));
+    }
+
+    /// The last pipeline state reflected on the button. The window's click
+    /// handler uses this to choose barge-in (`Speaking` → `StopSpeaking`) vs.
+    /// starting a push-to-talk turn.
+    pub fn current_state(&self) -> VoiceState {
+        self.state.get()
     }
 
     /// Get the current text content and clear the input.
@@ -132,5 +176,54 @@ impl InputBar {
         buffer
             .text(&buffer.start_iter(), &buffer.end_iter(), false)
             .to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tooltip_offers_barge_in_only_while_speaking() {
+        // Mirrors the plasmoid: clicking while Speaking stops playback, so the
+        // tooltip reads "Stop speaking"; every other state invites talking.
+        assert_eq!(mic_tooltip_for(VoiceState::Speaking), "Stop speaking");
+        assert_eq!(mic_tooltip_for(VoiceState::Idle), "Push to talk");
+        assert_eq!(
+            mic_tooltip_for(VoiceState::Listening),
+            "Push to talk — Listening…"
+        );
+        assert_eq!(
+            mic_tooltip_for(VoiceState::Processing),
+            "Push to talk — Processing…"
+        );
+    }
+
+    #[test]
+    fn each_state_maps_to_a_distinct_primary_icon() {
+        // The first entry in each chain is the plasmoid glyph; they must differ
+        // per state so the button visibly tracks the pipeline.
+        assert_eq!(mic_icons_for(VoiceState::Idle)[0], MIC_IDLE_ICONS[0]);
+        assert_eq!(
+            mic_icons_for(VoiceState::Listening)[0],
+            MIC_LISTENING_ICONS[0]
+        );
+        assert_eq!(
+            mic_icons_for(VoiceState::Processing)[0],
+            MIC_PROCESSING_ICONS[0]
+        );
+        assert_eq!(
+            mic_icons_for(VoiceState::Speaking)[0],
+            MIC_SPEAKING_ICONS[0]
+        );
+        // No chain is empty (an empty `from_names` would render nothing).
+        for state in [
+            VoiceState::Idle,
+            VoiceState::Listening,
+            VoiceState::Processing,
+            VoiceState::Speaking,
+        ] {
+            assert!(!mic_icons_for(state).is_empty());
+        }
     }
 }
