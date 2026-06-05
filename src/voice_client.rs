@@ -93,6 +93,35 @@ pub struct CurrentVoice {
     pub speaker: i32,
 }
 
+/// Where a mic-button push-to-talk turn should be routed.
+///
+/// This is the pure decision behind the mic button: when the user has a
+/// conversation open, the spoken prompt and reply must land in *that*
+/// conversation (`PushToTalkInConversation(<id>)`); with nothing open we fall
+/// back to the daemon's own session (`PushToTalk()`). Kept as a standalone
+/// value so the routing can be unit-tested without a live bus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PttRoute {
+    /// Dictate into this orchestrator conversation id.
+    InConversation(String),
+    /// No conversation open — use the daemon's own session.
+    DaemonSession,
+}
+
+impl PttRoute {
+    /// Decide the route from the active conversation id (the window's
+    /// `current_conversation_id`). A `Some` with a **non-empty** id routes into
+    /// that conversation; `None` *or* an empty/whitespace id falls back to the
+    /// daemon session (an empty id would otherwise mean "daemon session" to the
+    /// daemon anyway, so we normalise to the explicit `PushToTalk()`).
+    pub fn for_conversation(active_conversation: Option<&str>) -> Self {
+        match active_conversation {
+            Some(id) if !id.trim().is_empty() => Self::InConversation(id.to_string()),
+            _ => Self::DaemonSession,
+        }
+    }
+}
+
 /// Typed zbus proxy for the voice daemon.
 ///
 /// zbus derives each D-Bus method name by PascalCasing the Rust fn name, which
@@ -115,7 +144,17 @@ pub trait Voice {
     fn get_enabled(&self) -> zbus::Result<bool>;
 
     /// Start listening immediately (push-to-talk; works even with wake off).
+    /// The spoken turn lands in the daemon's own session.
     fn push_to_talk(&self) -> zbus::Result<()>;
+
+    /// Push-to-talk routed into a specific orchestrator conversation, so the
+    /// spoken prompt and reply appear in the conversation the user is viewing.
+    /// An empty `conversation_id` falls back to the daemon's own session,
+    /// matching [`VoiceProxy::push_to_talk`].
+    fn push_to_talk_in_conversation(&self, conversation_id: &str) -> zbus::Result<()>;
+
+    /// Stop any in-progress TTS playback (barge-in).
+    fn stop_speaking(&self) -> zbus::Result<()>;
 
     /// List installed voices as (id, display name, language, num_speakers).
     fn list_voices(&self) -> zbus::Result<Vec<(String, String, String, u32)>>;
@@ -195,6 +234,43 @@ impl VoiceController {
             return Err("voice service unavailable".to_string());
         };
         proxy.push_to_talk().await.map_err(|e| e.to_string())
+    }
+
+    /// Fire a push-to-talk request routed into a specific conversation, so the
+    /// spoken prompt and reply land in the conversation the user is viewing
+    /// (mirrors voice#24). An empty `conversation_id` is equivalent to
+    /// [`VoiceController::push_to_talk`] (the daemon's own session).
+    pub async fn push_to_talk_in_conversation(&self, conversation_id: &str) -> Result<(), String> {
+        let Some(proxy) = &self.proxy else {
+            return Err("voice service unavailable".to_string());
+        };
+        proxy
+            .push_to_talk_in_conversation(conversation_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Dispatch a push-to-talk turn according to [`PttRoute::for_conversation`]:
+    /// into the active conversation when one is open, else the daemon session.
+    ///
+    /// This is the single entry point the mic button uses; the routing decision
+    /// itself is the pure [`PttRoute`] so it can be unit-tested without a bus.
+    pub async fn push_to_talk_routed(
+        &self,
+        active_conversation: Option<&str>,
+    ) -> Result<(), String> {
+        match PttRoute::for_conversation(active_conversation) {
+            PttRoute::InConversation(id) => self.push_to_talk_in_conversation(&id).await,
+            PttRoute::DaemonSession => self.push_to_talk().await,
+        }
+    }
+
+    /// Stop any in-progress TTS playback (barge-in before re-listening).
+    pub async fn stop_speaking(&self) -> Result<(), String> {
+        let Some(proxy) = &self.proxy else {
+            return Err("voice service unavailable".to_string());
+        };
+        proxy.stop_speaking().await.map_err(|e| e.to_string())
     }
 
     /// Read the wake-word enabled flag. `None` when the service is unavailable.
@@ -340,5 +416,35 @@ mod tests {
         assert!(VoiceState::Listening.label().ends_with('…'));
         assert!(VoiceState::Processing.label().ends_with('…'));
         assert!(VoiceState::Speaking.label().ends_with('…'));
+    }
+
+    #[test]
+    fn ptt_routes_into_the_active_conversation() {
+        // A live conversation id → PushToTalkInConversation(id).
+        assert_eq!(
+            PttRoute::for_conversation(Some("conv-123")),
+            PttRoute::InConversation("conv-123".to_string())
+        );
+    }
+
+    #[test]
+    fn ptt_falls_back_to_daemon_session_with_no_conversation() {
+        // Nothing open → plain PushToTalk (daemon's own session).
+        assert_eq!(PttRoute::for_conversation(None), PttRoute::DaemonSession);
+    }
+
+    #[test]
+    fn ptt_treats_empty_conversation_id_as_no_conversation() {
+        // An empty/whitespace id must not be sent as a "real" conversation; it
+        // normalises to the daemon session (which is also how the daemon reads
+        // an empty id), so the mic button issues the explicit PushToTalk().
+        assert_eq!(
+            PttRoute::for_conversation(Some("")),
+            PttRoute::DaemonSession
+        );
+        assert_eq!(
+            PttRoute::for_conversation(Some("   ")),
+            PttRoute::DaemonSession
+        );
     }
 }

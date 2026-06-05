@@ -769,7 +769,7 @@ impl AdelieWindow {
         // gate the UI on the daemon actually owning its bus name (graceful
         // degradation when it isn't running / models aren't provisioned).
         let voice: Rc<RefCell<Option<VoiceController>>> = Rc::new(RefCell::new(None));
-        wire_voice_controls(&voice, &input_bar, &bridge);
+        wire_voice_controls(&voice, &input_bar, &bridge, &state);
 
         // Wire the side pane's interactions to daemon commands. Edits/toggles/
         // deletes issue scratchpad commands; the daemon's `ScratchpadChanged`
@@ -1455,7 +1455,7 @@ impl AdelieWindow {
 }
 
 /// Connect to the voice daemon and wire the input bar's mic button + state
-/// reflection (issue #59).
+/// reflection (issues #59, #63).
 ///
 /// Connecting is async (session bus + proxy build), so it runs on the Tokio
 /// runtime; the resulting [`VoiceController`] is delivered back to the GTK main
@@ -1465,28 +1465,53 @@ impl AdelieWindow {
 ///   (graceful degradation when it's absent), and
 /// - keep the button's state in sync with the daemon's `StateChanged` signal.
 ///
-/// The mic button fires `PushToTalk`, which starts a dictation turn even when
-/// the always-on wake word is off.
+/// Clicking the mic button dictates **into the active conversation**: it reads
+/// the window's `current_conversation_id` and calls
+/// `PushToTalkInConversation(<id>)` so the spoken prompt and reply land in the
+/// conversation the user is viewing (mirrors voice#24); with no conversation
+/// open it falls back to plain `PushToTalk()` (the daemon's own session). If a
+/// reply is currently playing (`Speaking`), the click barges in with
+/// `StopSpeaking()` instead — matching the plasmoid.
 fn wire_voice_controls(
     voice: &Rc<RefCell<Option<VoiceController>>>,
     input_bar: &Rc<InputBar>,
     bridge: &Rc<AsyncBridge>,
+    state: &Rc<RefCell<WindowState>>,
 ) {
-    // Mic button → PushToTalk. The controller may not be connected yet; a
-    // click before then is a harmless no-op (the button is hidden until the
-    // daemon is confirmed present anyway).
+    // Mic button click. The controller may not be connected yet; a click
+    // before then is a harmless no-op (the button is hidden until the daemon is
+    // confirmed present anyway).
     input_bar.mic_button.connect_clicked(glib::clone!(
         #[strong]
         voice,
         #[strong]
         bridge,
+        #[strong]
+        state,
+        #[strong]
+        input_bar,
         move |_| {
             let Some(controller) = voice.borrow().clone() else {
                 return;
             };
             let ui_tx = bridge.ui_sender();
+
+            // Barge-in: while a reply is playing, the click stops it rather than
+            // starting a new turn (mirrors the plasmoid's mic button).
+            if matches!(input_bar.current_state(), VoiceState::Speaking) {
+                crate::async_bridge::spawn_on_runtime(async move {
+                    if let Err(e) = controller.stop_speaking().await {
+                        let _ = ui_tx.send(UiMessage::Error(format!("Voice: {e}")));
+                    }
+                });
+                return;
+            }
+
+            // Otherwise start a dictation turn routed into the conversation the
+            // user is viewing (or the daemon's own session when none is open).
+            let active = state.borrow().current_conversation_id.clone();
             crate::async_bridge::spawn_on_runtime(async move {
-                if let Err(e) = controller.push_to_talk().await {
+                if let Err(e) = controller.push_to_talk_routed(active.as_deref()).await {
                     let _ = ui_tx.send(UiMessage::Error(format!("Voice: {e}")));
                 }
             });
