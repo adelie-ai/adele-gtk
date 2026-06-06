@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
-use desktop_assistant_client_common::{AssistantClient, TransportClient};
+use desktop_assistant_client_common::{AssistantClient, Connector};
 use gtk4::prelude::*;
 use gtk4::{
     Align, ApplicationWindow, Box as GtkBox, Button, Entry, HeaderBar, Label, ListBox, ListBoxRow,
@@ -61,7 +61,7 @@ impl KnowledgeBrowser {
     /// Build the popup. Caller is responsible for `.present()`-ing it.
     pub fn new(
         parent: &ApplicationWindow,
-        transport: Arc<TransportClient>,
+        transport: Arc<Connector>,
         bridge: Rc<AsyncBridge>,
     ) -> Self {
         let window = Window::builder()
@@ -243,10 +243,11 @@ impl KnowledgeBrowser {
                 let transport = Arc::clone(&transport);
                 let msg_tx = msg_tx.clone();
                 bridge.spawn(async move {
+                    let client = transport.client();
                     let result = if query.trim().is_empty() {
-                        transport.list_knowledge_entries(LIST_LIMIT, 0, None).await
+                        client.list_knowledge_entries(LIST_LIMIT, 0, None).await
                     } else {
-                        transport
+                        client
                             .search_knowledge_entries(&query, None, SEARCH_LIMIT)
                             .await
                     };
@@ -511,14 +512,15 @@ impl KnowledgeBrowser {
                 let msg_tx = msg_tx.clone();
                 let content_owned = content.clone();
                 bridge.spawn(async move {
+                    let client = transport.client();
                     let result = match selected_id {
                         Some(id) => {
-                            transport
+                            client
                                 .update_knowledge_entry(&id, &content_owned, tags, metadata)
                                 .await
                         }
                         None => {
-                            transport
+                            client
                                 .create_knowledge_entry(&content_owned, tags, metadata)
                                 .await
                         }
@@ -601,7 +603,10 @@ impl KnowledgeBrowser {
                         let transport = Arc::clone(&transport);
                         let msg_tx = msg_tx.clone();
                         bridge.spawn(async move {
-                            let result = transport.delete_knowledge_entry(&id_for_async).await;
+                            let result = transport
+                                .client()
+                                .delete_knowledge_entry(&id_for_async)
+                                .await;
                             let _ = match result {
                                 Ok(()) => {
                                     msg_tx.send(BrowserMsg::EntryDeleted { id: id_for_async })

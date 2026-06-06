@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_client_common::{
-    AssistantClient, ChatMessage, ConnectionConfig, ConversationDetail, ConversationSummary,
-    TransportClient,
+    AssistantClient, ChatMessage, ConnectionConfig, Connector, ConversationDetail,
+    ConversationSummary,
 };
 use gtk4::prelude::*;
 use gtk4::{
@@ -49,8 +49,8 @@ struct WindowState {
 /// Effects are emitted in the exact order the legacy `handle_ui_message`
 /// performed them, so the observable behavior is identical.
 enum Effect {
-    /// Stash the freshly connected transport in the window's client cell.
-    SetClient(Arc<TransportClient>),
+    /// Stash the freshly connected connector in the window's client cell.
+    SetClient(Arc<Connector>),
     /// Clear the client cell (on disconnect).
     ClearClient,
     /// Set the bottom status-bar text verbatim.
@@ -116,14 +116,14 @@ enum Effect {
     RefreshSidePaneTasks,
 }
 
-// Manual `Debug` (can't derive: `TransportClient` is not `Debug`, mirroring
+// Manual `Debug` (can't derive: `Connector` is not `Debug`, mirroring
 // `UiMessage`). Only `SetClient` needs special handling — it prints a marker
-// instead of the opaque transport; every other variant forwards its fields so
+// instead of the opaque connector; every other variant forwards its fields so
 // test panic messages stay informative.
 impl std::fmt::Debug for Effect {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Effect::SetClient(_) => f.debug_tuple("SetClient").field(&"<transport>").finish(),
+            Effect::SetClient(_) => f.debug_tuple("SetClient").field(&"<connector>").finish(),
             Effect::ClearClient => f.write_str("ClearClient"),
             Effect::SetStatusText(t) => f.debug_tuple("SetStatusText").field(t).finish(),
             Effect::SetSendSensitive(b) => f.debug_tuple("SetSendSensitive").field(b).finish(),
@@ -178,12 +178,12 @@ impl WindowState {
     /// effects into widget calls.
     fn apply(&mut self, msg: UiMessage) -> Vec<Effect> {
         match msg {
-            UiMessage::ClientReady(transport) => {
+            UiMessage::ClientReady(connector) => {
                 // The connection_manager handed us a freshly connected
-                // transport. Stash it so the rest of the UI can issue RPCs;
+                // connector. Stash it so the rest of the UI can issue RPCs;
                 // this arrives before `ConversationsLoaded`, which relies on
                 // the client cell.
-                vec![Effect::SetClient(transport)]
+                vec![Effect::SetClient(connector)]
             }
             UiMessage::ConversationsLoaded(convs) => {
                 self.conversations = convs.clone();
@@ -742,8 +742,10 @@ impl AdelieWindow {
         // hook reads + clears it in the effect executor.
         let voice_reply_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
-        // Client wrapped in Arc for async tasks, Rc<RefCell<>> for GTK thread
-        let client: Rc<RefCell<Option<Arc<TransportClient>>>> = Rc::new(RefCell::new(None));
+        // Connector wrapped in Arc for async tasks, Rc<RefCell<>> for GTK
+        // thread. The `Connector` owns the transport; call `.client()` for the
+        // `&TransportClient` surface (`as_commands()`, `AssistantClient` RPCs).
+        let client: Rc<RefCell<Option<Arc<Connector>>>> = Rc::new(RefCell::new(None));
 
         // Set up async bridge with UI message handler
         let bridge = AsyncBridge::new(glib::clone!(
@@ -824,11 +826,11 @@ impl AdelieWindow {
                 let Some(conv) = state.borrow().current_conversation_id.clone() else {
                     return;
                 };
-                let Some(transport) = client.borrow().clone() else {
+                let Some(connector) = client.borrow().clone() else {
                     return;
                 };
                 crate::async_bridge::spawn_on_runtime(async move {
-                    let Some(cmds) = transport.as_commands() else {
+                    let Some(cmds) = connector.client().as_commands() else {
                         return;
                     };
                     let result = match action {
@@ -856,11 +858,11 @@ impl AdelieWindow {
             #[strong]
             client,
             move |id: String| {
-                let Some(transport) = client.borrow().clone() else {
+                let Some(connector) = client.borrow().clone() else {
                     return;
                 };
                 crate::async_bridge::spawn_on_runtime(async move {
-                    if let Some(cmds) = transport.as_commands() {
+                    if let Some(cmds) = connector.client().as_commands() {
                         let _ = cmds
                             .send_command(api::Command::CancelBackgroundTask { id })
                             .await;
@@ -870,7 +872,7 @@ impl AdelieWindow {
         ));
 
         // Spawn persistent connection manager (connect → forward → reconnect).
-        // It now delivers the freshly connected transport to the main thread
+        // It now delivers the freshly connected `Connector` to the main thread
         // via `UiMessage::ClientReady` on the same channel as every other UI
         // message (handled in `handle_ui_message`).
         {
@@ -893,10 +895,10 @@ impl AdelieWindow {
                     let conv_id = conv.id.clone();
                     drop(state_borrow);
 
-                    if let Some(client) = client.borrow().clone() {
+                    if let Some(connector) = client.borrow().clone() {
                         let tx = bridge.ui_sender();
                         bridge.spawn(async move {
-                            match client.get_conversation(&conv_id).await {
+                            match connector.client().get_conversation(&conv_id).await {
                                 Ok(detail) => {
                                     let _ = tx.send(UiMessage::ConversationLoaded(detail));
                                 }
@@ -918,9 +920,10 @@ impl AdelieWindow {
             #[strong]
             bridge,
             move |_| {
-                if let Some(client) = client.borrow().clone() {
+                if let Some(connector) = client.borrow().clone() {
                     let tx = bridge.ui_sender();
                     bridge.spawn(async move {
+                        let client = connector.client();
                         match client.create_conversation("New Conversation").await {
                             Ok(id) => {
                                 let _ = tx.send(UiMessage::ConversationCreated { id: id.clone() });
@@ -959,11 +962,11 @@ impl AdelieWindow {
                         None => return,
                     }
                 };
-                if let Some(client) = client.borrow().clone() {
+                if let Some(connector) = client.borrow().clone() {
                     let tx = bridge.ui_sender();
                     let id = id.clone();
                     bridge.spawn(async move {
-                        match client.delete_conversation(&id).await {
+                        match connector.client().delete_conversation(&id).await {
                             Ok(()) => {
                                 let _ = tx.send(UiMessage::ConversationDeleted { id });
                             }
@@ -1046,12 +1049,12 @@ impl AdelieWindow {
                             return;
                         }
                         dialog.close();
-                        if let Some(client) = client.borrow().clone() {
+                        if let Some(connector) = client.borrow().clone() {
                             let tx = bridge.ui_sender();
                             let id = id.clone();
                             let title = new_title.clone();
                             bridge.spawn(async move {
-                                match client.rename_conversation(&id, &title).await {
+                                match connector.client().rename_conversation(&id, &title).await {
                                     Ok(()) => {
                                         let _ =
                                             tx.send(UiMessage::ConversationRenamed { id, title });
@@ -1099,10 +1102,11 @@ impl AdelieWindow {
                         None => return,
                     }
                 };
-                if let Some(client) = client.borrow().clone() {
+                if let Some(connector) = client.borrow().clone() {
                     let tx = bridge.ui_sender();
                     let id = id.clone();
                     bridge.spawn(async move {
+                        let client = connector.client();
                         let result = if archived {
                             client.unarchive_conversation(&id).await
                         } else {
@@ -1132,9 +1136,10 @@ impl AdelieWindow {
             #[strong]
             bridge,
             move |include_archived| {
-                if let Some(client) = client.borrow().clone() {
+                if let Some(connector) = client.borrow().clone() {
                     let tx = bridge.ui_sender();
                     bridge.spawn(async move {
+                        let client = connector.client();
                         let result = if include_archived {
                             client.list_conversations_with_archived().await
                         } else {
@@ -1198,10 +1203,11 @@ impl AdelieWindow {
 
                     let override_selection = model_picker.current_override();
 
-                    if let Some(client) = client.borrow().clone() {
+                    if let Some(connector) = client.borrow().clone() {
                         let tx = bridge_ref.ui_sender();
                         let text = text.clone();
                         bridge_ref.spawn(async move {
+                            let client = connector.client();
                             // Use the command-channel override path when
                             // available so the picker's selection is honoured.
                             // The shared AssistantClient trait can't carry the
@@ -1307,11 +1313,11 @@ impl AdelieWindow {
             voice,
             move |_| {
                 menu_popover.popdown();
-                let Some(transport) = client.borrow().clone() else {
+                let Some(connector) = client.borrow().clone() else {
                     status_label.set_text("Not connected — settings unavailable");
                     return;
                 };
-                if transport.as_commands().is_none() {
+                if connector.client().as_commands().is_none() {
                     status_label.set_text(
                         "Settings require a local-socket or WebSocket connection (not available over D-Bus)",
                     );
@@ -1328,7 +1334,7 @@ impl AdelieWindow {
                 };
                 crate::widgets::settings_dialog::show_settings_dialog(
                     &window,
-                    Arc::clone(&transport),
+                    Arc::clone(&connector),
                     Rc::clone(&bridge),
                     voice_handle,
                 );
@@ -1339,7 +1345,8 @@ impl AdelieWindow {
                 // changes); the dialog itself keeps its own tabs in sync.
                 let tx = bridge.ui_sender();
                 bridge.spawn(async move {
-                    match management_client::list_available_models(&transport, None, false).await {
+                    let transport = connector.client();
+                    match management_client::list_available_models(transport, None, false).await {
                         Ok(listings) => {
                             let _ = tx.send(UiMessage::ModelsLoaded(listings));
                         }
@@ -1352,7 +1359,7 @@ impl AdelieWindow {
                     // still on the default (issue #53). Graceful: on failure we
                     // emit `None` (picker degrades to "Model").
                     let default_model =
-                        match management_client::get_purposes(&transport).await {
+                        match management_client::get_purposes(transport).await {
                             Ok(purposes) => {
                                 crate::async_bridge::interactive_default_from_purposes(&purposes)
                             }
@@ -1382,13 +1389,13 @@ impl AdelieWindow {
             status_label,
             move |_| {
                 menu_popover.popdown();
-                let Some(transport) = client.borrow().clone() else {
+                let Some(connector) = client.borrow().clone() else {
                     status_label.set_text("Not connected — knowledge base unavailable");
                     return;
                 };
                 let browser = crate::widgets::knowledge_browser::KnowledgeBrowser::new(
                     &window,
-                    transport,
+                    connector,
                     Rc::clone(&bridge),
                 );
                 browser.present();
@@ -1423,11 +1430,11 @@ impl AdelieWindow {
                 state.borrow_mut().debug_enabled = btn.is_active();
                 let conv_id = state.borrow().current_conversation_id.clone();
                 if let Some(conv_id) = conv_id
-                    && let Some(client) = client.borrow().clone()
+                    && let Some(connector) = client.borrow().clone()
                 {
                     let tx = bridge.ui_sender();
                     bridge.spawn(async move {
-                        match client.get_conversation(&conv_id).await {
+                        match connector.client().get_conversation(&conv_id).await {
                             Ok(detail) => {
                                 let _ = tx.send(UiMessage::ConversationLoaded(detail));
                             }
@@ -1454,12 +1461,12 @@ impl AdelieWindow {
             #[strong]
             bridge,
             move |task_id| {
-                let Some(transport) = client.borrow().clone() else {
+                let Some(connector) = client.borrow().clone() else {
                     return;
                 };
                 let tx = bridge.ui_sender();
                 bridge.spawn(async move {
-                    let Some(cmds) = transport.as_commands() else {
+                    let Some(cmds) = connector.client().as_commands() else {
                         let _ = tx.send(UiMessage::Error(
                             "Background tasks require a local-socket or WebSocket connection \
                              (not available over D-Bus)"
@@ -1486,12 +1493,12 @@ impl AdelieWindow {
             stack,
             move |conv_id| {
                 stack.set_visible_child_name("conversations");
-                let Some(transport) = client.borrow().clone() else {
+                let Some(connector) = client.borrow().clone() else {
                     return;
                 };
                 let tx = bridge.ui_sender();
                 bridge.spawn(async move {
-                    match transport.get_conversation(&conv_id).await {
+                    match connector.client().get_conversation(&conv_id).await {
                         Ok(detail) => {
                             let _ = tx.send(UiMessage::ConversationLoaded(detail));
                         }
@@ -1773,7 +1780,7 @@ fn handle_ui_message(
     sidebar: &Rc<Sidebar>,
     chat_view: &Rc<RefCell<ChatView>>,
     status_label: &Rc<Label>,
-    client: &Rc<RefCell<Option<Arc<TransportClient>>>>,
+    client: &Rc<RefCell<Option<Arc<Connector>>>>,
     input_bar: &Rc<InputBar>,
     model_picker: &Rc<ModelPicker>,
     tasks_panel: &Rc<TasksPanel>,
@@ -1799,8 +1806,8 @@ fn handle_ui_message(
     // Thin executor: perform each effect against the real widgets, in order.
     for effect in effects {
         match effect {
-            Effect::SetClient(transport) => {
-                *client.borrow_mut() = Some(transport);
+            Effect::SetClient(connector) => {
+                *client.borrow_mut() = Some(connector);
             }
             Effect::ClearClient => {
                 *client.borrow_mut() = None;
@@ -1886,10 +1893,10 @@ fn handle_ui_message(
                 tasks_panel.handle_task_completed(id, now_epoch_ms());
             }
             Effect::FetchScratchpad(conversation_id) => {
-                if let Some(transport) = client.borrow().clone() {
+                if let Some(connector) = client.borrow().clone() {
                     let tx = ui_tx.clone();
                     crate::async_bridge::spawn_on_runtime(async move {
-                        let Some(cmds) = transport.as_commands() else {
+                        let Some(cmds) = connector.client().as_commands() else {
                             return;
                         };
                         match cmds
@@ -1932,7 +1939,7 @@ fn handle_ui_message(
 fn ensure_active_conversation(
     state: &Rc<RefCell<WindowState>>,
     sidebar: &Rc<Sidebar>,
-    client: &Rc<RefCell<Option<Arc<TransportClient>>>>,
+    client: &Rc<RefCell<Option<Arc<Connector>>>>,
     ui_tx: &mpsc::UnboundedSender<UiMessage>,
 ) {
     let (target_id, target_index) = {
@@ -1953,7 +1960,7 @@ fn ensure_active_conversation(
         }
     };
 
-    let Some(transport) = client.borrow().clone() else {
+    let Some(connector) = client.borrow().clone() else {
         // Not connected yet — connection_manager will resend
         // ConversationsLoaded once the transport is up, and we'll re-run.
         return;
@@ -1964,7 +1971,7 @@ fn ensure_active_conversation(
         (Some(id), Some(idx)) => {
             sidebar.select_index(idx);
             crate::async_bridge::spawn_on_runtime(async move {
-                match transport.get_conversation(&id).await {
+                match connector.client().get_conversation(&id).await {
                     Ok(detail) => {
                         let _ = tx.send(UiMessage::ConversationLoaded(detail));
                     }
@@ -1976,13 +1983,14 @@ fn ensure_active_conversation(
         }
         _ => {
             crate::async_bridge::spawn_on_runtime(async move {
-                match transport.create_conversation("New Conversation").await {
+                let client = connector.client();
+                match client.create_conversation("New Conversation").await {
                     Ok(id) => {
                         let _ = tx.send(UiMessage::ConversationCreated { id: id.clone() });
-                        if let Ok(convs) = transport.list_conversations().await {
+                        if let Ok(convs) = client.list_conversations().await {
                             let _ = tx.send(UiMessage::ConversationsLoaded(convs));
                         }
-                        if let Ok(detail) = transport.get_conversation(&id).await {
+                        if let Ok(detail) = client.get_conversation(&id).await {
                             let _ = tx.send(UiMessage::ConversationLoaded(detail));
                         }
                     }
