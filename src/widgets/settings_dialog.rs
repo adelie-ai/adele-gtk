@@ -6,8 +6,9 @@
 //! of RPCs).
 //!
 //! Async wiring mirrors `widgets/knowledge_browser.rs`: the dialog is
-//! handed an `Arc<TransportClient>` (resolved once by the caller) and an
-//! `Rc<AsyncBridge>`. Each RPC is dispatched on the tokio runtime via
+//! handed an `Arc<Connector>` (resolved once by the caller) and an
+//! `Rc<AsyncBridge>`. Management RPCs go through the connector's transport
+//! (`connector.client()`). Each RPC is dispatched on the tokio runtime via
 //! `bridge.spawn`, with results routed back to the GTK main thread through
 //! a short-lived `tokio::sync::mpsc` channel consumed by
 //! `glib::spawn_future_local`. Surface-level errors go to the window status
@@ -20,7 +21,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
-use desktop_assistant_client_common::TransportClient;
+use desktop_assistant_client_common::Connector;
 use gtk4::prelude::*;
 use gtk4::{Align, Box as GtkBox, Button, Label, Notebook, Orientation, Window, glib};
 use tokio::sync::mpsc;
@@ -99,17 +100,18 @@ fn confirm<F>(
     dialog.present();
 }
 
-/// Present the Settings dialog modally against `parent`, using `transport`
-/// for all RPC traffic. `bridge` provides the tokio runtime + the shared
-/// ui-message channel so errors propagate back to the window status bar.
+/// Present the Settings dialog modally against `parent`, using `connector`
+/// for all RPC traffic (management commands go through `connector.client()`).
+/// `bridge` provides the tokio runtime + the shared ui-message channel so
+/// errors propagate back to the window status bar.
 ///
 /// `voice` is the handle to the standalone voice daemon (a *separate* D-Bus
-/// service from `transport`'s orchestrator); it backs the Voice tab's wake-word
-/// toggle and voice picker. The tab degrades gracefully when the daemon is
-/// absent.
+/// service from the connector's orchestrator); it backs the Voice tab's
+/// wake-word toggle and voice picker. The tab degrades gracefully when the
+/// daemon is absent.
 pub fn show_settings_dialog(
     parent: &impl IsA<Window>,
-    transport: Arc<TransportClient>,
+    transport: Arc<Connector>,
     bridge: Rc<AsyncBridge>,
     voice: VoiceController,
 ) {
@@ -195,22 +197,22 @@ pub fn show_settings_dialog(
 
             let transport_for_task = Arc::clone(&transport);
             bridge.spawn(async move {
-                let conns = management_client::list_connections(&transport_for_task)
+                let client = transport_for_task.client();
+                let conns = management_client::list_connections(client)
                     .await
                     .map_err(|e| e.to_string());
                 let _ = tx_conn.send(conns);
 
-                let purposes = management_client::get_purposes(&transport_for_task)
+                let purposes = management_client::get_purposes(client)
                     .await
                     .map_err(|e| e.to_string());
                 let _ = tx_purposes.send(purposes);
 
                 // Aggregated list (None connection_id) populates model
                 // caches for every healthy connection at once.
-                let models =
-                    management_client::list_available_models(&transport_for_task, None, false)
-                        .await
-                        .map_err(|e| e.to_string());
+                let models = management_client::list_available_models(client, None, false)
+                    .await
+                    .map_err(|e| e.to_string());
                 let _ = tx_models.send(models);
             });
 
@@ -286,9 +288,10 @@ pub fn show_settings_dialog(
                     let ui_tx = bridge.ui_sender();
                     let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), String>>();
                     bridge.spawn(async move {
-                        let r = management_client::create_connection(&transport, id, config)
-                            .await
-                            .map_err(|e| e.to_string());
+                        let r =
+                            management_client::create_connection(transport.client(), id, config)
+                                .await
+                                .map_err(|e| e.to_string());
                         let _ = tx.send(r);
                     });
                     glib::spawn_future_local(async move {
@@ -362,9 +365,10 @@ pub fn show_settings_dialog(
                     let ui_tx = bridge_save.ui_sender();
                     let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), String>>();
                     bridge_save.spawn(async move {
-                        let r = management_client::update_connection(&transport, id, config)
-                            .await
-                            .map_err(|e| e.to_string());
+                        let r =
+                            management_client::update_connection(transport.client(), id, config)
+                                .await
+                                .map_err(|e| e.to_string());
                         let _ = tx.send(r);
                     });
                     glib::spawn_future_local(async move {
@@ -385,7 +389,7 @@ pub fn show_settings_dialog(
                     let ui_tx = bridge_refresh.ui_sender();
                     bridge_refresh.spawn(async move {
                         let r = management_client::list_available_models(
-                            &transport,
+                            transport.client(),
                             Some(id_for_refresh),
                             true,
                         )
@@ -450,7 +454,7 @@ pub fn show_settings_dialog(
             let ui_tx = bridge.ui_sender();
             let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), String>>();
             bridge.spawn(async move {
-                let r = management_client::set_purpose(&transport, purpose, config).await;
+                let r = management_client::set_purpose(transport.client(), purpose, config).await;
                 let _ = tx.send(r.map_err(|e| e.to_string()));
             });
             glib::spawn_future_local(async move {
@@ -481,7 +485,7 @@ pub fn show_settings_dialog(
             let connection_id_for_task = connection_id.clone();
             bridge.spawn(async move {
                 let r = management_client::list_available_models(
-                    &transport,
+                    transport.client(),
                     Some(connection_id_for_task),
                     false,
                 )
@@ -611,7 +615,7 @@ fn wire_voice_tab(voice_tab: &Rc<VoiceTab>, voice: &VoiceController, bridge: &Rc
 /// the daemon rewires referencing purposes to fall back to interactive.
 fn do_remove_connection(
     parent: &impl IsA<Window>,
-    transport: Arc<TransportClient>,
+    transport: Arc<Connector>,
     bridge: Rc<AsyncBridge>,
     refresh: Rc<dyn Fn()>,
     id: String,
@@ -622,7 +626,9 @@ fn do_remove_connection(
     let transport_for_task = Arc::clone(&transport);
     let id_for_task = id.clone();
     bridge.spawn(async move {
-        let r = management_client::delete_connection(&transport_for_task, id_for_task, force).await;
+        let r =
+            management_client::delete_connection(transport_for_task.client(), id_for_task, force)
+                .await;
         let _ = tx.send(r.map_err(|e| e.to_string()));
     });
 

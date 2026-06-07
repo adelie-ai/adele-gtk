@@ -4,10 +4,7 @@ use std::sync::OnceLock;
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_client_common::SignalEvent;
-use desktop_assistant_client_common::{
-    AssistantClient, ConnectionConfig, TransportClient, connect_transport,
-    transport::transport_label,
-};
+use desktop_assistant_client_common::{AssistantClient, ConnectionConfig, Connector};
 use gtk4::glib;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -25,13 +22,16 @@ fn runtime() -> &'static Runtime {
 
 /// Messages sent from async tasks back to the GTK main thread.
 pub enum UiMessage {
-    /// A freshly connected transport handed off to the GTK main thread.
-    /// `Arc<TransportClient>` is `Send`, so this rides the same channel as
+    /// A freshly connected [`Connector`] handed off to the GTK main thread.
+    /// `Arc<Connector>` is `Send`, so this rides the same channel as
     /// every other UI message (replacing the former dedicated `InternalMsg`
     /// channel). Sent by `connection_manager` immediately after `Connected`
     /// and before `ConversationsLoaded`, so the window's client cell is
-    /// populated before any handler that needs it runs.
-    ClientReady(Arc<TransportClient>),
+    /// populated before any handler that needs it runs. The `Connector` owns
+    /// the transport (`connector.client()`) and the signal stream; the window
+    /// shares this same handle wherever it previously held an
+    /// `Arc<TransportClient>`.
+    ClientReady(Arc<Connector>),
     ConversationsLoaded(Vec<desktop_assistant_client_common::ConversationSummary>),
     ConversationLoaded(desktop_assistant_client_common::ConversationDetail),
     ConversationCreated {
@@ -146,15 +146,15 @@ pub enum UiMessage {
     },
 }
 
-// Manual `Debug` (can't derive: `TransportClient` is not `Debug`). Only
+// Manual `Debug` (can't derive: `Connector` is not `Debug`). Only
 // `ClientReady` needs special handling — it prints a marker instead of the
-// opaque transport; every other variant forwards its fields as before so
+// opaque connector; every other variant forwards its fields as before so
 // the test panic messages stay informative.
 impl std::fmt::Debug for UiMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             UiMessage::ClientReady(_) => {
-                f.debug_tuple("ClientReady").field(&"<transport>").finish()
+                f.debug_tuple("ClientReady").field(&"<connector>").finish()
             }
             UiMessage::ConversationsLoaded(v) => {
                 f.debug_tuple("ConversationsLoaded").field(v).finish()
@@ -328,21 +328,29 @@ pub async fn connection_manager(config: ConnectionConfig, ui_tx: mpsc::Unbounded
     let mut backoff_secs = INITIAL_BACKOFF_SECS;
 
     loop {
-        match connect_transport(&config).await {
-            Ok((transport, mut signal_rx)) => {
+        match Connector::connect(&config).await {
+            Ok(connector) => {
                 backoff_secs = INITIAL_BACKOFF_SECS;
-                let transport = Arc::new(transport);
+                // Subscribe before issuing any prompt so no early chunk is
+                // lost; the fanout pump inside the `Connector` keeps running as
+                // long as the `Arc<Connector>` is alive (held by the window).
+                let mut signal_rx = connector.subscribe();
+                let connector = Arc::new(connector);
+                // `client()` borrows the transport owned by the `Connector`;
+                // the connector outlives every use below (and the shared
+                // `Arc` clone handed to the GTK thread keeps the pump alive).
+                let transport = connector.client();
 
-                let label = transport_label(&config);
+                let label = connector.label().to_string();
                 if ui_tx.send(UiMessage::Connected { label }).is_err() {
                     return;
                 }
 
-                // Hand the transport to the GTK main thread before the
+                // Hand the connector to the GTK main thread before the
                 // conversation list (which needs it). Same channel, so
                 // delivery stays ordered.
                 if ui_tx
-                    .send(UiMessage::ClientReady(Arc::clone(&transport)))
+                    .send(UiMessage::ClientReady(Arc::clone(&connector)))
                     .is_err()
                 {
                     return;
@@ -387,7 +395,7 @@ pub async fn connection_manager(config: ConnectionConfig, ui_tx: mpsc::Unbounded
                 // selection (issue #53). Graceful: on failure (or a D-Bus
                 // transport that doesn't carry GetPurposes) we send `None` and
                 // the picker degrades to its last-resort "Model" label.
-                let default_model = match crate::management_client::get_purposes(&transport).await {
+                let default_model = match crate::management_client::get_purposes(transport).await {
                     Ok(purposes) => interactive_default_from_purposes(&purposes),
                     Err(e) => {
                         tracing::warn!("get_purposes failed; default model unresolved: {e}");
@@ -441,7 +449,10 @@ pub async fn connection_manager(config: ConnectionConfig, ui_tx: mpsc::Unbounded
                 // `ListBackgroundTasks` snapshot above seeds the panel; the
                 // streaming arms in `match signal` keep it live.
 
-                // Forward signals until disconnect
+                // Forward signals until disconnect. The `Connector`'s fanout
+                // emits a terminal `SignalEvent::Disconnected` and then closes
+                // this receiver when the underlying stream ends, so the normal
+                // path already delivers a `UiMessage::Disconnected` here.
                 while let Some(signal) = signal_rx.recv().await {
                     if ui_tx.send(signal_to_ui_message(signal)).is_err() {
                         return;
