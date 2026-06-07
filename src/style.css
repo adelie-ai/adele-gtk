@@ -210,18 +210,6 @@ entry:focus {
 }
 
 /* Process-manager panel (#19) */
-.sidebar-stack-switcher button {
-    color: #e0e0e0;
-    background: none;
-    border-radius: 6px;
-    padding: 4px 12px;
-}
-
-.sidebar-stack-switcher button:checked {
-    background-color: #4866b4;
-    color: #f5f8ff;
-}
-
 .task-list row {
     padding: 4px 0;
     border-radius: 6px;
