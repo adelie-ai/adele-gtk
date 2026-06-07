@@ -584,6 +584,13 @@ impl AdelieWindow {
         knowledge_btn.set_halign(Align::Fill);
         menu_box.append(&knowledge_btn);
 
+        // Per-conversation personality override (#70). Opens a modal picker
+        // pre-filled from the active conversation's stored override.
+        let personality_btn = Button::with_label("Personality…");
+        personality_btn.add_css_class("context-button");
+        personality_btn.set_halign(Align::Fill);
+        menu_box.append(&personality_btn);
+
         let disconnect_btn = Button::with_label("Disconnect");
         disconnect_btn.add_css_class("context-button");
         disconnect_btn.set_halign(Align::Fill);
@@ -1402,6 +1409,99 @@ impl AdelieWindow {
             }
         ));
 
+        // Hamburger menu: Personality… → open the per-conversation personality
+        // picker (#70). Mirrors the model picker's gating: the override travels
+        // on the command channel (UDS/WS), which D-Bus doesn't expose. Pre-fills
+        // from the active conversation's stored override and, on Save, dispatches
+        // `set_conversation_personality` through the async bridge, then reloads
+        // the conversation so `current_conversation.conversation_personality`
+        // (the next pre-fill source) stays in sync with the daemon.
+        personality_btn.connect_clicked(glib::clone!(
+            #[weak]
+            menu_popover,
+            #[weak]
+            window,
+            #[strong]
+            client,
+            #[strong]
+            bridge,
+            #[strong]
+            status_label,
+            #[strong]
+            state,
+            move |_| {
+                menu_popover.popdown();
+                let Some(connector) = client.borrow().clone() else {
+                    status_label.set_text("Not connected — personality unavailable");
+                    return;
+                };
+                if connector.client().as_commands().is_none() {
+                    status_label.set_text(
+                        "Personality settings require a local-socket or WebSocket connection (not available over D-Bus)",
+                    );
+                    return;
+                }
+                let (conv_id, prefill) = {
+                    let s = state.borrow();
+                    let id = s.current_conversation_id.clone();
+                    let prefill = s
+                        .current_conversation
+                        .as_ref()
+                        .and_then(|c| c.conversation_personality);
+                    (id, prefill)
+                };
+                let Some(conv_id) = conv_id else {
+                    status_label.set_text("Open a conversation first to set its personality");
+                    return;
+                };
+
+                let bridge_for_save = Rc::clone(&bridge);
+                let connector_for_save = Arc::clone(&connector);
+                let status_for_save = status_label.clone();
+                crate::widgets::personality_dialog::show_personality_dialog(
+                    &window,
+                    prefill.as_ref(),
+                    move |personality| {
+                        let tx = bridge_for_save.ui_sender();
+                        let connector = Arc::clone(&connector_for_save);
+                        let conv_id = conv_id.clone();
+                        let status = status_for_save.clone();
+                        status.set_text("Saving personality…");
+                        bridge_for_save.spawn(async move {
+                            let transport = connector.client();
+                            match management_client::set_conversation_personality(
+                                transport,
+                                &conv_id,
+                                personality,
+                            )
+                            .await
+                            {
+                                Ok(_stored) => {
+                                    // Reload so the next pre-fill reflects the
+                                    // stored override (and any all-None clear).
+                                    match transport.get_conversation(&conv_id).await {
+                                        Ok(detail) => {
+                                            let _ = tx.send(UiMessage::ConversationLoaded(detail));
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(UiMessage::Error(format!(
+                                                "Reload after personality save: {e}"
+                                            )));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(UiMessage::Error(format!(
+                                        "Save personality: {e}"
+                                    )));
+                                }
+                            }
+                        });
+                    },
+                );
+            }
+        ));
+
         // Hamburger menu: Disconnect → close this window, show login screen
         disconnect_btn.connect_clicked(glib::clone!(
             #[weak]
@@ -2056,6 +2156,7 @@ fn filter_messages(detail: &ConversationDetail, debug: bool) -> ConversationDeta
             .cloned()
             .collect(),
         model_selection: detail.model_selection.clone(),
+        conversation_personality: detail.conversation_personality,
     }
 }
 
@@ -2087,6 +2188,7 @@ mod tests {
             title: format!("conv {id}"),
             messages,
             model_selection: None,
+            conversation_personality: None,
         }
     }
 
