@@ -10,8 +10,8 @@ use desktop_assistant_client_common::{
 use gtk4::prelude::*;
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, Entry, Label,
-    MenuButton, Orientation, Paned, Popover, Revealer, RevealerTransitionType, Separator, Stack,
-    StackSwitcher, Window, gdk, glib,
+    MenuButton, Orientation, Paned, Popover, Revealer, RevealerTransitionType, Separator, Window,
+    gdk, glib,
 };
 use tokio::sync::mpsc;
 
@@ -541,10 +541,12 @@ impl AdelieWindow {
         // system/GTK preference is light, and re-applied on preference change.
         crate::theme::install_for_display(&gdk::Display::default().expect("display"));
 
-        // Layout: resizable paned split between sidebar and chat. The left
-        // pane is a `Stack` that swaps between the conversation list and the
-        // process-manager view (issue #19) — minimal disruption to the
-        // existing sidebar widget, the Tasks page just becomes a sibling.
+        // Layout: resizable paned split between sidebar and chat. The left pane
+        // holds the conversation list directly. Background tasks (issue #19)
+        // used to be a second `Stack` page here, but they now live in a
+        // dedicated popup window (`tasks_window`, built below) so the task list
+        // and per-task log have room to show real detail — what each task is
+        // doing right now, its MCP/tool calls, etc.
         let paned = Paned::new(Orientation::Horizontal);
 
         let sidebar = Sidebar::new();
@@ -552,22 +554,44 @@ impl AdelieWindow {
 
         let left_box = GtkBox::new(Orientation::Vertical, 0);
         left_box.set_size_request(280, -1);
-
-        let stack = Stack::new();
-        stack.set_vexpand(true);
-        stack.add_titled(&sidebar.container, Some("conversations"), "Conversations");
-        stack.add_titled(&tasks_panel.container, Some("tasks"), "Tasks");
-
-        let stack_switcher = StackSwitcher::new();
-        stack_switcher.set_stack(Some(&stack));
-        stack_switcher.set_halign(Align::Center);
-        stack_switcher.set_margin_top(8);
-        stack_switcher.set_margin_bottom(4);
-        stack_switcher.add_css_class("sidebar-stack-switcher");
-        left_box.append(&stack_switcher);
-        left_box.append(&stack);
+        sidebar.container.set_vexpand(true);
+        left_box.append(&sidebar.container);
 
         paned.set_start_child(Some(&left_box));
+
+        // Background-tasks popup. Built once and hidden (not destroyed) on close
+        // so the long-lived `TasksPanel` — which keeps receiving live `Task*`
+        // events whether or not the window is visible — survives reopen with its
+        // model and selection intact.
+        //
+        // Deliberately *not* `transient_for` the main window and *not* added to
+        // the `Application`: a transient would stay stacked above the chat and
+        // share its taskbar entry, and an app-owned window would keep the
+        // process alive after the chat window closed. As an independent toplevel
+        // it gets its own taskbar entry and can sit behind the chat; we tie only
+        // its teardown to the client below so it can't outlive it.
+        let tasks_window = Window::builder()
+            .title("Background Tasks")
+            .modal(false)
+            .default_width(820)
+            .default_height(560)
+            .build();
+        tasks_window.set_child(Some(&tasks_panel.container));
+        tasks_window.set_hide_on_close(true);
+        let tasks_window = Rc::new(tasks_window);
+
+        // The popup isn't owned by the `Application`, so closing the main window
+        // won't reap it on its own. Destroy it when the chat window closes so it
+        // never lingers past client exit (`hide_on_close` is bypassed by an
+        // explicit `destroy`).
+        window.connect_close_request(glib::clone!(
+            #[strong]
+            tasks_window,
+            move |_| {
+                tasks_window.destroy();
+                glib::Propagation::Proceed
+            }
+        ));
         paned.set_resize_start_child(false);
         paned.set_shrink_start_child(false);
         paned.set_position(280);
@@ -636,6 +660,11 @@ impl AdelieWindow {
         knowledge_btn.add_css_class("context-button");
         knowledge_btn.set_halign(Align::Fill);
         menu_box.append(&knowledge_btn);
+
+        let tasks_btn = Button::with_label("Background Tasks");
+        tasks_btn.add_css_class("context-button");
+        tasks_btn.set_halign(Align::Fill);
+        menu_box.append(&tasks_btn);
 
         // Per-conversation personality override (#70). Opens a modal picker
         // pre-filled from the active conversation's stored override.
@@ -771,7 +800,6 @@ impl AdelieWindow {
         let model_picker = Rc::new(model_picker);
         let tasks_panel = Rc::new(tasks_panel);
         let side_pane = Rc::new(side_pane);
-        let stack = Rc::new(stack);
         let toast_revealer = Rc::new(toast_revealer);
         let toast_label = Rc::new(toast_label);
 
@@ -1462,6 +1490,20 @@ impl AdelieWindow {
             }
         ));
 
+        // Hamburger menu: Background Tasks → present the tasks popup. The window
+        // and its `TasksPanel` already exist and stay current via the live
+        // `Task*` event stream, so opening is just a `present()`.
+        tasks_btn.connect_clicked(glib::clone!(
+            #[weak]
+            menu_popover,
+            #[strong]
+            tasks_window,
+            move |_| {
+                menu_popover.popdown();
+                tasks_window.present();
+            }
+        ));
+
         // Hamburger menu: Personality… → open the per-conversation personality
         // picker (#70). Mirrors the model picker's gating: the override travels
         // on the command channel (UDS/WS), which D-Bus doesn't expose. Pre-fills
@@ -1610,10 +1652,9 @@ impl AdelieWindow {
         // Tasks panel: toolbar wiring (#19).
         //
         // `Cancel` sends `CancelBackgroundTask` over the command channel;
-        // `Open Conversation`
-        // routes the user back to the Conversations stack page and loads the
-        // task's conversation so the streaming output keeps flowing into the
-        // chat view.
+        // `Open Conversation` hides the tasks popup and loads the task's
+        // conversation into the main window so the streaming output keeps
+        // flowing into the chat view.
         tasks_panel.connect_cancel(glib::clone!(
             #[strong]
             client,
@@ -1649,9 +1690,9 @@ impl AdelieWindow {
             #[strong]
             bridge,
             #[strong]
-            stack,
+            tasks_window,
             move |conv_id| {
-                stack.set_visible_child_name("conversations");
+                tasks_window.set_visible(false);
                 let Some(connector) = client.borrow().clone() else {
                     return;
                 };
