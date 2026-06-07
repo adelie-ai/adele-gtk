@@ -34,6 +34,12 @@ pub enum UiMessage {
     ClientReady(Arc<Connector>),
     ConversationsLoaded(Vec<desktop_assistant_client_common::ConversationSummary>),
     ConversationLoaded(desktop_assistant_client_common::ConversationDetail),
+    /// A conversation that is *already open* was re-fetched (on reconnect, or
+    /// after a debug/personality refresh). The window refreshes the cached
+    /// detail + chat but, unlike [`ConversationLoaded`], does NOT reset the
+    /// model picker — the user's selection (sent or unsent) must survive a
+    /// reconnect (issue #72).
+    ConversationReloaded(desktop_assistant_client_common::ConversationDetail),
     ConversationCreated {
         id: String,
     },
@@ -161,6 +167,9 @@ impl std::fmt::Debug for UiMessage {
             }
             UiMessage::ConversationLoaded(v) => {
                 f.debug_tuple("ConversationLoaded").field(v).finish()
+            }
+            UiMessage::ConversationReloaded(v) => {
+                f.debug_tuple("ConversationReloaded").field(v).finish()
             }
             UiMessage::ConversationCreated { id } => f
                 .debug_struct("ConversationCreated")

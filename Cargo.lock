@@ -53,6 +53,8 @@ dependencies = [
 name = "adele-voice-core"
 version = "0.1.0"
 dependencies = [
+ "pulldown-cmark",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
 ]

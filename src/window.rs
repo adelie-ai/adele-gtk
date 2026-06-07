@@ -65,6 +65,13 @@ enum Effect {
     EnsureActiveConversation,
     /// Load an (already debug-filtered) conversation into the chat view.
     LoadConversationIntoChat(ConversationDetail),
+    /// Re-fetch a conversation that is already open, to refresh the cached
+    /// detail + chat after a reconnect (or a debug/personality refresh) WITHOUT
+    /// resetting the model picker. The reply arrives as
+    /// `UiMessage::ConversationReloaded`. Unlike a conversation *switch* (which
+    /// flows through `ConversationLoaded` and re-applies the picker selection),
+    /// a reload must never clobber the user's pick — see issue #72.
+    ReloadConversation(String),
     /// Clear the chat view.
     ClearChat,
     /// Set the chat's transient status line.
@@ -132,6 +139,9 @@ impl std::fmt::Debug for Effect {
             Effect::LoadConversationIntoChat(d) => {
                 f.debug_tuple("LoadConversationIntoChat").field(d).finish()
             }
+            Effect::ReloadConversation(id) => {
+                f.debug_tuple("ReloadConversation").field(id).finish()
+            }
             Effect::ClearChat => f.write_str("ClearChat"),
             Effect::SetChatStatus(m) => f.debug_tuple("SetChatStatus").field(m).finish(),
             Effect::ClearChatStatus => f.write_str("ClearChatStatus"),
@@ -187,10 +197,26 @@ impl WindowState {
             }
             UiMessage::ConversationsLoaded(convs) => {
                 self.conversations = convs.clone();
-                vec![
+                let mut effects = vec![
                     Effect::SetConversations(convs),
                     Effect::EnsureActiveConversation,
-                ]
+                ];
+                // On *reconnect* the window still has an active conversation
+                // that is still present. `EnsureActiveConversation` only
+                // re-syncs the sidebar selection in that case (it does not
+                // reload the messages), so re-fetch the conversation to refresh
+                // the cached detail + chat (it may have changed while we were
+                // disconnected) — via `ReloadConversation`, which keeps the
+                // model picker intact. On the first connect there is no active
+                // conversation yet, so the initial load happens through
+                // `EnsureActiveConversation -> ConversationLoaded` (which does
+                // set the picker). See issue #72.
+                if let Some(id) = self.current_conversation_id.clone()
+                    && self.conversations.iter().any(|c| c.id == id)
+                {
+                    effects.push(Effect::ReloadConversation(id));
+                }
+                effects
             }
             UiMessage::ConversationLoaded(detail) => {
                 let id = detail.id.clone();
@@ -208,6 +234,27 @@ impl WindowState {
                     Effect::RefreshSidePaneTasks,
                     Effect::FetchScratchpad(id),
                 ]
+            }
+            UiMessage::ConversationReloaded(detail) => {
+                // A conversation already open was re-fetched (reconnect / debug /
+                // personality refresh). Refresh the cached detail + chat (and
+                // side pane) but deliberately do NOT emit `SetModelSelection`:
+                // the model picker must keep the user's current selection across
+                // a reconnect (issue #72). Drop the reply if the user switched
+                // conversations while the fetch was in flight.
+                if self.current_conversation_id.as_deref() != Some(detail.id.as_str()) {
+                    vec![]
+                } else {
+                    let id = detail.id.clone();
+                    let filtered = filter_messages(&detail, self.debug_enabled);
+                    self.current_conversation = Some(detail);
+                    vec![
+                        Effect::LoadConversationIntoChat(filtered),
+                        Effect::SidePaneSetScratchpad(Vec::new()),
+                        Effect::RefreshSidePaneTasks,
+                        Effect::FetchScratchpad(id),
+                    ]
+                }
             }
             UiMessage::ConversationCreated { id } => {
                 self.current_conversation_id = Some(id);
@@ -378,15 +425,21 @@ impl WindowState {
             UiMessage::StatusUpdate(text) => vec![Effect::SetStatusText(text)],
             UiMessage::Error(text) => vec![Effect::SetStatusText(format!("Error: {text}"))],
             UiMessage::ModelsLoaded(listings) => {
+                // A models refresh fires on every (re)connect (the UDS link
+                // drops on idle / the daemon restarts) and when Settings is
+                // opened. It must NOT re-apply the conversation's stored
+                // selection: `set_models` already preserves the picker's active
+                // selection, and re-applying the *cached* `model_selection`
+                // (which is `None`/default for most conversations and is never
+                // refreshed after a send) clobbered the user's in-memory pick
+                // back to stored-or-default on each reconnect. The picker's
+                // selection is owned by `ConversationLoaded` (an explicit
+                // switch) and `set_default_model` (connect). See issue #72.
                 let visible = !listings.is_empty();
-                let mut effects = vec![Effect::SetModels(listings)];
-                // Re-apply the active conversation's stored selection (if any)
-                // since `set_models` resets the dropdown.
-                if let Some(ref detail) = self.current_conversation {
-                    effects.push(Effect::SetModelSelection(detail.model_selection.clone()));
-                }
-                effects.push(Effect::SetModelPickerVisible(visible));
-                effects
+                vec![
+                    Effect::SetModels(listings),
+                    Effect::SetModelPickerVisible(visible),
+                ]
             }
             UiMessage::DefaultModelLoaded(default) => {
                 // The picker uses this as the fallback selection for
@@ -1478,10 +1531,14 @@ impl AdelieWindow {
                             {
                                 Ok(_stored) => {
                                     // Reload so the next pre-fill reflects the
-                                    // stored override (and any all-None clear).
+                                    // stored personality override (and any
+                                    // all-None clear). Use `ConversationReloaded`
+                                    // so refreshing the personality cache doesn't
+                                    // reset the model picker (issue #72).
                                     match transport.get_conversation(&conv_id).await {
                                         Ok(detail) => {
-                                            let _ = tx.send(UiMessage::ConversationLoaded(detail));
+                                            let _ =
+                                                tx.send(UiMessage::ConversationReloaded(detail));
                                         }
                                         Err(e) => {
                                             let _ = tx.send(UiMessage::Error(format!(
@@ -1536,7 +1593,9 @@ impl AdelieWindow {
                     bridge.spawn(async move {
                         match connector.client().get_conversation(&conv_id).await {
                             Ok(detail) => {
-                                let _ = tx.send(UiMessage::ConversationLoaded(detail));
+                                // Reload (re-filter) the same conversation — keep
+                                // the model picker (issue #72).
+                                let _ = tx.send(UiMessage::ConversationReloaded(detail));
                             }
                             Err(e) => {
                                 let _ =
@@ -1926,6 +1985,25 @@ fn handle_ui_message(
             }
             Effect::LoadConversationIntoChat(filtered) => {
                 chat_view.borrow_mut().load_conversation(&filtered);
+            }
+            Effect::ReloadConversation(id) => {
+                // Re-fetch an already-open conversation (reconnect / debug /
+                // personality refresh) and refresh the cached detail + chat via
+                // `ConversationReloaded`, which deliberately leaves the model
+                // picker untouched (issue #72).
+                if let Some(connector) = client.borrow().clone() {
+                    let tx = ui_tx.clone();
+                    crate::async_bridge::spawn_on_runtime(async move {
+                        match connector.client().get_conversation(&id).await {
+                            Ok(detail) => {
+                                let _ = tx.send(UiMessage::ConversationReloaded(detail));
+                            }
+                            Err(e) => {
+                                tracing::warn!("reload conversation failed: {e}");
+                            }
+                        }
+                    });
+                }
             }
             Effect::ClearChat => {
                 chat_view.borrow_mut().clear();
@@ -2675,7 +2753,12 @@ mod tests {
     // --- Model-picker re-application -------------------------------------
 
     #[test]
-    fn models_loaded_reapplies_active_conversation_selection_and_shows_picker() {
+    fn models_loaded_does_not_touch_picker_selection() {
+        // Regression (issue #72): a models refresh fires on every (re)connect.
+        // It must NOT re-apply the conversation's stored selection — doing so
+        // clobbered the user's in-memory pick back to stored-or-default on each
+        // reconnect. `set_models` preserves the picker's `active`; the selection
+        // is owned by ConversationLoaded (switch) and set_default_model.
         let mut conv = detail("c1", vec![]);
         conv.model_selection = Some(selection("work", "claude"));
         let mut state = WindowState {
@@ -2684,18 +2767,14 @@ mod tests {
             ..Default::default()
         };
         let effects = state.apply(UiMessage::ModelsLoaded(vec![listing("work", "claude")]));
-        // set_models resets the dropdown, so apply must re-emit the stored
-        // selection, then make the picker visible (non-empty list).
         match effects.as_slice() {
             [
                 Effect::SetModels(models),
-                Effect::SetModelSelection(Some(sel)),
                 Effect::SetModelPickerVisible(true),
             ] => {
                 assert_eq!(models.len(), 1);
-                assert_eq!(sel.model_id, "claude");
             }
-            other => panic!("unexpected effects: {other:?}"),
+            other => panic!("ModelsLoaded must not emit SetModelSelection: {other:?}"),
         }
     }
 
@@ -2712,6 +2791,121 @@ mod tests {
             }
             other => panic!("unexpected effects (no conversation => no reapply): {other:?}"),
         }
+    }
+
+    // --- Reconnect: reload the active conversation without resetting picker --
+
+    #[test]
+    fn conversations_loaded_on_reconnect_reloads_active_conversation() {
+        // Issue #72: on reconnect the (still-present) active conversation is
+        // re-fetched via ReloadConversation — which refreshes the cache and
+        // keeps the picker — instead of ConversationLoaded (which resets it).
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::ConversationsLoaded(vec![summary(
+            "c1", "first", false,
+        )]));
+        match effects.as_slice() {
+            [
+                Effect::SetConversations(_),
+                Effect::EnsureActiveConversation,
+                Effect::ReloadConversation(id),
+            ] => assert_eq!(id, "c1"),
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conversations_loaded_on_first_connect_does_not_reload() {
+        // First connect: no active conversation yet, so the initial load runs
+        // through EnsureActiveConversation -> ConversationLoaded (which sets the
+        // picker). No ReloadConversation.
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::ConversationsLoaded(vec![summary(
+            "c1", "first", false,
+        )]));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::SetConversations(_),
+                    Effect::EnsureActiveConversation
+                ]
+            ),
+            "first connect must not reload: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn conversations_loaded_skips_reload_when_active_conversation_gone() {
+        // The active conversation was deleted while disconnected: don't try to
+        // reload it (EnsureActiveConversation switches to another / creates one).
+        let mut state = WindowState {
+            current_conversation_id: Some("gone".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::ConversationsLoaded(vec![summary(
+            "c1", "first", false,
+        )]));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::SetConversations(_),
+                    Effect::EnsureActiveConversation
+                ]
+            ),
+            "must not reload a conversation that's no longer present: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn conversation_reloaded_refreshes_cache_and_chat_without_touching_picker() {
+        // Issue #72: a reload refreshes the cached detail + chat but must NOT
+        // emit SetModelSelection (the picker keeps the user's pick).
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let mut d = detail("c1", vec![msg("user", "hi")]);
+        d.model_selection = Some(selection("work", "claude"));
+        let effects = state.apply(UiMessage::ConversationReloaded(d));
+        assert!(
+            state.current_conversation.is_some(),
+            "cache must be updated"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetModelSelection(_))),
+            "reload must not touch the picker: {effects:?}"
+        );
+        match effects.as_slice() {
+            [
+                Effect::LoadConversationIntoChat(_),
+                Effect::SidePaneSetScratchpad(_),
+                Effect::RefreshSidePaneTasks,
+                Effect::FetchScratchpad(conv),
+            ] => assert_eq!(conv, "c1"),
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conversation_reloaded_ignored_when_user_switched_away() {
+        // A reload reply that arrives after the user switched conversations must
+        // be dropped — it would otherwise overwrite the now-current chat.
+        let mut state = WindowState {
+            current_conversation_id: Some("c2".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::ConversationReloaded(detail("c1", vec![])));
+        assert!(
+            effects.is_empty(),
+            "stale reload for a non-active conversation must be a no-op: {effects:?}"
+        );
     }
 
     #[test]
@@ -2758,7 +2952,7 @@ mod tests {
             conversation_id: "c1".to_string(),
             warning,
         });
-        // Cached selection must be cleared so a later ModelsLoaded doesn't
+        // Cached selection must be cleared so a later reload/switch doesn't
         // re-apply the stale dangling selection, contradicting the toast.
         assert!(
             state
