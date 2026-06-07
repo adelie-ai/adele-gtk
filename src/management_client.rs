@@ -118,6 +118,22 @@ pub async fn set_purpose(
     expect_ack("SetPurpose", result)
 }
 
+/// Set (or clear) a conversation's personality override (#70 / daemon #227).
+/// `personality` is a *partial* override: each `Some` trait pins that trait for
+/// the conversation, each `None` inherits the global config. An all-`None`
+/// override clears it. Returns the stored value after the write. Routes through
+/// the `set_conversation_personality` default method on the command channel, so
+/// the result-envelope handling stays in `client-common`.
+pub async fn set_conversation_personality(
+    transport: &TransportClient,
+    conversation_id: &str,
+    personality: api::ConversationPersonalityView,
+) -> Result<api::ConversationPersonalityView> {
+    commands(transport)?
+        .set_conversation_personality(conversation_id, personality)
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -562,6 +562,14 @@ fn signal_to_ui_message(signal: SignalEvent) -> UiMessage {
         SignalEvent::ScratchpadChanged { conversation_id } => {
             UiMessage::ScratchpadChanged { conversation_id }
         }
+        // Client-local MCP tool execution (#107/#231) is not implemented in the
+        // GTK client — it has no local tool runtime to satisfy the call. Surface
+        // it as a status string so the parked turn is at least visible; the
+        // daemon eventually times the suspended call out. Wiring real
+        // client-side tool execution here is a separate feature.
+        SignalEvent::ClientToolCall { tool_name, .. } => UiMessage::StatusUpdate(format!(
+            "Assistant requested a client-side tool ({tool_name}) this client can't run."
+        )),
         SignalEvent::Disconnected { reason } => UiMessage::Disconnected { reason },
     }
 }
