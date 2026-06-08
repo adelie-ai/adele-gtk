@@ -3,115 +3,112 @@ use std::rc::Rc;
 
 use gtk4::prelude::*;
 use gtk4::{
-    Box as GtkBox, Button, Image, Orientation, ScrolledWindow, TextView, ToggleButton, WrapMode,
-    glib,
+    Box as GtkBox, Button, DropDown, Image, Label, Orientation, ScrolledWindow, StringList,
+    TextView, WrapMode, glib,
 };
 
+use crate::async_bridge::AdeleOutput;
 use crate::voice_client::VoiceState;
 
-/// Callback fired when the user flips the read-aloud toggle (issue #76/#78). The
-/// bool is the new "read aloud" state for the active conversation.
-type SpeechToggledCb = Box<dyn Fn(bool)>;
+/// Callback fired when the user changes the `You:` (voice input) dropdown (issue
+/// #80). The bool is the new per-conversation voice-input state: `true` =
+/// Enabled (push-to-talk available), `false` = Disabled (type only).
+type VoiceInChangedCb = Box<dyn Fn(bool)>;
 
-/// Callback fired when the user flips the voice-mode toggle (issue #78). The
-/// bool is the new "voice mode" state for the active conversation.
-type VoiceModeToggledCb = Box<dyn Fn(bool)>;
+/// Callback fired when the user changes the `Adele:` (voice output) dropdown
+/// (issue #80). The argument is the new per-conversation output level.
+type AdeleOutputChangedCb = Box<dyn Fn(AdeleOutput)>;
 
-/// Input bar widget with a record/mic button, a text view, and a send button.
+/// Dropdown option labels for `You:` (voice input). Index 0 = Disabled, 1 =
+/// Enabled — the position is the source of truth the callbacks decode (see
+/// [`voice_in_index`] / [`voice_in_from_index`]).
+const VOICE_IN_OPTIONS: &[&str] = &["Disabled", "Enabled"];
+
+/// Dropdown option labels for `Adele:` (voice output). Index 0 = Disabled, 1 =
+/// On Demand, 2 = Always — matching [`AdeleOutput`]'s ordering.
+const ADELE_OUTPUT_OPTIONS: &[&str] = &["Disabled", "On Demand", "Always"];
+
+/// The `You:` dropdown index for a voice-input state. Disabled = 0, Enabled = 1.
+fn voice_in_index(enabled: bool) -> u32 {
+    if enabled { 1 } else { 0 }
+}
+
+/// Decode the `You:` dropdown index back to the voice-input bool. Any
+/// unexpected index (shouldn't happen — the StringList is fixed) falls back to
+/// Disabled, the safe default (no audio capture offered).
+fn voice_in_from_index(index: u32) -> bool {
+    index == 1
+}
+
+/// The `Adele:` dropdown index for an output level, matching
+/// [`ADELE_OUTPUT_OPTIONS`].
+fn adele_output_index(level: AdeleOutput) -> u32 {
+    match level {
+        AdeleOutput::Disabled => 0,
+        AdeleOutput::OnDemand => 1,
+        AdeleOutput::Always => 2,
+    }
+}
+
+/// Decode the `Adele:` dropdown index back to an output level. An unexpected
+/// index falls back to Disabled (the safe default — never speaks).
+fn adele_output_from_index(index: u32) -> AdeleOutput {
+    match index {
+        1 => AdeleOutput::OnDemand,
+        2 => AdeleOutput::Always,
+        _ => AdeleOutput::Disabled,
+    }
+}
+
+/// Input bar widget: a text view + Send button on the top row, and a labeled
+/// voice-controls row underneath (issue #80) with the `You:` (input) and
+/// `Adele:` (output) dropdowns plus a push-to-talk control shown only while
+/// `You == Enabled`.
 pub struct InputBar {
     pub container: GtkBox,
     pub text_view: TextView,
     pub send_button: Button,
-    /// Push-to-talk button: starts a dictation turn on the voice daemon,
-    /// routed into the active conversation (`PushToTalkInConversation`) or the
-    /// daemon's own session (`PushToTalk`) when none is open. Hidden until the
-    /// voice service is found on the bus (graceful degradation — see
-    /// [`InputBar::set_voice_available`]).
+    /// Push-to-talk button (issue #80). Lives in the voice-controls row and is
+    /// shown only when `You == Enabled` AND voice capture is available on this
+    /// machine (the daemon owns its bus name, or the embedded engine is
+    /// active). Clicking it starts a dictation turn routed into the active
+    /// conversation — the same mechanic the removed left mic used. Hidden by
+    /// default (You defaults to Disabled). The window wires its `connect_clicked`
+    /// exactly as it did the old mic button.
     pub mic_button: Button,
-    /// The mic icon, swapped per pipeline state to mirror the plasmoid's glyphs.
+    /// The push-to-talk icon, swapped per pipeline state to mirror the plasmoid.
     mic_image: Image,
-    /// Per-conversation "read aloud" (accessibility) toggle (issue #76, reframed
-    /// in #78). Default OFF. LLM-unaware: when ON every reply auto-routes to the
-    /// Speaker and `say_this` is spoken. The window owns the authoritative
-    /// per-conversation state and drives `set_speech_active` on conversation
-    /// switch; this button is the affordance + write source.
-    pub speech_button: ToggleButton,
-    /// The speaker glyph on the read-aloud toggle, swapped on/off.
-    speech_image: Image,
-    /// User callback for read-aloud toggle flips. Guarded by `suppress` so a
-    /// programmatic `set_speech_active` (on conversation switch) does not echo a
-    /// write back.
-    on_speech_toggled: Rc<RefCell<Option<SpeechToggledCb>>>,
-    /// Per-conversation soft-sticky "voice mode" toggle (issue #78). Default OFF.
-    /// The model drives the same state via `request_voice` / `stop_voice`; this
-    /// button lets the user enter/leave it directly. When ON, replies are
-    /// narrated AND shaped for speech (a read-aloud `system_refinement` on send).
-    pub voice_mode_button: ToggleButton,
-    /// The voice-mode glyph, swapped on/off.
-    voice_mode_image: Image,
-    /// User callback for voice-mode toggle flips. Guarded by `suppress` so a
-    /// programmatic `set_voice_mode_active` (on conversation switch / model
-    /// drive) does not echo a write back.
-    on_voice_mode_toggled: Rc<RefCell<Option<VoiceModeToggledCb>>>,
-    /// Re-entrancy guard shared by `set_speech_active` and
-    /// `set_voice_mode_active`, mirroring `voice_tab`.
+    /// Whether voice capture is available on this machine (the daemon is present
+    /// or the embedded engine is active). Combined with the `You` selection to
+    /// decide whether the push-to-talk button is actually shown — an Enabled
+    /// `You` with no capture backend must not offer a dead control.
+    voice_available: Rc<Cell<bool>>,
+    /// The `You:` (voice input) dropdown. Disabled (type only) / Enabled
+    /// (push-to-talk available). The window owns the authoritative
+    /// per-conversation state and drives `set_voice_in_active` on conversation
+    /// switch; this dropdown is the affordance + write source.
+    pub voice_in_dropdown: DropDown,
+    /// User callback for `You:` dropdown changes. Guarded by `suppress` so a
+    /// programmatic `set_voice_in_active` (on conversation switch) does not echo
+    /// a write back.
+    on_voice_in_changed: Rc<RefCell<Option<VoiceInChangedCb>>>,
+    /// The `Adele:` (voice output) dropdown. Disabled / On Demand / Always. The
+    /// window owns the authoritative per-conversation state and drives
+    /// `set_adele_output_active` on conversation switch and on a model
+    /// `request_voice` / `stop_voice`; this dropdown is the affordance + write
+    /// source.
+    pub adele_output_dropdown: DropDown,
+    /// User callback for `Adele:` dropdown changes. Guarded by `suppress` so a
+    /// programmatic `set_adele_output_active` does not echo a write back.
+    on_adele_output_changed: Rc<RefCell<Option<AdeleOutputChangedCb>>>,
+    /// Re-entrancy guard shared by `set_voice_in_active` and
+    /// `set_adele_output_active`: a programmatic set must not echo a write back
+    /// through its callback.
     suppress: Rc<Cell<bool>>,
-    /// The last pipeline state reflected on the button. The window's click
-    /// handler reads it to decide barge-in (click while `Speaking` →
-    /// `StopSpeaking`, otherwise start a push-to-talk turn).
+    /// The last pipeline state reflected on the push-to-talk button. The
+    /// window's click handler reads it to decide barge-in (click while
+    /// `Speaking` → stop, otherwise start a push-to-talk turn).
     state: Rc<Cell<VoiceState>>,
-}
-
-/// Themed-icon fallback chain for the read-aloud toggle, by enabled state (#76).
-/// ON shows a speaker with sound; OFF shows a muted speaker, mirroring the
-/// "audio never plays while off" cut-off.
-fn speech_icons_for(enabled: bool) -> &'static [&'static str] {
-    if enabled {
-        &["audio-volume-high-symbolic", "audio-volume-high"]
-    } else {
-        &["audio-volume-muted-symbolic", "audio-volume-muted"]
-    }
-}
-
-/// Tooltip for the read-aloud (accessibility) toggle by state (#76, reframed in
-/// #78). Read-aloud auto-narrates every reply when ON; the copy uses the
-/// accessibility framing rather than the raw "speech enabled" wording.
-fn speech_tooltip_for(enabled: bool) -> &'static str {
-    if enabled {
-        "Read aloud — narrate every reply in this conversation. Click to mute."
-    } else {
-        "Read aloud is off — replies are not read aloud in this conversation. Click to enable."
-    }
-}
-
-/// Themed-icon fallback chain for the voice-mode toggle, by state (#78). ON
-/// shows a chat-bubble/voice glyph; OFF shows a muted variant — distinct from
-/// the read-aloud speaker glyphs so the two controls read as separate.
-fn voice_mode_icons_for(enabled: bool) -> &'static [&'static str] {
-    if enabled {
-        &[
-            "user-available-symbolic",
-            "audio-input-microphone-symbolic",
-            "audio-input-microphone",
-        ]
-    } else {
-        &[
-            "user-offline-symbolic",
-            "audio-input-microphone-muted-symbolic",
-            "audio-input-microphone-muted",
-        ]
-    }
-}
-
-/// Tooltip for the voice-mode toggle by state (#78). Voice mode narrates and
-/// shapes replies for speech; entering it is a mode of interaction, so the copy
-/// frames it as talking by voice.
-fn voice_mode_tooltip_for(enabled: bool) -> &'static str {
-    if enabled {
-        "Voice mode on — replies are spoken and kept conversational. Click to go back to text."
-    } else {
-        "Voice mode off — text only. Click to talk by voice (replies spoken and shaped for the ear)."
-    }
 }
 
 /// Themed-icon fallback chain for the **resting (Idle)** mic glyph. The first
@@ -148,9 +145,9 @@ fn mic_icons_for(state: VoiceState) -> &'static [&'static str] {
     }
 }
 
-/// The mic button's tooltip for a given state, mirroring the plasmoid: "Stop
-/// speaking" while Speaking (the click barges in), otherwise "Push to talk"
-/// with the in-progress phase appended.
+/// The push-to-talk button's tooltip for a given state, mirroring the plasmoid:
+/// "Stop speaking" while Speaking (the click barges in), otherwise "Push to
+/// talk" with the in-progress phase appended.
 fn mic_tooltip_for(state: VoiceState) -> String {
     match state {
         VoiceState::Speaking => "Stop speaking".to_string(),
@@ -159,25 +156,24 @@ fn mic_tooltip_for(state: VoiceState) -> String {
     }
 }
 
+impl Default for InputBar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InputBar {
     pub fn new() -> Self {
-        let container = GtkBox::new(Orientation::Horizontal, 8);
+        // The bar is now vertical: an entry+Send row on top, a labeled
+        // voice-controls row underneath (issue #80).
+        let container = GtkBox::new(Orientation::Vertical, 4);
         container.set_margin_start(8);
         container.set_margin_end(8);
         container.set_margin_top(4);
         container.set_margin_bottom(8);
 
-        // Push-to-talk button, left of the text entry. Starts hidden; the
-        // window reveals it once the voice daemon is found on the bus.
-        let mic_image = Image::from_gicon(&gtk4::gio::ThemedIcon::from_names(MIC_IDLE_ICONS));
-        let mic_button = Button::new();
-        mic_button.set_child(Some(&mic_image));
-        mic_button.add_css_class("mic-button");
-        mic_button.set_valign(gtk4::Align::End);
-        mic_button.set_margin_bottom(4);
-        mic_button.set_tooltip_text(Some(&mic_tooltip_for(VoiceState::Idle)));
-        mic_button.set_visible(false);
-        container.append(&mic_button);
+        // --- Top row: text entry + Send ------------------------------------
+        let entry_row = GtkBox::new(Orientation::Horizontal, 8);
 
         let scrolled = ScrolledWindow::new();
         scrolled.set_hexpand(true);
@@ -192,91 +188,118 @@ impl InputBar {
         text_view.set_right_margin(12);
         text_view.add_css_class("input-textview");
         scrolled.set_child(Some(&text_view));
-        container.append(&scrolled);
-
-        // Per-conversation read-aloud toggle (issue #76, reframed in #78),
-        // between the entry and Send. Default OFF; the window sets the active
-        // conversation's state on switch via `set_speech_active`.
-        let speech_image =
-            Image::from_gicon(&gtk4::gio::ThemedIcon::from_names(speech_icons_for(false)));
-        let speech_button = ToggleButton::new();
-        speech_button.set_child(Some(&speech_image));
-        speech_button.add_css_class("speech-button");
-        speech_button.set_valign(gtk4::Align::End);
-        speech_button.set_margin_bottom(4);
-        speech_button.set_tooltip_text(Some(speech_tooltip_for(false)));
-        container.append(&speech_button);
-
-        // Per-conversation voice-mode toggle (issue #78), beside read-aloud.
-        // Default OFF; the window sets the active conversation's state on switch
-        // (and on a model `request_voice`/`stop_voice`) via
-        // `set_voice_mode_active`.
-        let voice_mode_image = Image::from_gicon(&gtk4::gio::ThemedIcon::from_names(
-            voice_mode_icons_for(false),
-        ));
-        let voice_mode_button = ToggleButton::new();
-        voice_mode_button.set_child(Some(&voice_mode_image));
-        voice_mode_button.add_css_class("voice-mode-button");
-        voice_mode_button.set_valign(gtk4::Align::End);
-        voice_mode_button.set_margin_bottom(4);
-        voice_mode_button.set_tooltip_text(Some(voice_mode_tooltip_for(false)));
-        container.append(&voice_mode_button);
+        entry_row.append(&scrolled);
 
         let send_button = Button::with_label("Send");
         send_button.add_css_class("send-button");
         send_button.set_valign(gtk4::Align::End);
-        send_button.set_margin_bottom(4);
-        container.append(&send_button);
+        entry_row.append(&send_button);
+        container.append(&entry_row);
 
-        let on_speech_toggled: Rc<RefCell<Option<SpeechToggledCb>>> = Rc::new(RefCell::new(None));
-        let on_voice_mode_toggled: Rc<RefCell<Option<VoiceModeToggledCb>>> =
+        // --- Voice-controls row (issue #80) --------------------------------
+        // A labeled row directly under the input: `You:` (input) and `Adele:`
+        // (output) dropdowns, visually matched, plus a push-to-talk button
+        // shown only while `You == Enabled`.
+        let voice_row = GtkBox::new(Orientation::Horizontal, 8);
+        voice_row.add_css_class("voice-controls-row");
+
+        // Lead-in label so the `You:` / `Adele:` dropdowns read unambiguously as
+        // voice controls rather than free-floating options (issue #80).
+        let voice_leadin = Label::new(Some("Voice:"));
+        voice_leadin.add_css_class("voice-controls-leadin");
+        voice_row.append(&voice_leadin);
+
+        let you_label = Label::new(Some("You:"));
+        you_label.add_css_class("voice-control-label");
+        voice_row.append(&you_label);
+
+        let voice_in_dropdown = DropDown::new(
+            Some(StringList::new(VOICE_IN_OPTIONS)),
+            gtk4::Expression::NONE,
+        );
+        voice_in_dropdown.add_css_class("voice-in-dropdown");
+        voice_in_dropdown.set_tooltip_text(Some(
+            "Voice input — Enabled offers a push-to-talk button to speak your turns.",
+        ));
+        voice_row.append(&voice_in_dropdown);
+
+        // Push-to-talk, right after the `You:` dropdown so it reads as part of
+        // that control. Hidden until `You == Enabled` AND capture is available.
+        let mic_image = Image::from_gicon(&gtk4::gio::ThemedIcon::from_names(MIC_IDLE_ICONS));
+        let mic_button = Button::new();
+        mic_button.set_child(Some(&mic_image));
+        mic_button.add_css_class("mic-button");
+        mic_button.set_tooltip_text(Some(&mic_tooltip_for(VoiceState::Idle)));
+        mic_button.set_visible(false);
+        voice_row.append(&mic_button);
+
+        let adele_label = Label::new(Some("Adele:"));
+        adele_label.add_css_class("voice-control-label");
+        adele_label.set_margin_start(12);
+        voice_row.append(&adele_label);
+
+        let adele_output_dropdown = DropDown::new(
+            Some(StringList::new(ADELE_OUTPUT_OPTIONS)),
+            gtk4::Expression::NONE,
+        );
+        adele_output_dropdown.add_css_class("adele-output-dropdown");
+        adele_output_dropdown.set_tooltip_text(Some(
+            "Voice output — On Demand speaks while you're talking by voice; Always reads every \
+             reply aloud.",
+        ));
+        voice_row.append(&adele_output_dropdown);
+
+        container.append(&voice_row);
+
+        let on_voice_in_changed: Rc<RefCell<Option<VoiceInChangedCb>>> =
             Rc::new(RefCell::new(None));
-        // A single re-entrancy guard for both toggles: a programmatic
+        let on_adele_output_changed: Rc<RefCell<Option<AdeleOutputChangedCb>>> =
+            Rc::new(RefCell::new(None));
+        // A single re-entrancy guard for both dropdowns: a programmatic
         // `set_*_active` must not echo a write back through its callback.
         let suppress = Rc::new(Cell::new(false));
+        let voice_available = Rc::new(Cell::new(false));
 
-        speech_button.connect_toggled(glib::clone!(
+        // `You:` dropdown changes: decode the new selection, toggle the
+        // push-to-talk button's visibility, and (unless suppressed) fire the
+        // user callback.
+        voice_in_dropdown.connect_selected_notify(glib::clone!(
             #[strong]
-            on_speech_toggled,
+            on_voice_in_changed,
             #[strong]
             suppress,
+            #[strong]
+            voice_available,
             #[weak]
-            speech_image,
-            move |btn| {
-                let enabled = btn.is_active();
-                // Always reflect the glyph/tooltip, even on a suppressed
-                // (programmatic) flip, so the button never lies about state.
-                speech_image.set_from_gicon(&gtk4::gio::ThemedIcon::from_names(speech_icons_for(
-                    enabled,
-                )));
-                btn.set_tooltip_text(Some(speech_tooltip_for(enabled)));
+            mic_button,
+            move |dd| {
+                let enabled = voice_in_from_index(dd.selected());
+                // Always reflect the push-to-talk visibility, even on a
+                // suppressed (programmatic) change, so the control never lies.
+                mic_button.set_visible(enabled && voice_available.get());
                 if suppress.get() {
                     return;
                 }
-                if let Some(cb) = on_speech_toggled.borrow().as_ref() {
+                if let Some(cb) = on_voice_in_changed.borrow().as_ref() {
                     cb(enabled);
                 }
             }
         ));
 
-        voice_mode_button.connect_toggled(glib::clone!(
+        // `Adele:` dropdown changes: decode the level and (unless suppressed)
+        // fire the user callback.
+        adele_output_dropdown.connect_selected_notify(glib::clone!(
             #[strong]
-            on_voice_mode_toggled,
+            on_adele_output_changed,
             #[strong]
             suppress,
-            #[weak]
-            voice_mode_image,
-            move |btn| {
-                let enabled = btn.is_active();
-                voice_mode_image.set_from_gicon(&gtk4::gio::ThemedIcon::from_names(
-                    voice_mode_icons_for(enabled),
-                ));
-                btn.set_tooltip_text(Some(voice_mode_tooltip_for(enabled)));
+            move |dd| {
+                let level = adele_output_from_index(dd.selected());
                 if suppress.get() {
                     return;
                 }
-                if let Some(cb) = on_voice_mode_toggled.borrow().as_ref() {
-                    cb(enabled);
+                if let Some(cb) = on_adele_output_changed.borrow().as_ref() {
+                    cb(level);
                 }
             }
         ));
@@ -287,74 +310,70 @@ impl InputBar {
             send_button,
             mic_button,
             mic_image,
-            speech_button,
-            speech_image,
-            on_speech_toggled,
-            voice_mode_button,
-            voice_mode_image,
-            on_voice_mode_toggled,
+            voice_available,
+            voice_in_dropdown,
+            on_voice_in_changed,
+            adele_output_dropdown,
+            on_adele_output_changed,
             suppress,
             state: Rc::new(Cell::new(VoiceState::Idle)),
         }
     }
 
-    /// Register the callback fired when the user flips the read-aloud toggle
-    /// (issue #76). The argument is the new per-conversation "read aloud" state.
-    pub fn connect_speech_toggled<F: Fn(bool) + 'static>(&self, f: F) {
-        *self.on_speech_toggled.borrow_mut() = Some(Box::new(f));
+    /// Register the callback fired when the user changes the `You:` dropdown
+    /// (issue #80). The argument is the new per-conversation voice-input state.
+    pub fn connect_voice_in_changed<F: Fn(bool) + 'static>(&self, f: F) {
+        *self.on_voice_in_changed.borrow_mut() = Some(Box::new(f));
     }
 
-    /// Reflect the active conversation's read-aloud state on the toggle WITHOUT
-    /// echoing a write back (issue #76). Called by the window on conversation
-    /// switch so the button always shows the conversation it belongs to —
-    /// per-conversation state, no cross-conversation bleed.
-    pub fn set_speech_active(&self, enabled: bool) {
+    /// Reflect the active conversation's voice-input state on the `You:`
+    /// dropdown WITHOUT echoing a write back (issue #80). Called by the window
+    /// on conversation switch so the dropdown always shows the conversation it
+    /// belongs to — per-conversation state, no cross-conversation bleed. Also
+    /// re-evaluates the push-to-talk button's visibility.
+    pub fn set_voice_in_active(&self, enabled: bool) {
         self.suppress.set(true);
-        self.speech_button.set_active(enabled);
-        // `connect_toggled` only fires on a *change*; ensure the glyph/tooltip
-        // are correct even when the value didn't change.
-        self.speech_image
-            .set_from_gicon(&gtk4::gio::ThemedIcon::from_names(speech_icons_for(
-                enabled,
-            )));
-        self.speech_button
-            .set_tooltip_text(Some(speech_tooltip_for(enabled)));
+        self.voice_in_dropdown.set_selected(voice_in_index(enabled));
+        // `connect_selected_notify` only fires on a *change*; ensure the
+        // push-to-talk visibility is correct even when the value didn't change.
+        self.mic_button
+            .set_visible(enabled && self.voice_available.get());
         self.suppress.set(false);
     }
 
-    /// Register the callback fired when the user flips the voice-mode toggle
-    /// (issue #78). The argument is the new per-conversation "voice mode" state.
-    pub fn connect_voice_mode_toggled<F: Fn(bool) + 'static>(&self, f: F) {
-        *self.on_voice_mode_toggled.borrow_mut() = Some(Box::new(f));
+    /// Register the callback fired when the user changes the `Adele:` dropdown
+    /// (issue #80). The argument is the new per-conversation output level.
+    pub fn connect_adele_output_changed<F: Fn(AdeleOutput) + 'static>(&self, f: F) {
+        *self.on_adele_output_changed.borrow_mut() = Some(Box::new(f));
     }
 
-    /// Reflect the active conversation's voice-mode state on the toggle WITHOUT
-    /// echoing a write back (issue #78). Called by the window on conversation
-    /// switch and when the model drives voice mode via `request_voice` /
-    /// `stop_voice`, so the button always tracks the conversation's state — no
-    /// cross-conversation bleed.
-    pub fn set_voice_mode_active(&self, enabled: bool) {
+    /// Reflect the active conversation's output level on the `Adele:` dropdown
+    /// WITHOUT echoing a write back (issue #80). Called by the window on
+    /// conversation switch and when the model drives the level via
+    /// `request_voice` / `stop_voice`, so the dropdown always tracks the
+    /// conversation's state — no cross-conversation bleed.
+    pub fn set_adele_output_active(&self, level: AdeleOutput) {
         self.suppress.set(true);
-        self.voice_mode_button.set_active(enabled);
-        self.voice_mode_image
-            .set_from_gicon(&gtk4::gio::ThemedIcon::from_names(voice_mode_icons_for(
-                enabled,
-            )));
-        self.voice_mode_button
-            .set_tooltip_text(Some(voice_mode_tooltip_for(enabled)));
+        self.adele_output_dropdown
+            .set_selected(adele_output_index(level));
         self.suppress.set(false);
     }
 
-    /// Show or hide the mic button based on whether the voice daemon is
-    /// reachable. Hidden when absent so the user isn't offered a dead control
-    /// (graceful degradation per issue #59).
+    /// Record whether voice capture is available on this machine and refresh the
+    /// push-to-talk button's visibility accordingly (issue #80, graceful
+    /// degradation per #59). When capture is unavailable the push-to-talk button
+    /// stays hidden even if `You == Enabled`, so the user is never offered a dead
+    /// control. The `Adele` output dropdown is independent and unaffected.
     pub fn set_voice_available(&self, available: bool) {
-        self.mic_button.set_visible(available);
+        self.voice_available.set(available);
+        // Show push-to-talk only when capture is available AND You == Enabled.
+        let you_enabled = voice_in_from_index(self.voice_in_dropdown.selected());
+        self.mic_button.set_visible(available && you_enabled);
     }
 
-    /// Reflect the voice pipeline state on the mic button: the icon swaps to
-    /// the per-state glyph (mirroring the plasmoid), a CSS class drives the
-    /// accent while a turn is active, and the tooltip explains the current
+    /// Reflect the voice pipeline state on the push-to-talk button: the icon
+    /// swaps to the per-state glyph (mirroring the plasmoid), a CSS class drives
+    /// the accent while a turn is active, and the tooltip explains the current
     /// phase. The state is also cached for the click handler's barge-in check
     /// (see [`InputBar::current_state`]).
     pub fn reflect_voice_state(&self, state: VoiceState) {
@@ -373,9 +392,9 @@ impl InputBar {
             .set_tooltip_text(Some(&mic_tooltip_for(state)));
     }
 
-    /// The last pipeline state reflected on the button. The window's click
-    /// handler uses this to choose barge-in (`Speaking` → `StopSpeaking`) vs.
-    /// starting a push-to-talk turn.
+    /// The last pipeline state reflected on the push-to-talk button. The
+    /// window's click handler uses this to choose barge-in (`Speaking` → stop)
+    /// vs. starting a push-to-talk turn.
     pub fn current_state(&self) -> VoiceState {
         self.state.get()
     }
@@ -431,56 +450,6 @@ mod tests {
     }
 
     #[test]
-    fn speech_toggle_icon_and_tooltip_reflect_enabled_state() {
-        // Issue #76: the glyph and tooltip must distinguish ON (a speaker that
-        // plays) from OFF (a muted speaker — the master cut-off).
-        assert_ne!(speech_icons_for(true)[0], speech_icons_for(false)[0]);
-        assert_eq!(speech_icons_for(true)[0], "audio-volume-high-symbolic");
-        assert_eq!(speech_icons_for(false)[0], "audio-volume-muted-symbolic");
-        assert!(!speech_icons_for(true).is_empty());
-        assert!(!speech_icons_for(false).is_empty());
-
-        // Issue #78 reframes the toggle to the read-aloud/accessibility framing:
-        // the tooltips now talk about reading replies aloud rather than the raw
-        // "speech enabled" wording, and remain distinct per state.
-        assert_ne!(speech_tooltip_for(true), speech_tooltip_for(false));
-        assert!(
-            speech_tooltip_for(true)
-                .to_lowercase()
-                .contains("read aloud")
-        );
-        assert!(
-            speech_tooltip_for(false)
-                .to_lowercase()
-                .contains("read aloud")
-        );
-    }
-
-    #[test]
-    fn voice_mode_toggle_icon_and_tooltip_reflect_state() {
-        // Issue #78: the voice-mode toggle is a distinct control from read-aloud;
-        // its glyph and tooltip must distinguish ON from OFF, and the ON tooltip
-        // makes clear replies are spoken + shaped for the ear.
-        assert_ne!(
-            voice_mode_icons_for(true)[0],
-            voice_mode_icons_for(false)[0]
-        );
-        assert!(!voice_mode_icons_for(true).is_empty());
-        assert!(!voice_mode_icons_for(false).is_empty());
-        assert_ne!(voice_mode_tooltip_for(true), voice_mode_tooltip_for(false));
-        assert!(
-            voice_mode_tooltip_for(true)
-                .to_lowercase()
-                .contains("voice")
-        );
-        assert!(
-            voice_mode_tooltip_for(false)
-                .to_lowercase()
-                .contains("voice")
-        );
-    }
-
-    #[test]
     fn each_state_maps_to_a_distinct_primary_icon() {
         // The first entry in each chain is the plasmoid glyph; they must differ
         // per state so the button visibly tracks the pipeline.
@@ -506,5 +475,44 @@ mod tests {
         ] {
             assert!(!mic_icons_for(state).is_empty());
         }
+    }
+
+    /// Issue #80: the `You:` dropdown index round-trips the voice-input bool —
+    /// index 0 == Disabled, index 1 == Enabled — and an out-of-range index
+    /// decodes to the safe Disabled default (no capture offered).
+    #[test]
+    fn voice_in_index_round_trips_and_defaults_disabled() {
+        assert_eq!(voice_in_index(false), 0);
+        assert_eq!(voice_in_index(true), 1);
+        assert!(!voice_in_from_index(0));
+        assert!(voice_in_from_index(1));
+        // Out-of-range → Disabled (the safe default).
+        assert!(!voice_in_from_index(99));
+        // The labels exist and match the indices.
+        assert_eq!(VOICE_IN_OPTIONS[0], "Disabled");
+        assert_eq!(VOICE_IN_OPTIONS[1], "Enabled");
+    }
+
+    /// Issue #80: the `Adele:` dropdown index round-trips every output level,
+    /// matching the label order, and an out-of-range index decodes to the safe
+    /// Disabled default (never speaks).
+    #[test]
+    fn adele_output_index_round_trips_and_defaults_disabled() {
+        for level in [
+            AdeleOutput::Disabled,
+            AdeleOutput::OnDemand,
+            AdeleOutput::Always,
+        ] {
+            assert_eq!(adele_output_from_index(adele_output_index(level)), level);
+        }
+        assert_eq!(adele_output_index(AdeleOutput::Disabled), 0);
+        assert_eq!(adele_output_index(AdeleOutput::OnDemand), 1);
+        assert_eq!(adele_output_index(AdeleOutput::Always), 2);
+        // Out-of-range → Disabled (the safe default).
+        assert_eq!(adele_output_from_index(99), AdeleOutput::Disabled);
+        // The labels exist and match the indices.
+        assert_eq!(ADELE_OUTPUT_OPTIONS[0], "Disabled");
+        assert_eq!(ADELE_OUTPUT_OPTIONS[1], "On Demand");
+        assert_eq!(ADELE_OUTPUT_OPTIONS[2], "Always");
     }
 }
