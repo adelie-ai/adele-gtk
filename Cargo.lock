@@ -6,6 +6,7 @@ version = 4
 name = "adele-gtk"
 version = "0.1.0"
 dependencies = [
+ "adele-voice-core",
  "adele-voice-module",
  "adele-voice-stt-whisper",
  "adele-voice-vad-silero",

@@ -153,6 +153,11 @@ pub trait Voice {
     /// matching [`VoiceProxy::push_to_talk`].
     fn push_to_talk_in_conversation(&self, conversation_id: &str) -> zbus::Result<()>;
 
+    /// Speak `text` through the daemon's warm TTS Speaker + audio sink (maps to
+    /// `SayText`). The daemon's `Speaker` is one-shot and applies a per-synth
+    /// timeout, so callers must hand it **one short sentence at a time**.
+    fn say_text(&self, text: &str) -> zbus::Result<()>;
+
     /// Stop any in-progress TTS playback (barge-in).
     fn stop_speaking(&self) -> zbus::Result<()>;
 
@@ -263,6 +268,22 @@ impl VoiceController {
             PttRoute::InConversation(id) => self.push_to_talk_in_conversation(&id).await,
             PttRoute::DaemonSession => self.push_to_talk().await,
         }
+    }
+
+    /// Speak `text` through the daemon's warm Speaker (maps to `SayText`).
+    ///
+    /// Routing narration through the daemon reuses its already-warm models +
+    /// shared audio sink, which is far faster than the in-process embedded
+    /// engine (the live timeout bug). The daemon's `Speaker` is **one-shot** and
+    /// applies a per-synth timeout, so the caller must hand this **one short
+    /// sentence at a time** (see [`crate::voice_embedded::into_speakable_sentences`]).
+    /// Errors (including "daemon absent") surface as `Err(String)` for the caller
+    /// to log/report; a `None` proxy is a graceful "unavailable".
+    pub async fn say(&self, text: String) -> Result<(), String> {
+        let Some(proxy) = &self.proxy else {
+            return Err("voice service unavailable".to_string());
+        };
+        proxy.say_text(&text).await.map_err(|e| e.to_string())
     }
 
     /// Stop any in-progress TTS playback (barge-in before re-listening).

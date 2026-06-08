@@ -1155,6 +1155,14 @@ impl AdelieWindow {
         // `&TransportClient` surface (`as_commands()`, `AssistantClient` RPCs).
         let client: Rc<RefCell<Option<Arc<Connector>>>> = Rc::new(RefCell::new(None));
 
+        // Handle to the standalone voice daemon (`org.desktopAssistant.Voice`),
+        // declared here — *before* the bridge — so the `handle_ui_message`
+        // executor can also reach it (issue #80): narration prefers the daemon's
+        // warm Speaker over the slow embedded engine. Populated later by
+        // `wire_voice_controls` (daemon path) once the async connect lands;
+        // until then it's `None` (and `Effect::Speak` falls back to embedded).
+        let voice: Rc<RefCell<Option<VoiceController>>> = Rc::new(RefCell::new(None));
+
         // Set up async bridge with UI message handler
         let bridge = AsyncBridge::new(glib::clone!(
             #[strong]
@@ -1182,6 +1190,8 @@ impl AdelieWindow {
             #[strong]
             embedded_voice,
             #[strong]
+            voice,
+            #[strong]
             voice_reply_pending,
             move |msg, ui_tx| {
                 handle_ui_message(
@@ -1198,6 +1208,7 @@ impl AdelieWindow {
                     &toast_revealer,
                     &toast_label,
                     &embedded_voice,
+                    &voice,
                     &voice_reply_pending,
                     ui_tx,
                 );
@@ -1210,8 +1221,9 @@ impl AdelieWindow {
         // orchestrator transport above. We connect once, share the handle so
         // both the mic button and the Settings → Voice tab can drive it, and
         // gate the UI on the daemon actually owning its bus name (graceful
-        // degradation when it isn't running / models aren't provisioned).
-        let voice: Rc<RefCell<Option<VoiceController>>> = Rc::new(RefCell::new(None));
+        // degradation when it isn't running / models aren't provisioned). The
+        // `voice` handle itself was declared above (before the bridge) so the
+        // `Effect::Speak` executor can prefer the daemon for narration (#80).
         // The daemon controls are wired only on the daemon path. In embedded
         // mode the mic button is driven in-process (wired in the send block
         // below, where it can reuse the send action) and shown immediately,
@@ -2352,6 +2364,61 @@ fn wire_embedded_mic(
     ));
 }
 
+/// Speak `text` aloud, daemon-first and chunked (issue #80).
+///
+/// Single entry point shared by every spoken-output site (reply narration and
+/// `say_this` asides) so routing + chunking live in one place:
+///
+/// 1. **Chunk.** `text` is split into one-short-sentence-per-call pieces via
+///    [`into_speakable_sentences`]. Both backends' synth is one-shot with a
+///    ~20s per-synth timeout, so feeding a long reply whole would blow it — the
+///    live bug this fixes.
+/// 2. **Route, daemon-first.** When a connected voice daemon is available, each
+///    sentence goes to its warm `SayText`; otherwise, if the embedded engine is
+///    present, to `EmbeddedVoice::say`; otherwise nothing is spoken. The backend
+///    is chosen **once** for the whole utterance (not per sentence) so playback
+///    never splits across engines.
+/// 3. **Order.** Sentences are awaited **sequentially**, so the daemon/embedded
+///    sink receives — and plays — them in order; they are never fired unordered.
+///
+/// Errors are reported once (the first failing sentence) via `ui_tx` and the
+/// rest of the utterance is abandoned, matching the prior single-shot behaviour.
+async fn speak_text(
+    voice: Option<VoiceController>,
+    embedded: Option<crate::voice_embedded::EmbeddedVoice>,
+    ui_tx: mpsc::UnboundedSender<UiMessage>,
+    text: String,
+) {
+    let sentences = crate::voice_embedded::into_speakable_sentences(&text);
+    if sentences.is_empty() {
+        return;
+    }
+
+    // Choose the backend once for the whole utterance: a daemon that has
+    // actually connected wins (warm models), else the in-process engine. Probing
+    // availability also avoids handing sentences to a daemon that vanished.
+    let daemon = match voice {
+        Some(controller) if controller.is_available().await => Some(controller),
+        _ => None,
+    };
+
+    for sentence in sentences {
+        let result = if let Some(controller) = &daemon {
+            controller.say(sentence).await
+        } else if let Some(engine) = &embedded {
+            engine.say(&sentence).await
+        } else {
+            // Neither backend present (daemon absent + no embedded engine):
+            // nothing to speak, and nothing more will become available mid-loop.
+            return;
+        };
+        if let Err(e) = result {
+            let _ = ui_tx.send(UiMessage::Error(format!("Voice: {e}")));
+            return;
+        }
+    }
+}
+
 /// Current wall-clock time in epoch milliseconds. Centralized so the
 /// task-panel callers all use the same units as `TaskView.started_at`.
 fn now_epoch_ms() -> i64 {
@@ -2377,6 +2444,7 @@ fn handle_ui_message(
     toast_revealer: &Rc<Revealer>,
     toast_label: &Rc<Label>,
     embedded_voice: &Rc<Option<crate::voice_embedded::EmbeddedVoice>>,
+    voice: &Rc<RefCell<Option<VoiceController>>>,
     voice_reply_pending: &Rc<Cell<bool>>,
     ui_tx: &mpsc::UnboundedSender<UiMessage>,
 ) {
@@ -2476,23 +2544,20 @@ fn handle_ui_message(
             }
             Effect::CompleteStreaming(full) => {
                 chat_view.borrow_mut().complete_streaming(&full);
-                // Embedded voice (issue #65): speak the reply only when this
-                // turn was started by the embedded mic button (so typed
-                // messages stay silent). The flag is consumed here; on the
-                // daemon path `embedded_voice` is `None` and the daemon speaks
-                // its own replies, so this is a no-op.
-                let engine = if voice_reply_pending.replace(false) {
-                    (**embedded_voice).clone()
-                } else {
-                    None
-                };
-                if let Some(engine) = engine {
+                // Voice (issues #65/#80): speak the reply only when this turn was
+                // started by the embedded mic button (so typed messages stay
+                // silent). The flag is consumed here. Narration is routed
+                // daemon-first and chunked through the shared `speak_text` helper
+                // (#80): on the embedded path `voice` is `None` so it uses the
+                // in-process engine; if a daemon is connected it speaks via the
+                // warm `SayText` instead — one short sentence per synth call.
+                if voice_reply_pending.replace(false) {
+                    let voice = voice.borrow().clone();
+                    let embedded = (**embedded_voice).clone();
                     let ui_tx = ui_tx.clone();
                     let reply = full.clone();
                     crate::async_bridge::spawn_on_runtime(async move {
-                        if let Err(e) = engine.say(&reply).await {
-                            let _ = ui_tx.send(UiMessage::Error(format!("Voice: {e}")));
-                        }
+                        speak_text(voice, embedded, ui_tx, reply).await;
                     });
                 }
             }
@@ -2560,20 +2625,20 @@ fn handle_ui_message(
                 side_pane.set_tasks(&rows);
             }
             Effect::Speak(text) => {
-                // Speak via the embedded engine. `apply` only emits this when
-                // the active conversation has speech ON, so this is the spoken
-                // path of both reply narration and a `say_this` aside. No-op on
-                // the daemon path (`embedded_voice` is `None` there — the daemon
-                // narrates its own replies), which keeps the master cut-off:
-                // audio is produced by exactly one engine.
-                if let Some(engine) = (**embedded_voice).clone() {
-                    let ui_tx = ui_tx.clone();
-                    crate::async_bridge::spawn_on_runtime(async move {
-                        if let Err(e) = engine.say(&text).await {
-                            let _ = ui_tx.send(UiMessage::Error(format!("Voice: {e}")));
-                        }
-                    });
-                }
+                // Spoken output, daemon-first + chunked (#80). `apply` only emits
+                // this when the active conversation has speech ON, so this is the
+                // spoken path of both reply narration and a `say_this` aside. The
+                // shared `speak_text` helper prefers a connected voice daemon's
+                // warm `SayText` and otherwise falls back to the embedded engine,
+                // chunking the text into one short sentence per synth call so a
+                // long reply can't trip the per-synth ~20s timeout. Audio is
+                // still produced by exactly one engine (daemon OR embedded).
+                let voice = voice.borrow().clone();
+                let embedded = (**embedded_voice).clone();
+                let ui_tx = ui_tx.clone();
+                crate::async_bridge::spawn_on_runtime(async move {
+                    speak_text(voice, embedded, ui_tx, text).await;
+                });
             }
             Effect::AddInlineNote(note) => {
                 chat_view.borrow_mut().add_inline_note(&note);
