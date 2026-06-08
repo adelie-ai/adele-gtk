@@ -885,20 +885,37 @@ mod tests {
         }
     }
 
-    /// Issue #78: the user-driven voice-mode toggle is its own `UiMessage`
-    /// (mirroring `SetSpeechEnabled`); its `Debug` must surface both fields so a
-    /// test panic stays informative.
+    /// Issue #80: the user-driven `You:` (voice input) dropdown is its own
+    /// `UiMessage`; its `Debug` must surface both fields so a test panic stays
+    /// informative.
     #[test]
-    fn set_voice_mode_debug_includes_conversation_and_enabled() {
+    fn set_voice_in_debug_includes_conversation_and_enabled() {
         let dbg = format!(
             "{:?}",
-            UiMessage::SetVoiceMode {
+            UiMessage::SetVoiceIn {
                 conversation_id: "conv-1".to_string(),
                 enabled: true,
             }
         );
-        assert!(dbg.contains("SetVoiceMode"), "got {dbg}");
+        assert!(dbg.contains("SetVoiceIn"), "got {dbg}");
         assert!(dbg.contains("conv-1"), "got {dbg}");
         assert!(dbg.contains("true"), "got {dbg}");
+    }
+
+    /// Issue #80: the user-driven `Adele:` (voice output) dropdown is its own
+    /// `UiMessage` carrying the three-way level; its `Debug` must surface both
+    /// the conversation and the level variant.
+    #[test]
+    fn set_adele_output_debug_includes_conversation_and_level() {
+        let dbg = format!(
+            "{:?}",
+            UiMessage::SetAdeleOutput {
+                conversation_id: "conv-2".to_string(),
+                level: AdeleOutput::Always,
+            }
+        );
+        assert!(dbg.contains("SetAdeleOutput"), "got {dbg}");
+        assert!(dbg.contains("conv-2"), "got {dbg}");
+        assert!(dbg.contains("Always"), "got {dbg}");
     }
 }

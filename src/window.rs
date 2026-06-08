@@ -3514,10 +3514,10 @@ mod tests {
         assert!(effects.is_empty());
     }
 
-    // --- Speech toggle + client tools (issue #76) ------------------------
+    // --- Voice UI: You/Adele dropdowns + client tools (issue #80) --------
 
-    /// A `say_this` client-tool call (#76). Convenience constructor for the
-    /// tests below.
+    /// A `say_this` client-tool call (#76, still used in #80). Convenience
+    /// constructor for the tests below.
     fn say_this_call(conversation_id: &str, text: &str) -> UiMessage {
         UiMessage::ClientToolCall {
             task_id: "task-1".to_string(),
@@ -3528,53 +3528,70 @@ mod tests {
         }
     }
 
-    /// Acceptance: the hard toggle defaults OFF for a conversation that was
-    /// never touched, so `speech_enabled_for_current` reports `false` and no
-    /// audio path can fire.
+    /// A `request_voice` / `stop_voice` client-tool call (#80). Convenience
+    /// constructor mirroring `say_this_call`.
+    fn voice_tool_call(conversation_id: &str, tool_name: &str) -> UiMessage {
+        UiMessage::ClientToolCall {
+            task_id: "task-v".to_string(),
+            conversation_id: conversation_id.to_string(),
+            tool_call_id: "call-v".to_string(),
+            tool_name: tool_name.to_string(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    /// A `WindowState` pinned to conversation `c1` with the given `You:` and
+    /// `Adele:` settings — the common test fixture for the gate tests below.
+    fn state_with(voice_in: bool, adele: AdeleOutput) -> WindowState {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        state.conversation_voice_in.insert("c1".to_string(), voice_in);
+        state.conversation_adele_output.insert("c1".to_string(), adele);
+        state
+    }
+
+    /// A `StreamComplete` for `c1` carrying `full_response`, against a freshly
+    /// pinned pending request — the reply-narration trigger.
+    fn stream_complete_in(state: &mut WindowState, full_response: &str) -> Vec<Effect> {
+        state.pending_request_id = Some("req".to_string());
+        state.current_conversation = Some(detail("c1", vec![]));
+        state.apply(UiMessage::StreamComplete {
+            request_id: "req".to_string(),
+            full_response: full_response.to_string(),
+        })
+    }
+
+    /// Default (You=Disabled, Adele=Disabled): both controls default off for an
+    /// untouched conversation, so no audio path can fire.
     #[test]
-    fn speech_toggle_defaults_off_per_conversation() {
+    fn defaults_are_voice_in_disabled_and_adele_disabled() {
         let state = WindowState {
             current_conversation_id: Some("c1".to_string()),
             ..Default::default()
         };
         assert!(
-            !state.speech_enabled_for_current(),
-            "speech must default OFF for an untouched conversation"
+            !state.voice_in_for_current(),
+            "You must default Disabled for an untouched conversation"
         );
-    }
-
-    /// `SetSpeechEnabled` records the flag per conversation and only affects
-    /// the named conversation — enabling speech in c1 must not enable it in c2
-    /// (no cross-conversation bleed).
-    #[test]
-    fn set_speech_enabled_is_scoped_to_its_conversation() {
-        let mut state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        let effects = state.apply(UiMessage::SetSpeechEnabled {
-            conversation_id: "c1".to_string(),
-            enabled: true,
-        });
-        assert!(effects.is_empty(), "toggling state emits no effects");
-        assert!(state.speech_enabled_for_current());
-        // Switch the active conversation to c2: it inherits the default OFF.
-        state.current_conversation_id = Some("c2".to_string());
+        assert_eq!(
+            state.adele_output_for_current(),
+            AdeleOutput::Disabled,
+            "Adele must default Disabled for an untouched conversation"
+        );
+        assert!(!state.narrate_for_current(), "default gate must be closed");
         assert!(
-            !state.speech_enabled_for_current(),
-            "enabling speech in c1 must not leak into c2"
+            !state.say_this_spoken_for_current(),
+            "default say_this must downgrade to inline"
         );
-        // And back to c1: still ON (sticks per conversation).
-        state.current_conversation_id = Some("c1".to_string());
-        assert!(state.speech_enabled_for_current());
     }
 
-    /// Acceptance: with speech OFF, a `say_this` call produces the inline
-    /// `(speech mode disabled) …` downgrade and ALWAYS a `SubmitClientToolResult`
-    /// — and crucially NO `Speak` effect (the master audio cut-off). The turn
-    /// completes (a result is posted), so it can't hang.
+    /// Default: a `say_this` produces the inline `(speech mode disabled) …`
+    /// downgrade, NO `Speak`, and ALWAYS a `SubmitClientToolResult` (the turn
+    /// completes, can't hang).
     #[test]
-    fn say_this_while_speech_off_renders_inline_and_resolves_without_audio() {
+    fn default_say_this_renders_inline_and_resolves_without_audio() {
         let mut state = WindowState {
             current_conversation_id: Some("c1".to_string()),
             ..Default::default()
@@ -3582,7 +3599,7 @@ mod tests {
         let effects = state.apply(say_this_call("c1", "the aside"));
         assert!(
             !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
-            "speech OFF must never produce a Speak effect: {effects:?}"
+            "Adele Disabled must never produce a Speak effect: {effects:?}"
         );
         let inline = effects.iter().any(
             |e| matches!(e, Effect::AddInlineNote(t) if t == "(speech mode disabled) the aside"),
@@ -3595,34 +3612,47 @@ mod tests {
                     if task_id == "task-1" && tool_call_id == "call-1"
             )
         });
-        assert!(
-            resolved,
-            "say_this must always resolve a result: {effects:?}"
-        );
+        assert!(resolved, "say_this must always resolve a result: {effects:?}");
     }
 
-    /// Acceptance: with speech ON, a `say_this` call speaks the text and
-    /// resolves the result `"spoken"`. No inline downgrade note.
+    /// Adele=Always: every reply is spoken (and finalized), independent of You.
     #[test]
-    fn say_this_while_speech_on_speaks_and_resolves_spoken() {
-        let mut state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        state
-            .conversation_speech_enabled
-            .insert("c1".to_string(), true);
+    fn adele_always_speaks_every_reply_regardless_of_you() {
+        for voice_in in [false, true] {
+            let mut state = state_with(voice_in, AdeleOutput::Always);
+            assert!(
+                state.narrate_for_current(),
+                "Always must narrate (You={voice_in})"
+            );
+            let effects = stream_complete_in(&mut state, "an answer");
+            assert!(
+                effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::Speak(t) if t == "an answer")),
+                "Always must speak the reply (You={voice_in}): {effects:?}"
+            );
+            assert!(
+                effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::CompleteStreaming(t) if t == "an answer")),
+                "the reply text must still be finalized: {effects:?}"
+            );
+        }
+    }
+
+    /// Adele=Always: a `say_this` aside is spoken (Adele ∈ {OnDemand, Always}).
+    #[test]
+    fn adele_always_speaks_say_this_aside() {
+        let mut state = state_with(false, AdeleOutput::Always);
         let effects = state.apply(say_this_call("c1", "hello aloud"));
         assert!(
             effects
                 .iter()
                 .any(|e| matches!(e, Effect::Speak(t) if t == "hello aloud")),
-            "speech ON must speak the aside: {effects:?}"
+            "Always must speak a say_this aside: {effects:?}"
         );
         assert!(
-            !effects
-                .iter()
-                .any(|e| matches!(e, Effect::AddInlineNote(_))),
+            !effects.iter().any(|e| matches!(e, Effect::AddInlineNote(_))),
             "no inline downgrade when spoken: {effects:?}"
         );
         assert!(
@@ -3634,37 +3664,155 @@ mod tests {
         );
     }
 
-    /// Master cut-off: even a `say_this` for the *active* conversation does not
-    /// speak while that conversation's toggle is OFF — and a `say_this` whose
-    /// conversation_id differs from the active one (stale / concurrent session)
-    /// is judged against the *active* conversation's toggle, never another's.
+    /// Adele=OnDemand + You=Enabled: the reply is spoken (the gate's OnDemand
+    /// arm) and finalized.
     #[test]
-    fn say_this_for_other_conversation_uses_active_toggle_no_bleed() {
-        let mut state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        // c2 has speech ON, but the active conversation is c1 (OFF). A call
-        // tagged c2 must NOT borrow c2's ON state to play audio on this client.
-        state
-            .conversation_speech_enabled
-            .insert("c2".to_string(), true);
-        let effects = state.apply(say_this_call("c2", "should not play"));
+    fn adele_on_demand_with_you_enabled_speaks_reply() {
+        let mut state = state_with(true, AdeleOutput::OnDemand);
+        assert!(state.narrate_for_current(), "OnDemand + You=Enabled narrates");
+        let effects = stream_complete_in(&mut state, "an answer");
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Speak(t) if t == "an answer")),
+            "OnDemand + You=Enabled must speak the reply: {effects:?}"
+        );
+    }
+
+    /// Adele=OnDemand + You=Disabled: the reply is NOT spoken (text-only), but a
+    /// `say_this` aside still speaks (asides ignore You).
+    #[test]
+    fn adele_on_demand_with_you_disabled_text_only_but_say_this_speaks() {
+        // Reply NOT narrated.
+        let mut state = state_with(false, AdeleOutput::OnDemand);
+        assert!(
+            !state.narrate_for_current(),
+            "OnDemand + You=Disabled must not narrate replies"
+        );
+        let effects = stream_complete_in(&mut state, "an answer");
         assert!(
             !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
-            "a call for a non-active conversation must not borrow its toggle: {effects:?}"
+            "OnDemand + You=Disabled must not speak the reply: {effects:?}"
         );
         assert!(
             effects
                 .iter()
-                .any(|e| matches!(e, Effect::SubmitClientToolResult { .. })),
-            "still always resolves: {effects:?}"
+                .any(|e| matches!(e, Effect::CompleteStreaming(t) if t == "an answer")),
+            "the reply text must still be finalized: {effects:?}"
+        );
+
+        // say_this aside STILL speaks (independent of You).
+        let mut state = state_with(false, AdeleOutput::OnDemand);
+        let effects = state.apply(say_this_call("c1", "an aside"));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Speak(t) if t == "an aside")),
+            "OnDemand say_this aside must speak even when You=Disabled: {effects:?}"
+        );
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::AddInlineNote(_))),
+            "no inline downgrade when spoken: {effects:?}"
         );
     }
 
-    /// Acceptance: a non-`say_this` client tool the GTK client can't run still
-    /// ALWAYS gets a result (an `Err`), so the suspended turn resumes rather
-    /// than wedging on a `PendingClientTool`.
+    /// `request_voice` sets Adele=OnDemand for the active conversation, reflects
+    /// the dropdown, and ALWAYS resolves a result (no audio by itself).
+    #[test]
+    fn request_voice_sets_on_demand_reflects_and_resolves() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(voice_tool_call("c1", "request_voice"));
+        assert_eq!(
+            state.adele_output_for_current(),
+            AdeleOutput::OnDemand,
+            "request_voice must set Adele=OnDemand for the active conversation"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetAdeleOutputDropdown(AdeleOutput::OnDemand))),
+            "request_voice must reflect OnDemand on the dropdown: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SubmitClientToolResult { task_id, tool_call_id, result: Ok(_) }
+                    if task_id == "task-v" && tool_call_id == "call-v"
+            )),
+            "request_voice must resolve an Ok result: {effects:?}"
+        );
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "request_voice itself must not speak: {effects:?}"
+        );
+    }
+
+    /// `stop_voice` sets Adele=Disabled, reflects the dropdown, and ALWAYS
+    /// resolves a result.
+    #[test]
+    fn stop_voice_sets_disabled_reflects_and_resolves() {
+        let mut state = state_with(true, AdeleOutput::Always);
+        let effects = state.apply(voice_tool_call("c1", "stop_voice"));
+        assert_eq!(
+            state.adele_output_for_current(),
+            AdeleOutput::Disabled,
+            "stop_voice must set Adele=Disabled"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetAdeleOutputDropdown(AdeleOutput::Disabled))),
+            "stop_voice must reflect Disabled on the dropdown: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SubmitClientToolResult { task_id, tool_call_id, result: Ok(_) }
+                    if task_id == "task-v" && tool_call_id == "call-v"
+            )),
+            "stop_voice must resolve an Ok result: {effects:?}"
+        );
+    }
+
+    /// Every client-tool call emits exactly one result (no wedge, no double),
+    /// across say_this / request_voice / stop_voice / an unknown tool.
+    #[test]
+    fn every_client_tool_call_emits_exactly_one_result() {
+        let calls = [
+            say_this_call("c1", "x"),
+            voice_tool_call("c1", "request_voice"),
+            voice_tool_call("c1", "stop_voice"),
+            UiMessage::ClientToolCall {
+                task_id: "t".to_string(),
+                conversation_id: "c1".to_string(),
+                tool_call_id: "tc".to_string(),
+                tool_name: "frobnicate".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        for call in calls {
+            let mut state = WindowState {
+                current_conversation_id: Some("c1".to_string()),
+                ..Default::default()
+            };
+            let effects = state.apply(call);
+            let results = effects
+                .iter()
+                .filter(|e| matches!(e, Effect::SubmitClientToolResult { .. }))
+                .count();
+            assert_eq!(
+                results, 1,
+                "exactly one result per client-tool call: {effects:?}"
+            );
+        }
+    }
+
+    /// An unknown client tool the GTK client can't run still ALWAYS gets an
+    /// `Err` result (no audio), so the suspended turn resumes rather than
+    /// wedging.
     #[test]
     fn unknown_client_tool_always_resolves_with_error_result() {
         let mut state = WindowState {
@@ -3693,17 +3841,10 @@ mod tests {
     }
 
     /// Malformed `say_this` arguments (missing/invalid `text`) must not panic
-    /// and must resolve with an `Err` result (never unwrap), so a hostile or
-    /// buggy payload can't wedge or crash the turn.
+    /// and must resolve with an `Err` result (never unwrap), even with Adele on.
     #[test]
     fn say_this_with_malformed_arguments_resolves_error_not_panic() {
-        let mut state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        state
-            .conversation_speech_enabled
-            .insert("c1".to_string(), true);
+        let mut state = state_with(true, AdeleOutput::Always);
         let effects = state.apply(UiMessage::ClientToolCall {
             task_id: "task-3".to_string(),
             conversation_id: "c1".to_string(),
@@ -3724,239 +3865,8 @@ mod tests {
         );
     }
 
-    /// Acceptance: reply narration is gated on the per-conversation toggle. With
-    /// speech ON, `StreamComplete` additionally emits a `Speak` of the reply;
-    /// with speech OFF it does not (only the normal text effects).
-    #[test]
-    fn reply_narration_is_gated_on_speech_toggle() {
-        // OFF → no Speak.
-        let mut off = WindowState {
-            pending_request_id: Some("req".to_string()),
-            current_conversation: Some(detail("c1", vec![])),
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        let effects = off.apply(UiMessage::StreamComplete {
-            request_id: "req".to_string(),
-            full_response: "an answer".to_string(),
-        });
-        assert!(
-            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
-            "speech OFF must not narrate the reply: {effects:?}"
-        );
-
-        // ON → Speak the reply (in addition to the usual text effects).
-        let mut on = WindowState {
-            pending_request_id: Some("req".to_string()),
-            current_conversation: Some(detail("c1", vec![])),
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        on.conversation_speech_enabled
-            .insert("c1".to_string(), true);
-        let effects = on.apply(UiMessage::StreamComplete {
-            request_id: "req".to_string(),
-            full_response: "an answer".to_string(),
-        });
-        assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::Speak(t) if t == "an answer")),
-            "speech ON must narrate the reply: {effects:?}"
-        );
-        // The normal text finalize must still happen.
-        assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::CompleteStreaming(t) if t == "an answer")),
-            "the reply text must still be finalized: {effects:?}"
-        );
-    }
-
-    // --- Voice mode (issue #78, phase-2) ---------------------------------
-
-    /// A `request_voice` / `stop_voice` client-tool call (#78). Convenience
-    /// constructor mirroring `say_this_call`.
-    fn voice_tool_call(conversation_id: &str, tool_name: &str) -> UiMessage {
-        UiMessage::ClientToolCall {
-            task_id: "task-v".to_string(),
-            conversation_id: conversation_id.to_string(),
-            tool_call_id: "call-v".to_string(),
-            tool_name: tool_name.to_string(),
-            arguments: serde_json::json!({}),
-        }
-    }
-
-    /// Acceptance: voice mode defaults OFF for an untouched conversation, so it
-    /// never narrates or shapes a reply until the user/model turns it on.
-    #[test]
-    fn voice_mode_defaults_off_per_conversation() {
-        let state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        assert!(
-            !state.voice_mode_for_current(),
-            "voice mode must default OFF for an untouched conversation"
-        );
-    }
-
-    /// Acceptance: read-aloud OFF + voice-mode OFF → a `StreamComplete` produces
-    /// NO `Speak` effect on any path (the both-off baseline == phase-1 OFF).
-    #[test]
-    fn reply_narration_silent_when_both_controls_off() {
-        let mut state = WindowState {
-            pending_request_id: Some("req".to_string()),
-            current_conversation: Some(detail("c1", vec![])),
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        let effects = state.apply(UiMessage::StreamComplete {
-            request_id: "req".to_string(),
-            full_response: "an answer".to_string(),
-        });
-        assert!(
-            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
-            "both controls OFF must never narrate: {effects:?}"
-        );
-    }
-
-    /// Acceptance: with read-aloud OFF but voice-mode ON, the reply is narrated
-    /// (the narration gate is read-aloud OR voice-mode), and the text still
-    /// finalizes.
-    #[test]
-    fn reply_narration_when_voice_mode_on_read_aloud_off() {
-        let mut state = WindowState {
-            pending_request_id: Some("req".to_string()),
-            current_conversation: Some(detail("c1", vec![])),
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        state.conversation_voice_mode.insert("c1".to_string(), true);
-        let effects = state.apply(UiMessage::StreamComplete {
-            request_id: "req".to_string(),
-            full_response: "an answer".to_string(),
-        });
-        assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::Speak(t) if t == "an answer")),
-            "voice-mode ON must narrate the reply: {effects:?}"
-        );
-        assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::CompleteStreaming(t) if t == "an answer")),
-            "the reply text must still be finalized: {effects:?}"
-        );
-    }
-
-    /// Acceptance: `request_voice` turns voice mode ON for the active
-    /// conversation and ALWAYS resolves a result.
-    #[test]
-    fn request_voice_turns_on_voice_mode_and_resolves() {
-        let mut state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        let effects = state.apply(voice_tool_call("c1", "request_voice"));
-        assert!(
-            state.voice_mode_for_current(),
-            "request_voice must turn voice mode ON for the active conversation"
-        );
-        assert!(
-            effects.iter().any(|e| matches!(
-                e,
-                Effect::SubmitClientToolResult { task_id, tool_call_id, result: Ok(_) }
-                    if task_id == "task-v" && tool_call_id == "call-v"
-            )),
-            "request_voice must resolve an Ok result: {effects:?}"
-        );
-        // Entering voice mode produces no audio by itself (only subsequent
-        // replies are narrated).
-        assert!(
-            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
-            "request_voice itself must not speak: {effects:?}"
-        );
-    }
-
-    /// Acceptance: `stop_voice` turns voice mode OFF and ALWAYS resolves a
-    /// result.
-    #[test]
-    fn stop_voice_turns_off_voice_mode_and_resolves() {
-        let mut state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        state.conversation_voice_mode.insert("c1".to_string(), true);
-        let effects = state.apply(voice_tool_call("c1", "stop_voice"));
-        assert!(
-            !state.voice_mode_for_current(),
-            "stop_voice must turn voice mode OFF"
-        );
-        assert!(
-            effects.iter().any(|e| matches!(
-                e,
-                Effect::SubmitClientToolResult { task_id, tool_call_id, result: Ok(_) }
-                    if task_id == "task-v" && tool_call_id == "call-v"
-            )),
-            "stop_voice must resolve an Ok result: {effects:?}"
-        );
-    }
-
-    /// Acceptance: voice mode is per-conversation — `request_voice` on c1 (the
-    /// active conversation) must not leak into c2, and it sticks for c1.
-    #[test]
-    fn voice_mode_is_scoped_per_conversation() {
-        let mut state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        state.apply(voice_tool_call("c1", "request_voice"));
-        assert!(state.voice_mode_for_current(), "c1 is in voice mode");
-        // Switch to c2: inherits the default OFF.
-        state.current_conversation_id = Some("c2".to_string());
-        assert!(
-            !state.voice_mode_for_current(),
-            "voice mode in c1 must not leak into c2"
-        );
-        // Back to c1: still ON (sticks per conversation).
-        state.current_conversation_id = Some("c1".to_string());
-        assert!(state.voice_mode_for_current());
-    }
-
-    /// The model gates voice mode against the ACTIVE conversation, mirroring the
-    /// say_this choice: a `request_voice` tagged for a non-active conversation
-    /// must not flip some other conversation's state, but must still resolve.
-    #[test]
-    fn request_voice_for_other_conversation_uses_active_no_bleed() {
-        let mut state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        // Tagged c2, but c1 is active: the active conversation (c1) is what the
-        // mode applies to — c2's state is never touched by a foreign call.
-        let effects = state.apply(voice_tool_call("c2", "request_voice"));
-        assert!(
-            state.voice_mode_for_current(),
-            "request_voice applies to the active conversation"
-        );
-        assert!(
-            !state.conversation_voice_mode.contains_key("c2"),
-            "a foreign-tagged call must not write c2's state: {:?}",
-            state.conversation_voice_mode
-        );
-        assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::SubmitClientToolResult { .. })),
-            "still always resolves: {effects:?}"
-        );
-    }
-
-    /// Acceptance: every `request_voice` / `stop_voice` call ALWAYS resolves
-    /// exactly one result even with malformed/no arguments — no panic, no wedge.
-    /// (These tools take no arguments, so a junk payload must be ignored.)
+    /// `request_voice` / `stop_voice` with malformed/non-object args still
+    /// resolve exactly one result without panicking (they take no arguments).
     #[test]
     fn voice_tools_with_malformed_args_resolve_without_panic() {
         for tool in ["request_voice", "stop_voice"] {
@@ -3971,126 +3881,192 @@ mod tests {
                 tool_name: tool.to_string(),
                 arguments: serde_json::json!("not-an-object"),
             });
-            let results: Vec<_> = effects
+            let results = effects
                 .iter()
                 .filter(|e| matches!(e, Effect::SubmitClientToolResult { .. }))
-                .collect();
-            assert_eq!(
-                results.len(),
-                1,
-                "{tool} must resolve exactly one result: {effects:?}"
-            );
+                .count();
+            assert_eq!(results, 1, "{tool} must resolve exactly one result: {effects:?}");
         }
     }
 
-    /// `say_this` audio is broadened to (read-aloud OR voice-mode): with
-    /// read-aloud OFF but voice-mode ON, a `say_this` is spoken (not downgraded).
+    /// Both controls are per-conversation and isolated: setting them on c1 must
+    /// not leak into c2, and they stick when switching back.
     #[test]
-    fn say_this_spoken_when_voice_mode_on_read_aloud_off() {
+    fn both_controls_are_per_conversation_isolated() {
         let mut state = WindowState {
             current_conversation_id: Some("c1".to_string()),
             ..Default::default()
         };
-        state.conversation_voice_mode.insert("c1".to_string(), true);
-        let effects = state.apply(say_this_call("c1", "hello aloud"));
-        assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::Speak(t) if t == "hello aloud")),
-            "voice-mode ON must speak a say_this aside: {effects:?}"
-        );
-        assert!(
-            !effects
-                .iter()
-                .any(|e| matches!(e, Effect::AddInlineNote(_))),
-            "no inline downgrade when spoken: {effects:?}"
-        );
-        assert!(
-            effects.iter().any(|e| matches!(
-                e,
-                Effect::SubmitClientToolResult { result: Ok(r), .. } if r == "spoken"
-            )),
-            "result must be \"spoken\": {effects:?}"
-        );
-    }
-
-    /// With BOTH read-aloud and voice-mode OFF, `say_this` still downgrades to
-    /// the inline note (no audio) — the both-off baseline.
-    #[test]
-    fn say_this_downgrades_when_both_controls_off() {
-        let mut state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        let effects = state.apply(say_this_call("c1", "the aside"));
-        assert!(
-            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
-            "both controls OFF must never speak a say_this: {effects:?}"
-        );
-        assert!(
-            effects.iter().any(
-                |e| matches!(e, Effect::AddInlineNote(t) if t == "(speech mode disabled) the aside")
-            ),
-            "expected the inline downgrade note: {effects:?}"
-        );
-    }
-
-    /// The voice-mode send shaping is a pure decision: when voice mode is ON for
-    /// the active conversation, a non-empty system refinement is used; when OFF,
-    /// none is. This is what the send path consults to choose
-    /// `send_prompt_with_system_refinement`.
-    #[test]
-    fn voice_mode_send_uses_system_refinement_only_when_on() {
-        // OFF → no refinement (plain send path).
-        let off = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        assert!(
-            refinement_for_send(&off).is_none(),
-            "voice mode OFF must not attach a system refinement"
-        );
-
-        // ON → the voice refinement constant is attached.
-        let mut on = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        on.conversation_voice_mode.insert("c1".to_string(), true);
-        assert_eq!(
-            refinement_for_send(&on),
-            Some(VOICE_SYSTEM_REFINEMENT),
-            "voice mode ON must attach the voice system refinement"
-        );
-        // The refinement is non-empty and free of markdown markers, so it can't
-        // leak formatting into a spoken reply.
-        assert!(!VOICE_SYSTEM_REFINEMENT.trim().is_empty());
-        for marker in ['*', '_', '`', '#'] {
-            assert!(
-                !VOICE_SYSTEM_REFINEMENT.contains(marker),
-                "the refinement itself must avoid markdown markers ({marker})"
-            );
-        }
-    }
-
-    /// A user-driven voice-mode flip (the UI button) records the per-conversation
-    /// state and emits no effects, mirroring `SetSpeechEnabled`.
-    #[test]
-    fn set_voice_mode_records_state_scoped_to_conversation() {
-        let mut state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        let effects = state.apply(UiMessage::SetVoiceMode {
+        state.apply(UiMessage::SetVoiceIn {
             conversation_id: "c1".to_string(),
             enabled: true,
         });
-        assert!(effects.is_empty(), "setting voice mode emits no effects");
-        assert!(state.voice_mode_for_current());
+        state.apply(UiMessage::SetAdeleOutput {
+            conversation_id: "c1".to_string(),
+            level: AdeleOutput::Always,
+        });
+        assert!(state.voice_in_for_current());
+        assert_eq!(state.adele_output_for_current(), AdeleOutput::Always);
+
+        // Switch to c2: both inherit their defaults (no bleed).
+        state.current_conversation_id = Some("c2".to_string());
+        assert!(!state.voice_in_for_current(), "You must not leak c1 → c2");
+        assert_eq!(
+            state.adele_output_for_current(),
+            AdeleOutput::Disabled,
+            "Adele must not leak c1 → c2"
+        );
+
+        // Back to c1: both stick.
+        state.current_conversation_id = Some("c1".to_string());
+        assert!(state.voice_in_for_current());
+        assert_eq!(state.adele_output_for_current(), AdeleOutput::Always);
+    }
+
+    /// A `request_voice` tagged for a non-active conversation applies to the
+    /// ACTIVE conversation (mirrors say_this's gating) and never writes the
+    /// foreign conversation's state — but still resolves.
+    #[test]
+    fn request_voice_for_other_conversation_uses_active_no_bleed() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(voice_tool_call("c2", "request_voice"));
+        assert_eq!(
+            state.adele_output_for_current(),
+            AdeleOutput::OnDemand,
+            "request_voice applies to the active conversation"
+        );
+        assert!(
+            !state.conversation_adele_output.contains_key("c2"),
+            "a foreign-tagged call must not write c2's state: {:?}",
+            state.conversation_adele_output
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SubmitClientToolResult { .. })),
+            "still always resolves: {effects:?}"
+        );
+    }
+
+    /// A `say_this` whose `conversation_id` differs from the active one is judged
+    /// against the *active* conversation's Adele level, never another's (no
+    /// cross-conversation bleed).
+    #[test]
+    fn say_this_for_other_conversation_uses_active_level_no_bleed() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        // c2 has Adele=Always, but the active conversation is c1 (Disabled). A
+        // call tagged c2 must NOT borrow c2's level to play audio on this client.
+        state
+            .conversation_adele_output
+            .insert("c2".to_string(), AdeleOutput::Always);
+        let effects = state.apply(say_this_call("c2", "should not play"));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "a call for a non-active conversation must not borrow its level: {effects:?}"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SubmitClientToolResult { .. })),
+            "still always resolves: {effects:?}"
+        );
+    }
+
+    /// `refinement_for_send` returns the right variant per (Adele level, You):
+    /// Disabled → none; OnDemand → the brief/conversational refinement; Always →
+    /// the speakable-but-full refinement. `You` does not change the refinement
+    /// (it's chosen by the Adele level), and both refinement strings are
+    /// non-empty and free of markdown markers so they can't leak formatting.
+    #[test]
+    fn refinement_for_send_returns_right_variant_per_level() {
+        // Disabled → none (independent of You).
+        for voice_in in [false, true] {
+            let state = state_with(voice_in, AdeleOutput::Disabled);
+            assert!(
+                refinement_for_send(&state).is_none(),
+                "Adele=Disabled must attach no refinement (You={voice_in})"
+            );
+        }
+        // OnDemand → the brief refinement (independent of You).
+        for voice_in in [false, true] {
+            let state = state_with(voice_in, AdeleOutput::OnDemand);
+            assert_eq!(
+                refinement_for_send(&state),
+                Some(ON_DEMAND_SYSTEM_REFINEMENT),
+                "Adele=OnDemand must attach the brief refinement (You={voice_in})"
+            );
+        }
+        // Always → the full refinement (independent of You).
+        for voice_in in [false, true] {
+            let state = state_with(voice_in, AdeleOutput::Always);
+            assert_eq!(
+                refinement_for_send(&state),
+                Some(ALWAYS_SYSTEM_REFINEMENT),
+                "Adele=Always must attach the full refinement (You={voice_in})"
+            );
+        }
+        // The two refinements differ, are non-empty, and carry no markdown.
+        assert_ne!(ON_DEMAND_SYSTEM_REFINEMENT, ALWAYS_SYSTEM_REFINEMENT);
+        // OnDemand asks for brevity; Always explicitly does not shorten.
+        assert!(ON_DEMAND_SYSTEM_REFINEMENT.to_lowercase().contains("brief"));
+        assert!(ALWAYS_SYSTEM_REFINEMENT.to_lowercase().contains("do not shorten"));
+        for refinement in [ON_DEMAND_SYSTEM_REFINEMENT, ALWAYS_SYSTEM_REFINEMENT] {
+            assert!(!refinement.trim().is_empty());
+            for marker in ['*', '_', '`', '#'] {
+                assert!(
+                    !refinement.contains(marker),
+                    "the refinement itself must avoid markdown markers ({marker})"
+                );
+            }
+        }
+    }
+
+    /// A user-driven `SetVoiceIn` records the per-conversation state and emits
+    /// no effects.
+    #[test]
+    fn set_voice_in_records_state_scoped_to_conversation() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::SetVoiceIn {
+            conversation_id: "c1".to_string(),
+            enabled: true,
+        });
+        assert!(effects.is_empty(), "setting You emits no effects");
+        assert!(state.voice_in_for_current());
         state.current_conversation_id = Some("c2".to_string());
         assert!(
-            !state.voice_mode_for_current(),
-            "voice mode set on c1 must not leak into c2"
+            !state.voice_in_for_current(),
+            "You set on c1 must not leak into c2"
+        );
+    }
+
+    /// A user-driven `SetAdeleOutput` records the per-conversation level and
+    /// emits no effects.
+    #[test]
+    fn set_adele_output_records_state_scoped_to_conversation() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::SetAdeleOutput {
+            conversation_id: "c1".to_string(),
+            level: AdeleOutput::OnDemand,
+        });
+        assert!(effects.is_empty(), "setting Adele emits no effects");
+        assert_eq!(state.adele_output_for_current(), AdeleOutput::OnDemand);
+        state.current_conversation_id = Some("c2".to_string());
+        assert_eq!(
+            state.adele_output_for_current(),
+            AdeleOutput::Disabled,
+            "Adele set on c1 must not leak into c2"
         );
     }
 }

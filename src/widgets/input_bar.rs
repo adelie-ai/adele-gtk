@@ -431,56 +431,6 @@ mod tests {
     }
 
     #[test]
-    fn speech_toggle_icon_and_tooltip_reflect_enabled_state() {
-        // Issue #76: the glyph and tooltip must distinguish ON (a speaker that
-        // plays) from OFF (a muted speaker — the master cut-off).
-        assert_ne!(speech_icons_for(true)[0], speech_icons_for(false)[0]);
-        assert_eq!(speech_icons_for(true)[0], "audio-volume-high-symbolic");
-        assert_eq!(speech_icons_for(false)[0], "audio-volume-muted-symbolic");
-        assert!(!speech_icons_for(true).is_empty());
-        assert!(!speech_icons_for(false).is_empty());
-
-        // Issue #78 reframes the toggle to the read-aloud/accessibility framing:
-        // the tooltips now talk about reading replies aloud rather than the raw
-        // "speech enabled" wording, and remain distinct per state.
-        assert_ne!(speech_tooltip_for(true), speech_tooltip_for(false));
-        assert!(
-            speech_tooltip_for(true)
-                .to_lowercase()
-                .contains("read aloud")
-        );
-        assert!(
-            speech_tooltip_for(false)
-                .to_lowercase()
-                .contains("read aloud")
-        );
-    }
-
-    #[test]
-    fn voice_mode_toggle_icon_and_tooltip_reflect_state() {
-        // Issue #78: the voice-mode toggle is a distinct control from read-aloud;
-        // its glyph and tooltip must distinguish ON from OFF, and the ON tooltip
-        // makes clear replies are spoken + shaped for the ear.
-        assert_ne!(
-            voice_mode_icons_for(true)[0],
-            voice_mode_icons_for(false)[0]
-        );
-        assert!(!voice_mode_icons_for(true).is_empty());
-        assert!(!voice_mode_icons_for(false).is_empty());
-        assert_ne!(voice_mode_tooltip_for(true), voice_mode_tooltip_for(false));
-        assert!(
-            voice_mode_tooltip_for(true)
-                .to_lowercase()
-                .contains("voice")
-        );
-        assert!(
-            voice_mode_tooltip_for(false)
-                .to_lowercase()
-                .contains("voice")
-        );
-    }
-
-    #[test]
     fn each_state_maps_to_a_distinct_primary_icon() {
         // The first entry in each chain is the plasmoid glyph; they must differ
         // per state so the button visibly tracks the pipeline.
@@ -506,5 +456,44 @@ mod tests {
         ] {
             assert!(!mic_icons_for(state).is_empty());
         }
+    }
+
+    /// Issue #80: the `You:` dropdown index round-trips the voice-input bool —
+    /// index 0 == Disabled, index 1 == Enabled — and an out-of-range index
+    /// decodes to the safe Disabled default (no capture offered).
+    #[test]
+    fn voice_in_index_round_trips_and_defaults_disabled() {
+        assert_eq!(voice_in_index(false), 0);
+        assert_eq!(voice_in_index(true), 1);
+        assert!(!voice_in_from_index(0));
+        assert!(voice_in_from_index(1));
+        // Out-of-range → Disabled (the safe default).
+        assert!(!voice_in_from_index(99));
+        // The labels exist and match the indices.
+        assert_eq!(VOICE_IN_OPTIONS[0], "Disabled");
+        assert_eq!(VOICE_IN_OPTIONS[1], "Enabled");
+    }
+
+    /// Issue #80: the `Adele:` dropdown index round-trips every output level,
+    /// matching the label order, and an out-of-range index decodes to the safe
+    /// Disabled default (never speaks).
+    #[test]
+    fn adele_output_index_round_trips_and_defaults_disabled() {
+        for level in [
+            AdeleOutput::Disabled,
+            AdeleOutput::OnDemand,
+            AdeleOutput::Always,
+        ] {
+            assert_eq!(adele_output_from_index(adele_output_index(level)), level);
+        }
+        assert_eq!(adele_output_index(AdeleOutput::Disabled), 0);
+        assert_eq!(adele_output_index(AdeleOutput::OnDemand), 1);
+        assert_eq!(adele_output_index(AdeleOutput::Always), 2);
+        // Out-of-range → Disabled (the safe default).
+        assert_eq!(adele_output_from_index(99), AdeleOutput::Disabled);
+        // The labels exist and match the indices.
+        assert_eq!(ADELE_OUTPUT_OPTIONS[0], "Disabled");
+        assert_eq!(ADELE_OUTPUT_OPTIONS[1], "On Demand");
+        assert_eq!(ADELE_OUTPUT_OPTIONS[2], "Always");
     }
 }
