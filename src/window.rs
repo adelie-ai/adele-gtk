@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -34,6 +35,25 @@ struct WindowState {
     pending_request_id: Option<String>,
     streaming_buffer: String,
     debug_enabled: bool,
+    /// Per-conversation hard "speech enabled" toggle (issue #76), keyed by
+    /// conversation id. Default (absent key) is **OFF** — the master cut-off,
+    /// so no path produces audio for a conversation until the user explicitly
+    /// enables speech for it. State is per-conversation, so enabling speech in
+    /// one conversation never leaks audio into another.
+    conversation_speech_enabled: HashMap<String, bool>,
+}
+
+impl WindowState {
+    /// Whether speech is hard-enabled for the *currently active* conversation.
+    /// `false` when there is no active conversation or the toggle was never set
+    /// (default OFF). The single gate every audio-producing path consults.
+    fn speech_enabled_for_current(&self) -> bool {
+        self.current_conversation_id
+            .as_deref()
+            .and_then(|id| self.conversation_speech_enabled.get(id))
+            .copied()
+            .unwrap_or(false)
+    }
 }
 
 /// A single observable side-effect produced by [`WindowState::apply`].
@@ -121,6 +141,27 @@ enum Effect {
     /// Recompute the side pane's task list from the authoritative `TasksModel`,
     /// filtered to the active conversation.
     RefreshSidePaneTasks,
+
+    // --- Speech toggle + client tools (issue #76) -------------------------
+    /// Speak `text` through the embedded `Speaker`. Emitted only when the
+    /// active conversation's speech toggle is ON (the executor still no-ops if
+    /// there is no embedded engine, e.g. the daemon path). The master audio
+    /// cut-off lives in `apply`: when speech is OFF this effect is never
+    /// produced, so no path plays audio while the toggle is off.
+    Speak(String),
+    /// Render an inline note in the chat transcript (issue #76). Used for the
+    /// `(speech mode disabled) …` downgrade when `say_this` arrives with speech
+    /// OFF, so the text is shown rather than dropped.
+    AddInlineNote(String),
+    /// Resolve a suspended client-tool call back to the daemon via
+    /// `submit_client_tool_result` so the parked turn resumes (issue #76). Every
+    /// `ClientToolCall` yields exactly one of these — `Ok` on success, `Err`
+    /// with a reason otherwise — which is what kills the silent-drop wedge.
+    SubmitClientToolResult {
+        task_id: String,
+        tool_call_id: String,
+        result: Result<String, String>,
+    },
 }
 
 // Manual `Debug` (can't derive: `Connector` is not `Debug`, mirroring
@@ -174,6 +215,18 @@ impl std::fmt::Debug for Effect {
                 f.debug_tuple("SidePaneSetScratchpad").field(n).finish()
             }
             Effect::RefreshSidePaneTasks => f.write_str("RefreshSidePaneTasks"),
+            Effect::Speak(t) => f.debug_tuple("Speak").field(t).finish(),
+            Effect::AddInlineNote(t) => f.debug_tuple("AddInlineNote").field(t).finish(),
+            Effect::SubmitClientToolResult {
+                task_id,
+                tool_call_id,
+                result,
+            } => f
+                .debug_struct("SubmitClientToolResult")
+                .field("task_id", task_id)
+                .field("tool_call_id", tool_call_id)
+                .field("result", result)
+                .finish(),
         }
     }
 }
@@ -491,6 +544,11 @@ impl WindowState {
                     vec![]
                 }
             }
+            // STUB (failing-tests commit): real handling lands in the
+            // implementation commit. Returning no effects makes the #76 tests
+            // fail on their assertions rather than fail to compile.
+            UiMessage::SetSpeechEnabled { .. } => vec![],
+            UiMessage::ClientToolCall { .. } => vec![],
             UiMessage::Disconnected { reason } => {
                 let mut effects = vec![
                     Effect::ClearClient,
@@ -790,6 +848,7 @@ impl AdelieWindow {
             pending_request_id: None,
             streaming_buffer: String::new(),
             debug_enabled: false,
+            conversation_speech_enabled: HashMap::new(),
         }));
 
         // Wrap widgets in Rc for closures
@@ -2143,6 +2202,10 @@ fn handle_ui_message(
                 let rows = tasks_panel.task_view_models_for(conv.as_deref(), now_epoch_ms());
                 side_pane.set_tasks(&rows);
             }
+            // STUBS (failing-tests commit): wired in the implementation commit.
+            Effect::Speak(_) => {}
+            Effect::AddInlineNote(_) => {}
+            Effect::SubmitClientToolResult { .. } => {}
         }
     }
 }
@@ -3084,5 +3147,264 @@ mod tests {
         });
         assert_eq!(state.current_conversation_id.as_deref(), Some("new-c"));
         assert!(effects.is_empty());
+    }
+
+    // --- Speech toggle + client tools (issue #76) ------------------------
+
+    /// A `say_this` client-tool call (#76). Convenience constructor for the
+    /// tests below.
+    fn say_this_call(conversation_id: &str, text: &str) -> UiMessage {
+        UiMessage::ClientToolCall {
+            task_id: "task-1".to_string(),
+            conversation_id: conversation_id.to_string(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "say_this".to_string(),
+            arguments: serde_json::json!({ "text": text }),
+        }
+    }
+
+    /// Acceptance: the hard toggle defaults OFF for a conversation that was
+    /// never touched, so `speech_enabled_for_current` reports `false` and no
+    /// audio path can fire.
+    #[test]
+    fn speech_toggle_defaults_off_per_conversation() {
+        let state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            !state.speech_enabled_for_current(),
+            "speech must default OFF for an untouched conversation"
+        );
+    }
+
+    /// `SetSpeechEnabled` records the flag per conversation and only affects
+    /// the named conversation — enabling speech in c1 must not enable it in c2
+    /// (no cross-conversation bleed).
+    #[test]
+    fn set_speech_enabled_is_scoped_to_its_conversation() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::SetSpeechEnabled {
+            conversation_id: "c1".to_string(),
+            enabled: true,
+        });
+        assert!(effects.is_empty(), "toggling state emits no effects");
+        assert!(state.speech_enabled_for_current());
+        // Switch the active conversation to c2: it inherits the default OFF.
+        state.current_conversation_id = Some("c2".to_string());
+        assert!(
+            !state.speech_enabled_for_current(),
+            "enabling speech in c1 must not leak into c2"
+        );
+        // And back to c1: still ON (sticks per conversation).
+        state.current_conversation_id = Some("c1".to_string());
+        assert!(state.speech_enabled_for_current());
+    }
+
+    /// Acceptance: with speech OFF, a `say_this` call produces the inline
+    /// `(speech mode disabled) …` downgrade and ALWAYS a `SubmitClientToolResult`
+    /// — and crucially NO `Speak` effect (the master audio cut-off). The turn
+    /// completes (a result is posted), so it can't hang.
+    #[test]
+    fn say_this_while_speech_off_renders_inline_and_resolves_without_audio() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(say_this_call("c1", "the aside"));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "speech OFF must never produce a Speak effect: {effects:?}"
+        );
+        let inline = effects.iter().any(
+            |e| matches!(e, Effect::AddInlineNote(t) if t == "(speech mode disabled) the aside"),
+        );
+        assert!(inline, "expected the inline downgrade note: {effects:?}");
+        let resolved = effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::SubmitClientToolResult { task_id, tool_call_id, result: Ok(_) }
+                    if task_id == "task-1" && tool_call_id == "call-1"
+            )
+        });
+        assert!(
+            resolved,
+            "say_this must always resolve a result: {effects:?}"
+        );
+    }
+
+    /// Acceptance: with speech ON, a `say_this` call speaks the text and
+    /// resolves the result `"spoken"`. No inline downgrade note.
+    #[test]
+    fn say_this_while_speech_on_speaks_and_resolves_spoken() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        state
+            .conversation_speech_enabled
+            .insert("c1".to_string(), true);
+        let effects = state.apply(say_this_call("c1", "hello aloud"));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Speak(t) if t == "hello aloud")),
+            "speech ON must speak the aside: {effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::AddInlineNote(_))),
+            "no inline downgrade when spoken: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SubmitClientToolResult { result: Ok(r), .. } if r == "spoken"
+            )),
+            "result must be \"spoken\": {effects:?}"
+        );
+    }
+
+    /// Master cut-off: even a `say_this` for the *active* conversation does not
+    /// speak while that conversation's toggle is OFF — and a `say_this` whose
+    /// conversation_id differs from the active one (stale / concurrent session)
+    /// is judged against the *active* conversation's toggle, never another's.
+    #[test]
+    fn say_this_for_other_conversation_uses_active_toggle_no_bleed() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        // c2 has speech ON, but the active conversation is c1 (OFF). A call
+        // tagged c2 must NOT borrow c2's ON state to play audio on this client.
+        state
+            .conversation_speech_enabled
+            .insert("c2".to_string(), true);
+        let effects = state.apply(say_this_call("c2", "should not play"));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "a call for a non-active conversation must not borrow its toggle: {effects:?}"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SubmitClientToolResult { .. })),
+            "still always resolves: {effects:?}"
+        );
+    }
+
+    /// Acceptance: a non-`say_this` client tool the GTK client can't run still
+    /// ALWAYS gets a result (an `Err`), so the suspended turn resumes rather
+    /// than wedging on a `PendingClientTool`.
+    #[test]
+    fn unknown_client_tool_always_resolves_with_error_result() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::ClientToolCall {
+            task_id: "task-2".to_string(),
+            conversation_id: "c1".to_string(),
+            tool_call_id: "call-2".to_string(),
+            tool_name: "frobnicate".to_string(),
+            arguments: serde_json::json!({}),
+        });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "an unknown tool must not produce audio: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SubmitClientToolResult { task_id, tool_call_id, result: Err(_) }
+                    if task_id == "task-2" && tool_call_id == "call-2"
+            )),
+            "an unrunnable tool must resolve with an Err result: {effects:?}"
+        );
+    }
+
+    /// Malformed `say_this` arguments (missing/invalid `text`) must not panic
+    /// and must resolve with an `Err` result (never unwrap), so a hostile or
+    /// buggy payload can't wedge or crash the turn.
+    #[test]
+    fn say_this_with_malformed_arguments_resolves_error_not_panic() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        state
+            .conversation_speech_enabled
+            .insert("c1".to_string(), true);
+        let effects = state.apply(UiMessage::ClientToolCall {
+            task_id: "task-3".to_string(),
+            conversation_id: "c1".to_string(),
+            tool_call_id: "call-3".to_string(),
+            tool_name: "say_this".to_string(),
+            // `text` missing entirely.
+            arguments: serde_json::json!({ "wrong": 5 }),
+        });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "malformed say_this must not speak: {effects:?}"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SubmitClientToolResult { result: Err(_), .. })),
+            "malformed say_this must resolve an Err result: {effects:?}"
+        );
+    }
+
+    /// Acceptance: reply narration is gated on the per-conversation toggle. With
+    /// speech ON, `StreamComplete` additionally emits a `Speak` of the reply;
+    /// with speech OFF it does not (only the normal text effects).
+    #[test]
+    fn reply_narration_is_gated_on_speech_toggle() {
+        // OFF → no Speak.
+        let mut off = WindowState {
+            pending_request_id: Some("req".to_string()),
+            current_conversation: Some(detail("c1", vec![])),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = off.apply(UiMessage::StreamComplete {
+            request_id: "req".to_string(),
+            full_response: "an answer".to_string(),
+        });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "speech OFF must not narrate the reply: {effects:?}"
+        );
+
+        // ON → Speak the reply (in addition to the usual text effects).
+        let mut on = WindowState {
+            pending_request_id: Some("req".to_string()),
+            current_conversation: Some(detail("c1", vec![])),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        on.conversation_speech_enabled
+            .insert("c1".to_string(), true);
+        let effects = on.apply(UiMessage::StreamComplete {
+            request_id: "req".to_string(),
+            full_response: "an answer".to_string(),
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Speak(t) if t == "an answer")),
+            "speech ON must narrate the reply: {effects:?}"
+        );
+        // The normal text finalize must still happen.
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::CompleteStreaming(t) if t == "an answer")),
+            "the reply text must still be finalized: {effects:?}"
+        );
     }
 }
