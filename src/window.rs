@@ -35,18 +35,37 @@ struct WindowState {
     pending_request_id: Option<String>,
     streaming_buffer: String,
     debug_enabled: bool,
-    /// Per-conversation hard "speech enabled" toggle (issue #76), keyed by
-    /// conversation id. Default (absent key) is **OFF** — the master cut-off,
-    /// so no path produces audio for a conversation until the user explicitly
-    /// enables speech for it. State is per-conversation, so enabling speech in
-    /// one conversation never leaks audio into another.
+    /// Per-conversation "read aloud" (accessibility) toggle (issue #76, reframed
+    /// in #78), keyed by conversation id. Default (absent key) is **OFF**. When
+    /// ON, every reply auto-routes to the Speaker (LLM-unaware). State is
+    /// per-conversation, so enabling it in one conversation never leaks audio
+    /// into another.
     conversation_speech_enabled: HashMap<String, bool>,
+    /// Per-conversation soft-sticky "voice mode" toggle (issue #78), keyed by
+    /// conversation id. Default (absent key) is **OFF**. Entered by the user
+    /// (UI) or the model (`request_voice`), left via UI or `stop_voice`. When
+    /// ON: replies are narrated (same routing as read-aloud) AND a concise
+    /// read-aloud `system_refinement` is attached on send. Independent of
+    /// read-aloud — either being ON narrates.
+    conversation_voice_mode: HashMap<String, bool>,
 }
 
+/// Concise read-aloud system refinement attached on send while voice mode is ON
+/// (issue #78). Mirrors the *essence* of the voice daemon's
+/// `spoken_response_hint` (brief, conversational, no markdown, symbols/acronyms
+/// spelled out, written for the ear) without duplicating its full paragraph.
+/// Deliberately free of markdown markers so it can't itself leak formatting.
+const VOICE_SYSTEM_REFINEMENT: &str = "This reply will be read aloud, so write it to be spoken, not read. Keep it brief and \
+     conversational, a few short sentences at most. Use no markdown or formatting of any kind, \
+     and no emoji. Spell out acronyms and abbreviations as full words and avoid symbols that do \
+     not read well aloud (say 'and' not an ampersand, 'percent' not a percent sign, 'dollars' not \
+     a dollar sign). Do not read out URLs, file paths, or email addresses; describe them in words \
+     instead, and write numbers, dates, and times the way you would say them.";
+
 impl WindowState {
-    /// Whether speech is hard-enabled for the *currently active* conversation.
+    /// Whether read-aloud is enabled for the *currently active* conversation.
     /// `false` when there is no active conversation or the toggle was never set
-    /// (default OFF). The single gate every audio-producing path consults.
+    /// (default OFF).
     fn speech_enabled_for_current(&self) -> bool {
         self.current_conversation_id
             .as_deref()
@@ -54,6 +73,63 @@ impl WindowState {
             .copied()
             .unwrap_or(false)
     }
+
+    /// Whether voice mode is on for the *currently active* conversation.
+    /// `false` when there is no active conversation or it was never set
+    /// (default OFF).
+    fn voice_mode_for_current(&self) -> bool {
+        self.current_conversation_id
+            .as_deref()
+            .and_then(|id| self.conversation_voice_mode.get(id))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Whether a reply is spoken for the active conversation: read-aloud OR
+    /// voice mode (issue #78). The single audio gate both reply narration and
+    /// `say_this` consult.
+    fn narrate_for_current(&self) -> bool {
+        self.speech_enabled_for_current() || self.voice_mode_for_current()
+    }
+}
+
+/// The read-aloud system refinement to attach on the next send, or `None` when
+/// voice mode is off for the active conversation (issue #78). Pure decision the
+/// send path consults to choose `send_prompt_with_system_refinement`. Free
+/// function (not a method) so the send closure can call it through a snapshot
+/// without holding a `WindowState` borrow across the await.
+fn refinement_for_send(state: &WindowState) -> Option<&'static str> {
+    state
+        .voice_mode_for_current()
+        .then_some(VOICE_SYSTEM_REFINEMENT)
+}
+
+/// The session-scoped client tools this client advertises so the model can
+/// enter/leave spoken voice mode (issue #78). Both take no arguments. Registered
+/// on connect; the daemon replaces the prior set on each call, so this is the
+/// full list, not a delta. (Phase-1's `say_this` is handled defensively without
+/// registration — the daemon forwards it regardless — so it is intentionally
+/// not advertised here.)
+fn voice_mode_client_tools() -> Vec<api::ClientToolRegistration> {
+    let no_args = serde_json::json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+    });
+    vec![
+        api::ClientToolRegistration {
+            name: "request_voice".to_string(),
+            description: "Switch this conversation into spoken voice mode (the user asked to talk \
+                 by voice); replies will be read aloud and kept conversational."
+                .to_string(),
+            input_schema: no_args.clone(),
+        },
+        api::ClientToolRegistration {
+            name: "stop_voice".to_string(),
+            description: "Leave voice mode; go back to text-only.".to_string(),
+            input_schema: no_args,
+        },
+    ]
 }
 
 /// Extract the `text` argument from a `say_this` client-tool call (issue #76).
@@ -166,6 +242,12 @@ enum Effect {
     /// `(speech mode disabled) …` downgrade when `say_this` arrives with speech
     /// OFF, so the text is shown rather than dropped.
     AddInlineNote(String),
+    /// Reflect the active conversation's voice-mode state on the input-bar
+    /// toggle (issue #78). Emitted when the model drives voice mode via
+    /// `request_voice` / `stop_voice` so the button tracks the model's change
+    /// (the user-driven path needs no echo — the button is its own write
+    /// source). Suppressed inside `set_voice_mode_active`, so it never loops.
+    SetVoiceModeButton(bool),
     /// Resolve a suspended client-tool call back to the daemon via
     /// `submit_client_tool_result` so the parked turn resumes (issue #76). Every
     /// `ClientToolCall` yields exactly one of these — `Ok` on success, `Err`
@@ -230,6 +312,7 @@ impl std::fmt::Debug for Effect {
             Effect::RefreshSidePaneTasks => f.write_str("RefreshSidePaneTasks"),
             Effect::Speak(t) => f.debug_tuple("Speak").field(t).finish(),
             Effect::AddInlineNote(t) => f.debug_tuple("AddInlineNote").field(t).finish(),
+            Effect::SetVoiceModeButton(b) => f.debug_tuple("SetVoiceModeButton").field(b).finish(),
             Effect::SubmitClientToolResult {
                 task_id,
                 tool_call_id,
@@ -408,14 +491,15 @@ impl WindowState {
                             content: full_response.clone(),
                         });
                     }
-                    // Reply narration (issue #76): when the active conversation
-                    // has speech hard-enabled, narrate the finalized reply via
-                    // the embedded `Speaker`. Gated entirely here so the master
-                    // cut-off holds — with speech OFF no `Speak` effect exists,
-                    // so no path plays audio. (The executor additionally no-ops
-                    // when there is no embedded engine, e.g. the daemon path,
-                    // which narrates its own replies.)
-                    let narrate = self.speech_enabled_for_current();
+                    // Reply narration (issue #76/#78): narrate the finalized
+                    // reply via the embedded `Speaker` when the active
+                    // conversation has read-aloud ON *or* voice mode ON. Gated
+                    // entirely here so the cut-off holds — with both OFF no
+                    // `Speak` effect exists, so no path plays audio. (The
+                    // executor additionally no-ops when there is no embedded
+                    // engine, e.g. the daemon path, which narrates its own
+                    // replies.)
+                    let narrate = self.narrate_for_current();
                     let mut effects = vec![Effect::ClearChatStatus];
                     if narrate {
                         effects.push(Effect::Speak(full_response.clone()));
@@ -570,10 +654,22 @@ impl WindowState {
                 conversation_id,
                 enabled,
             } => {
-                // Record the per-conversation hard toggle. Pure state change;
-                // the button already reflects itself (it is the write source).
-                // Keyed by conversation so it never bleeds across conversations.
+                // Record the per-conversation read-aloud toggle. Pure state
+                // change; the button already reflects itself (it is the write
+                // source). Keyed by conversation so it never bleeds across them.
                 self.conversation_speech_enabled
+                    .insert(conversation_id, enabled);
+                vec![]
+            }
+            UiMessage::SetVoiceMode {
+                conversation_id,
+                enabled,
+            } => {
+                // Record the per-conversation voice-mode toggle (issue #78).
+                // Pure state change; the button is the write source here (the
+                // user clicked it), so no UI reflection is needed. Keyed by
+                // conversation so it never bleeds across them.
+                self.conversation_voice_mode
                     .insert(conversation_id, enabled);
                 vec![]
             }
@@ -587,29 +683,27 @@ impl WindowState {
                 // ALWAYS resolve the call (issue #76) so the suspended turn
                 // resumes — the previous code dropped it and wedged the turn.
                 //
-                // `say_this` is the only tool this client honours. Note we gate
-                // on the *active* conversation's toggle, not the call's
-                // `conversation_id`: a say_this for some other (e.g. a
+                // We gate/apply against the *active* conversation, not the
+                // call's `conversation_id`: a tool call for some other (e.g. a
                 // concurrent voice session's) conversation must never borrow a
-                // different conversation's ON state to play audio on this
-                // client. With #261's session-scoped registration the daemon
-                // already scopes tools per session; this is the belt-and-braces
-                // local guard.
-                if tool_name == "say_this" {
-                    match say_this_text(&arguments) {
-                        Some(text) if self.speech_enabled_for_current() => {
-                            // Hard toggle ON → speak it.
-                            vec![
-                                Effect::Speak(text),
-                                Effect::SubmitClientToolResult {
-                                    task_id,
-                                    tool_call_id,
-                                    result: Ok("spoken".to_string()),
-                                },
-                            ]
-                        }
+                // different conversation's state on this client. With #261's
+                // session-scoped registration the daemon already scopes tools
+                // per session; this is the belt-and-braces local guard.
+                match tool_name.as_str() {
+                    "say_this" => match say_this_text(&arguments) {
+                        // Audio gate broadened in #78 to (read-aloud OR voice
+                        // mode): speak the aside when either is on for the
+                        // active conversation.
+                        Some(text) if self.narrate_for_current() => vec![
+                            Effect::Speak(text),
+                            Effect::SubmitClientToolResult {
+                                task_id,
+                                tool_call_id,
+                                result: Ok("spoken".to_string()),
+                            },
+                        ],
                         Some(text) => {
-                            // Hard toggle OFF → show, don't speak. The turn
+                            // Both controls OFF → show, don't speak. The turn
                             // still completes; no audio on any path.
                             let note = format!("(speech mode disabled) {text}");
                             vec![
@@ -634,15 +728,51 @@ impl WindowState {
                                 ),
                             }]
                         }
+                    },
+                    // The model asks to switch this conversation into spoken
+                    // voice mode (issue #78). Applies to the ACTIVE conversation
+                    // (consistent with say_this's active-conversation gating);
+                    // sticks until left. Reflect it on the button so the UI
+                    // tracks the model's change, and always resolve a result.
+                    // `request_voice` / `stop_voice` take no arguments, so a junk
+                    // payload is simply ignored — never a panic.
+                    "request_voice" => {
+                        if let Some(id) = self.current_conversation_id.clone() {
+                            self.conversation_voice_mode.insert(id, true);
+                        }
+                        vec![
+                            Effect::SetVoiceModeButton(true),
+                            Effect::SubmitClientToolResult {
+                                task_id,
+                                tool_call_id,
+                                result: Ok("voice mode on; replies will be read aloud and kept \
+                                     conversational"
+                                    .to_string()),
+                            },
+                        ]
                     }
-                } else {
-                    // Any other client tool: this client has no runtime for it,
-                    // but it must still be resolved or the turn wedges.
-                    vec![Effect::SubmitClientToolResult {
-                        task_id,
-                        tool_call_id,
-                        result: Err(format!("this client cannot run the tool \"{tool_name}\"")),
-                    }]
+                    "stop_voice" => {
+                        if let Some(id) = self.current_conversation_id.clone() {
+                            self.conversation_voice_mode.insert(id, false);
+                        }
+                        vec![
+                            Effect::SetVoiceModeButton(false),
+                            Effect::SubmitClientToolResult {
+                                task_id,
+                                tool_call_id,
+                                result: Ok("voice mode off; back to text-only".to_string()),
+                            },
+                        ]
+                    }
+                    _ => {
+                        // Any other client tool: this client has no runtime for
+                        // it, but it must still be resolved or the turn wedges.
+                        vec![Effect::SubmitClientToolResult {
+                            task_id,
+                            tool_call_id,
+                            result: Err(format!("this client cannot run the tool \"{tool_name}\"")),
+                        }]
+                    }
                 }
             }
             UiMessage::Disconnected { reason } => {
@@ -945,6 +1075,7 @@ impl AdelieWindow {
             streaming_buffer: String::new(),
             debug_enabled: false,
             conversation_speech_enabled: HashMap::new(),
+            conversation_voice_mode: HashMap::new(),
         }));
 
         // Wrap widgets in Rc for closures
@@ -1445,24 +1576,48 @@ impl AdelieWindow {
                     }
 
                     let override_selection = model_picker.current_override();
+                    // Voice-mode send shaping (issue #78): when the active
+                    // conversation is in voice mode, attach the read-aloud
+                    // system refinement so the reply is shaped for speech. This
+                    // travels in the system prompt for the turn only — never the
+                    // visible chat text. `None` when voice mode is off → an
+                    // empty refinement, i.e. the unchanged phase-1 send.
+                    let refinement = refinement_for_send(&state.borrow())
+                        .unwrap_or_default()
+                        .to_string();
 
                     if let Some(connector) = client.borrow().clone() {
                         let tx = bridge_ref.ui_sender();
                         let text = text.clone();
                         bridge_ref.spawn(async move {
                             let client = connector.client();
-                            // Use the command-channel override path when
-                            // available so the picker's selection is honoured.
-                            // The shared AssistantClient trait can't carry the
-                            // override because the D-Bus surface doesn't expose
-                            // it; on D-Bus we fall through to the plain
-                            // send_prompt.
-                            let result = match (client.as_commands(), override_selection) {
-                                (Some(cmds), Some(over)) => {
-                                    cmds.send_prompt_with_override(&conv_id, &text, Some(over))
+                            // Socket transports (UDS/WS) carry the model override
+                            // AND the system refinement together on the command
+                            // channel via `send_prompt_full`. The shared
+                            // AssistantClient trait exposes neither, so on D-Bus
+                            // we fall back to the Connector's
+                            // `send_prompt_with_system_refinement` (which folds
+                            // the refinement into the prompt; the override isn't
+                            // available over D-Bus regardless).
+                            let result = match client.as_commands() {
+                                Some(cmds) => {
+                                    cmds.send_prompt_full(
+                                        &conv_id,
+                                        &text,
+                                        override_selection,
+                                        refinement,
+                                    )
+                                    .await
+                                }
+                                None => {
+                                    connector
+                                        .send_prompt_with_system_refinement(
+                                            &conv_id,
+                                            &text,
+                                            &refinement,
+                                        )
                                         .await
                                 }
-                                _ => client.send_prompt(&conv_id, &text).await,
                             };
                             match result {
                                 Ok(task_id) => {
@@ -1539,6 +1694,27 @@ impl AdelieWindow {
                     return;
                 };
                 let _ = bridge.ui_sender().send(UiMessage::SetSpeechEnabled {
+                    conversation_id: conv_id,
+                    enabled,
+                });
+            }
+        ));
+
+        // Per-conversation voice-mode toggle (issue #78). A user flip routes a
+        // `SetVoiceMode` for the *current* conversation through the same handler
+        // so the pure `apply` records it. The `set_voice_mode_active` reflection
+        // on conversation switch / model drive is suppressed, so it never echoes
+        // back here. With no active conversation the flip is dropped.
+        input_bar.connect_voice_mode_toggled(glib::clone!(
+            #[strong]
+            state,
+            #[strong]
+            bridge,
+            move |enabled| {
+                let Some(conv_id) = state.borrow().current_conversation_id.clone() else {
+                    return;
+                };
+                let _ = bridge.ui_sender().send(UiMessage::SetVoiceMode {
                     conversation_id: conv_id,
                     enabled,
                 });
@@ -2185,6 +2361,22 @@ fn handle_ui_message(
     for effect in effects {
         match effect {
             Effect::SetClient(connector) => {
+                // Advertise gtk's session-scoped voice-mode client tools so the
+                // model can drive voice mode (issue #78). Registered once on
+                // connect; the Connector remembers + replays this set after an
+                // auto-reconnect (#246), so a daemon restart won't drop them.
+                // Socket-only (UDS/WS) — on a D-Bus transport this is a logged
+                // no-op (the daemon has no command channel for client tools),
+                // which is fine: voice mode still works as a local UI toggle.
+                let registration_connector = Arc::clone(&connector);
+                crate::async_bridge::spawn_on_runtime(async move {
+                    if let Err(e) = registration_connector
+                        .register_client_tools(voice_mode_client_tools())
+                        .await
+                    {
+                        tracing::debug!("voice-mode client tools not registered: {e}");
+                    }
+                });
                 *client.borrow_mut() = Some(connector);
             }
             Effect::ClearClient => {
@@ -2204,13 +2396,17 @@ fn handle_ui_message(
             }
             Effect::LoadConversationIntoChat(filtered) => {
                 chat_view.borrow_mut().load_conversation(&filtered);
-                // Reflect the newly-active conversation's speech toggle on the
-                // input bar (issue #76). `apply` has already pointed
-                // `current_conversation_id` at this conversation, so this reads
-                // the right per-conversation state. Suppressed inside
-                // `set_speech_active`, so it doesn't echo a write back.
-                let enabled = state.borrow().speech_enabled_for_current();
-                input_bar.set_speech_active(enabled);
+                // Reflect the newly-active conversation's read-aloud + voice-mode
+                // toggles on the input bar (issue #76/#78). `apply` has already
+                // pointed `current_conversation_id` at this conversation, so
+                // these read the right per-conversation state. Suppressed inside
+                // each setter, so they don't echo a write back.
+                let (read_aloud, voice_mode) = {
+                    let s = state.borrow();
+                    (s.speech_enabled_for_current(), s.voice_mode_for_current())
+                };
+                input_bar.set_speech_active(read_aloud);
+                input_bar.set_voice_mode_active(voice_mode);
             }
             Effect::ReloadConversation(id) => {
                 // Re-fetch an already-open conversation (reconnect / debug /
@@ -2346,6 +2542,12 @@ fn handle_ui_message(
             }
             Effect::AddInlineNote(note) => {
                 chat_view.borrow_mut().add_inline_note(&note);
+            }
+            Effect::SetVoiceModeButton(enabled) => {
+                // The model drove voice mode (request_voice / stop_voice);
+                // reflect it on the toggle. Suppressed inside, so it doesn't
+                // echo a `SetVoiceMode` write back through the user callback.
+                input_bar.set_voice_mode_active(enabled);
             }
             Effect::SubmitClientToolResult {
                 task_id,
@@ -3568,6 +3770,327 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::CompleteStreaming(t) if t == "an answer")),
             "the reply text must still be finalized: {effects:?}"
+        );
+    }
+
+    // --- Voice mode (issue #78, phase-2) ---------------------------------
+
+    /// A `request_voice` / `stop_voice` client-tool call (#78). Convenience
+    /// constructor mirroring `say_this_call`.
+    fn voice_tool_call(conversation_id: &str, tool_name: &str) -> UiMessage {
+        UiMessage::ClientToolCall {
+            task_id: "task-v".to_string(),
+            conversation_id: conversation_id.to_string(),
+            tool_call_id: "call-v".to_string(),
+            tool_name: tool_name.to_string(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    /// Acceptance: voice mode defaults OFF for an untouched conversation, so it
+    /// never narrates or shapes a reply until the user/model turns it on.
+    #[test]
+    fn voice_mode_defaults_off_per_conversation() {
+        let state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            !state.voice_mode_for_current(),
+            "voice mode must default OFF for an untouched conversation"
+        );
+    }
+
+    /// Acceptance: read-aloud OFF + voice-mode OFF → a `StreamComplete` produces
+    /// NO `Speak` effect on any path (the both-off baseline == phase-1 OFF).
+    #[test]
+    fn reply_narration_silent_when_both_controls_off() {
+        let mut state = WindowState {
+            pending_request_id: Some("req".to_string()),
+            current_conversation: Some(detail("c1", vec![])),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req".to_string(),
+            full_response: "an answer".to_string(),
+        });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "both controls OFF must never narrate: {effects:?}"
+        );
+    }
+
+    /// Acceptance: with read-aloud OFF but voice-mode ON, the reply is narrated
+    /// (the narration gate is read-aloud OR voice-mode), and the text still
+    /// finalizes.
+    #[test]
+    fn reply_narration_when_voice_mode_on_read_aloud_off() {
+        let mut state = WindowState {
+            pending_request_id: Some("req".to_string()),
+            current_conversation: Some(detail("c1", vec![])),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        state.conversation_voice_mode.insert("c1".to_string(), true);
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req".to_string(),
+            full_response: "an answer".to_string(),
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Speak(t) if t == "an answer")),
+            "voice-mode ON must narrate the reply: {effects:?}"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::CompleteStreaming(t) if t == "an answer")),
+            "the reply text must still be finalized: {effects:?}"
+        );
+    }
+
+    /// Acceptance: `request_voice` turns voice mode ON for the active
+    /// conversation and ALWAYS resolves a result.
+    #[test]
+    fn request_voice_turns_on_voice_mode_and_resolves() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(voice_tool_call("c1", "request_voice"));
+        assert!(
+            state.voice_mode_for_current(),
+            "request_voice must turn voice mode ON for the active conversation"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SubmitClientToolResult { task_id, tool_call_id, result: Ok(_) }
+                    if task_id == "task-v" && tool_call_id == "call-v"
+            )),
+            "request_voice must resolve an Ok result: {effects:?}"
+        );
+        // Entering voice mode produces no audio by itself (only subsequent
+        // replies are narrated).
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "request_voice itself must not speak: {effects:?}"
+        );
+    }
+
+    /// Acceptance: `stop_voice` turns voice mode OFF and ALWAYS resolves a
+    /// result.
+    #[test]
+    fn stop_voice_turns_off_voice_mode_and_resolves() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        state.conversation_voice_mode.insert("c1".to_string(), true);
+        let effects = state.apply(voice_tool_call("c1", "stop_voice"));
+        assert!(
+            !state.voice_mode_for_current(),
+            "stop_voice must turn voice mode OFF"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SubmitClientToolResult { task_id, tool_call_id, result: Ok(_) }
+                    if task_id == "task-v" && tool_call_id == "call-v"
+            )),
+            "stop_voice must resolve an Ok result: {effects:?}"
+        );
+    }
+
+    /// Acceptance: voice mode is per-conversation — `request_voice` on c1 (the
+    /// active conversation) must not leak into c2, and it sticks for c1.
+    #[test]
+    fn voice_mode_is_scoped_per_conversation() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        state.apply(voice_tool_call("c1", "request_voice"));
+        assert!(state.voice_mode_for_current(), "c1 is in voice mode");
+        // Switch to c2: inherits the default OFF.
+        state.current_conversation_id = Some("c2".to_string());
+        assert!(
+            !state.voice_mode_for_current(),
+            "voice mode in c1 must not leak into c2"
+        );
+        // Back to c1: still ON (sticks per conversation).
+        state.current_conversation_id = Some("c1".to_string());
+        assert!(state.voice_mode_for_current());
+    }
+
+    /// The model gates voice mode against the ACTIVE conversation, mirroring the
+    /// say_this choice: a `request_voice` tagged for a non-active conversation
+    /// must not flip some other conversation's state, but must still resolve.
+    #[test]
+    fn request_voice_for_other_conversation_uses_active_no_bleed() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        // Tagged c2, but c1 is active: the active conversation (c1) is what the
+        // mode applies to — c2's state is never touched by a foreign call.
+        let effects = state.apply(voice_tool_call("c2", "request_voice"));
+        assert!(
+            state.voice_mode_for_current(),
+            "request_voice applies to the active conversation"
+        );
+        assert!(
+            !state.conversation_voice_mode.contains_key("c2"),
+            "a foreign-tagged call must not write c2's state: {:?}",
+            state.conversation_voice_mode
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SubmitClientToolResult { .. })),
+            "still always resolves: {effects:?}"
+        );
+    }
+
+    /// Acceptance: every `request_voice` / `stop_voice` call ALWAYS resolves
+    /// exactly one result even with malformed/no arguments — no panic, no wedge.
+    /// (These tools take no arguments, so a junk payload must be ignored.)
+    #[test]
+    fn voice_tools_with_malformed_args_resolve_without_panic() {
+        for tool in ["request_voice", "stop_voice"] {
+            let mut state = WindowState {
+                current_conversation_id: Some("c1".to_string()),
+                ..Default::default()
+            };
+            let effects = state.apply(UiMessage::ClientToolCall {
+                task_id: "t".to_string(),
+                conversation_id: "c1".to_string(),
+                tool_call_id: "tc".to_string(),
+                tool_name: tool.to_string(),
+                arguments: serde_json::json!("not-an-object"),
+            });
+            let results: Vec<_> = effects
+                .iter()
+                .filter(|e| matches!(e, Effect::SubmitClientToolResult { .. }))
+                .collect();
+            assert_eq!(
+                results.len(),
+                1,
+                "{tool} must resolve exactly one result: {effects:?}"
+            );
+        }
+    }
+
+    /// `say_this` audio is broadened to (read-aloud OR voice-mode): with
+    /// read-aloud OFF but voice-mode ON, a `say_this` is spoken (not downgraded).
+    #[test]
+    fn say_this_spoken_when_voice_mode_on_read_aloud_off() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        state.conversation_voice_mode.insert("c1".to_string(), true);
+        let effects = state.apply(say_this_call("c1", "hello aloud"));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Speak(t) if t == "hello aloud")),
+            "voice-mode ON must speak a say_this aside: {effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::AddInlineNote(_))),
+            "no inline downgrade when spoken: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SubmitClientToolResult { result: Ok(r), .. } if r == "spoken"
+            )),
+            "result must be \"spoken\": {effects:?}"
+        );
+    }
+
+    /// With BOTH read-aloud and voice-mode OFF, `say_this` still downgrades to
+    /// the inline note (no audio) — the both-off baseline.
+    #[test]
+    fn say_this_downgrades_when_both_controls_off() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(say_this_call("c1", "the aside"));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "both controls OFF must never speak a say_this: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(
+                |e| matches!(e, Effect::AddInlineNote(t) if t == "(speech mode disabled) the aside")
+            ),
+            "expected the inline downgrade note: {effects:?}"
+        );
+    }
+
+    /// The voice-mode send shaping is a pure decision: when voice mode is ON for
+    /// the active conversation, a non-empty system refinement is used; when OFF,
+    /// none is. This is what the send path consults to choose
+    /// `send_prompt_with_system_refinement`.
+    #[test]
+    fn voice_mode_send_uses_system_refinement_only_when_on() {
+        // OFF → no refinement (plain send path).
+        let off = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            refinement_for_send(&off).is_none(),
+            "voice mode OFF must not attach a system refinement"
+        );
+
+        // ON → the voice refinement constant is attached.
+        let mut on = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        on.conversation_voice_mode.insert("c1".to_string(), true);
+        assert_eq!(
+            refinement_for_send(&on),
+            Some(VOICE_SYSTEM_REFINEMENT),
+            "voice mode ON must attach the voice system refinement"
+        );
+        // The refinement is non-empty and free of markdown markers, so it can't
+        // leak formatting into a spoken reply.
+        assert!(!VOICE_SYSTEM_REFINEMENT.trim().is_empty());
+        for marker in ['*', '_', '`', '#'] {
+            assert!(
+                !VOICE_SYSTEM_REFINEMENT.contains(marker),
+                "the refinement itself must avoid markdown markers ({marker})"
+            );
+        }
+    }
+
+    /// A user-driven voice-mode flip (the UI button) records the per-conversation
+    /// state and emits no effects, mirroring `SetSpeechEnabled`.
+    #[test]
+    fn set_voice_mode_records_state_scoped_to_conversation() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::SetVoiceMode {
+            conversation_id: "c1".to_string(),
+            enabled: true,
+        });
+        assert!(effects.is_empty(), "setting voice mode emits no effects");
+        assert!(state.voice_mode_for_current());
+        state.current_conversation_id = Some("c2".to_string());
+        assert!(
+            !state.voice_mode_for_current(),
+            "voice mode set on c1 must not leak into c2"
         );
     }
 }

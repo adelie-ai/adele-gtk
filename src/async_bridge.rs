@@ -161,6 +161,18 @@ pub enum UiMessage {
         enabled: bool,
     },
 
+    // --- Voice mode (issue #78, phase-2) ----------------------------------
+    /// The user flipped the per-conversation soft-sticky "voice mode" toggle in
+    /// the input bar (the model drives the same state via the `request_voice` /
+    /// `stop_voice` client tools). Carries the conversation it belongs to and
+    /// the new state. Default is OFF. When ON, replies are narrated (same
+    /// routing as read-aloud) AND a concise read-aloud `system_refinement` is
+    /// attached on send so replies are shaped for speech. See issue #78.
+    SetVoiceMode {
+        conversation_id: String,
+        enabled: bool,
+    },
+
     // --- Client-local tool calls (issue #76) ------------------------------
     /// The daemon suspended a turn on a client-local tool call and is waiting
     /// for this client to post the outcome (#107/#231). Carried verbatim from
@@ -301,6 +313,14 @@ impl std::fmt::Debug for UiMessage {
                 enabled,
             } => f
                 .debug_struct("SetSpeechEnabled")
+                .field("conversation_id", conversation_id)
+                .field("enabled", enabled)
+                .finish(),
+            UiMessage::SetVoiceMode {
+                conversation_id,
+                enabled,
+            } => f
+                .debug_struct("SetVoiceMode")
                 .field("conversation_id", conversation_id)
                 .field("enabled", enabled)
                 .finish(),
@@ -863,5 +883,22 @@ mod tests {
             }
             other => panic!("expected ClientToolCall, got {other:?}"),
         }
+    }
+
+    /// Issue #78: the user-driven voice-mode toggle is its own `UiMessage`
+    /// (mirroring `SetSpeechEnabled`); its `Debug` must surface both fields so a
+    /// test panic stays informative.
+    #[test]
+    fn set_voice_mode_debug_includes_conversation_and_enabled() {
+        let dbg = format!(
+            "{:?}",
+            UiMessage::SetVoiceMode {
+                conversation_id: "conv-1".to_string(),
+                enabled: true,
+            }
+        );
+        assert!(dbg.contains("SetVoiceMode"), "got {dbg}");
+        assert!(dbg.contains("conv-1"), "got {dbg}");
+        assert!(dbg.contains("true"), "got {dbg}");
     }
 }
