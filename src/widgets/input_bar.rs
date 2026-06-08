@@ -326,10 +326,44 @@ mod tests {
         assert!(!speech_icons_for(true).is_empty());
         assert!(!speech_icons_for(false).is_empty());
 
-        // The OFF tooltip must make the cut-off explicit ("no audio").
-        assert!(speech_tooltip_for(false).contains("no audio"));
-        assert!(speech_tooltip_for(true).contains("may speak"));
+        // Issue #78 reframes the toggle to the read-aloud/accessibility framing:
+        // the tooltips now talk about reading replies aloud rather than the raw
+        // "speech enabled" wording, and remain distinct per state.
         assert_ne!(speech_tooltip_for(true), speech_tooltip_for(false));
+        assert!(
+            speech_tooltip_for(true)
+                .to_lowercase()
+                .contains("read aloud")
+        );
+        assert!(
+            speech_tooltip_for(false)
+                .to_lowercase()
+                .contains("read aloud")
+        );
+    }
+
+    #[test]
+    fn voice_mode_toggle_icon_and_tooltip_reflect_state() {
+        // Issue #78: the voice-mode toggle is a distinct control from read-aloud;
+        // its glyph and tooltip must distinguish ON from OFF, and the ON tooltip
+        // makes clear replies are spoken + shaped for the ear.
+        assert_ne!(
+            voice_mode_icons_for(true)[0],
+            voice_mode_icons_for(false)[0]
+        );
+        assert!(!voice_mode_icons_for(true).is_empty());
+        assert!(!voice_mode_icons_for(false).is_empty());
+        assert_ne!(voice_mode_tooltip_for(true), voice_mode_tooltip_for(false));
+        assert!(
+            voice_mode_tooltip_for(true)
+                .to_lowercase()
+                .contains("voice")
+        );
+        assert!(
+            voice_mode_tooltip_for(false)
+                .to_lowercase()
+                .contains("voice")
+        );
     }
 
     #[test]

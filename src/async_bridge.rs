@@ -864,4 +864,21 @@ mod tests {
             other => panic!("expected ClientToolCall, got {other:?}"),
         }
     }
+
+    /// Issue #78: the user-driven voice-mode toggle is its own `UiMessage`
+    /// (mirroring `SetSpeechEnabled`); its `Debug` must surface both fields so a
+    /// test panic stays informative.
+    #[test]
+    fn set_voice_mode_debug_includes_conversation_and_enabled() {
+        let dbg = format!(
+            "{:?}",
+            UiMessage::SetVoiceMode {
+                conversation_id: "conv-1".to_string(),
+                enabled: true,
+            }
+        );
+        assert!(dbg.contains("SetVoiceMode"), "got {dbg}");
+        assert!(dbg.contains("conv-1"), "got {dbg}");
+        assert!(dbg.contains("true"), "got {dbg}");
+    }
 }

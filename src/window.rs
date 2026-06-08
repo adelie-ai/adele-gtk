@@ -3570,4 +3570,325 @@ mod tests {
             "the reply text must still be finalized: {effects:?}"
         );
     }
+
+    // --- Voice mode (issue #78, phase-2) ---------------------------------
+
+    /// A `request_voice` / `stop_voice` client-tool call (#78). Convenience
+    /// constructor mirroring `say_this_call`.
+    fn voice_tool_call(conversation_id: &str, tool_name: &str) -> UiMessage {
+        UiMessage::ClientToolCall {
+            task_id: "task-v".to_string(),
+            conversation_id: conversation_id.to_string(),
+            tool_call_id: "call-v".to_string(),
+            tool_name: tool_name.to_string(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    /// Acceptance: voice mode defaults OFF for an untouched conversation, so it
+    /// never narrates or shapes a reply until the user/model turns it on.
+    #[test]
+    fn voice_mode_defaults_off_per_conversation() {
+        let state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            !state.voice_mode_for_current(),
+            "voice mode must default OFF for an untouched conversation"
+        );
+    }
+
+    /// Acceptance: read-aloud OFF + voice-mode OFF → a `StreamComplete` produces
+    /// NO `Speak` effect on any path (the both-off baseline == phase-1 OFF).
+    #[test]
+    fn reply_narration_silent_when_both_controls_off() {
+        let mut state = WindowState {
+            pending_request_id: Some("req".to_string()),
+            current_conversation: Some(detail("c1", vec![])),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req".to_string(),
+            full_response: "an answer".to_string(),
+        });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "both controls OFF must never narrate: {effects:?}"
+        );
+    }
+
+    /// Acceptance: with read-aloud OFF but voice-mode ON, the reply is narrated
+    /// (the narration gate is read-aloud OR voice-mode), and the text still
+    /// finalizes.
+    #[test]
+    fn reply_narration_when_voice_mode_on_read_aloud_off() {
+        let mut state = WindowState {
+            pending_request_id: Some("req".to_string()),
+            current_conversation: Some(detail("c1", vec![])),
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        state.conversation_voice_mode.insert("c1".to_string(), true);
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req".to_string(),
+            full_response: "an answer".to_string(),
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Speak(t) if t == "an answer")),
+            "voice-mode ON must narrate the reply: {effects:?}"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::CompleteStreaming(t) if t == "an answer")),
+            "the reply text must still be finalized: {effects:?}"
+        );
+    }
+
+    /// Acceptance: `request_voice` turns voice mode ON for the active
+    /// conversation and ALWAYS resolves a result.
+    #[test]
+    fn request_voice_turns_on_voice_mode_and_resolves() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(voice_tool_call("c1", "request_voice"));
+        assert!(
+            state.voice_mode_for_current(),
+            "request_voice must turn voice mode ON for the active conversation"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SubmitClientToolResult { task_id, tool_call_id, result: Ok(_) }
+                    if task_id == "task-v" && tool_call_id == "call-v"
+            )),
+            "request_voice must resolve an Ok result: {effects:?}"
+        );
+        // Entering voice mode produces no audio by itself (only subsequent
+        // replies are narrated).
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "request_voice itself must not speak: {effects:?}"
+        );
+    }
+
+    /// Acceptance: `stop_voice` turns voice mode OFF and ALWAYS resolves a
+    /// result.
+    #[test]
+    fn stop_voice_turns_off_voice_mode_and_resolves() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        state.conversation_voice_mode.insert("c1".to_string(), true);
+        let effects = state.apply(voice_tool_call("c1", "stop_voice"));
+        assert!(
+            !state.voice_mode_for_current(),
+            "stop_voice must turn voice mode OFF"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SubmitClientToolResult { task_id, tool_call_id, result: Ok(_) }
+                    if task_id == "task-v" && tool_call_id == "call-v"
+            )),
+            "stop_voice must resolve an Ok result: {effects:?}"
+        );
+    }
+
+    /// Acceptance: voice mode is per-conversation — `request_voice` on c1 (the
+    /// active conversation) must not leak into c2, and it sticks for c1.
+    #[test]
+    fn voice_mode_is_scoped_per_conversation() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        state.apply(voice_tool_call("c1", "request_voice"));
+        assert!(state.voice_mode_for_current(), "c1 is in voice mode");
+        // Switch to c2: inherits the default OFF.
+        state.current_conversation_id = Some("c2".to_string());
+        assert!(
+            !state.voice_mode_for_current(),
+            "voice mode in c1 must not leak into c2"
+        );
+        // Back to c1: still ON (sticks per conversation).
+        state.current_conversation_id = Some("c1".to_string());
+        assert!(state.voice_mode_for_current());
+    }
+
+    /// The model gates voice mode against the ACTIVE conversation, mirroring the
+    /// say_this choice: a `request_voice` tagged for a non-active conversation
+    /// must not flip some other conversation's state, but must still resolve.
+    #[test]
+    fn request_voice_for_other_conversation_uses_active_no_bleed() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        // Tagged c2, but c1 is active: the active conversation (c1) is what the
+        // mode applies to — c2's state is never touched by a foreign call.
+        let effects = state.apply(voice_tool_call("c2", "request_voice"));
+        assert!(
+            state.voice_mode_for_current(),
+            "request_voice applies to the active conversation"
+        );
+        assert!(
+            !state.conversation_voice_mode.contains_key("c2"),
+            "a foreign-tagged call must not write c2's state: {:?}",
+            state.conversation_voice_mode
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SubmitClientToolResult { .. })),
+            "still always resolves: {effects:?}"
+        );
+    }
+
+    /// Acceptance: every `request_voice` / `stop_voice` call ALWAYS resolves
+    /// exactly one result even with malformed/no arguments — no panic, no wedge.
+    /// (These tools take no arguments, so a junk payload must be ignored.)
+    #[test]
+    fn voice_tools_with_malformed_args_resolve_without_panic() {
+        for tool in ["request_voice", "stop_voice"] {
+            let mut state = WindowState {
+                current_conversation_id: Some("c1".to_string()),
+                ..Default::default()
+            };
+            let effects = state.apply(UiMessage::ClientToolCall {
+                task_id: "t".to_string(),
+                conversation_id: "c1".to_string(),
+                tool_call_id: "tc".to_string(),
+                tool_name: tool.to_string(),
+                arguments: serde_json::json!("not-an-object"),
+            });
+            let results: Vec<_> = effects
+                .iter()
+                .filter(|e| matches!(e, Effect::SubmitClientToolResult { .. }))
+                .collect();
+            assert_eq!(
+                results.len(),
+                1,
+                "{tool} must resolve exactly one result: {effects:?}"
+            );
+        }
+    }
+
+    /// `say_this` audio is broadened to (read-aloud OR voice-mode): with
+    /// read-aloud OFF but voice-mode ON, a `say_this` is spoken (not downgraded).
+    #[test]
+    fn say_this_spoken_when_voice_mode_on_read_aloud_off() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        state.conversation_voice_mode.insert("c1".to_string(), true);
+        let effects = state.apply(say_this_call("c1", "hello aloud"));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Speak(t) if t == "hello aloud")),
+            "voice-mode ON must speak a say_this aside: {effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::AddInlineNote(_))),
+            "no inline downgrade when spoken: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SubmitClientToolResult { result: Ok(r), .. } if r == "spoken"
+            )),
+            "result must be \"spoken\": {effects:?}"
+        );
+    }
+
+    /// With BOTH read-aloud and voice-mode OFF, `say_this` still downgrades to
+    /// the inline note (no audio) — the both-off baseline.
+    #[test]
+    fn say_this_downgrades_when_both_controls_off() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(say_this_call("c1", "the aside"));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "both controls OFF must never speak a say_this: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(
+                |e| matches!(e, Effect::AddInlineNote(t) if t == "(speech mode disabled) the aside")
+            ),
+            "expected the inline downgrade note: {effects:?}"
+        );
+    }
+
+    /// The voice-mode send shaping is a pure decision: when voice mode is ON for
+    /// the active conversation, a non-empty system refinement is used; when OFF,
+    /// none is. This is what the send path consults to choose
+    /// `send_prompt_with_system_refinement`.
+    #[test]
+    fn voice_mode_send_uses_system_refinement_only_when_on() {
+        // OFF → no refinement (plain send path).
+        let off = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            refinement_for_send(&off).is_none(),
+            "voice mode OFF must not attach a system refinement"
+        );
+
+        // ON → the voice refinement constant is attached.
+        let mut on = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        on.conversation_voice_mode.insert("c1".to_string(), true);
+        assert_eq!(
+            refinement_for_send(&on),
+            Some(VOICE_SYSTEM_REFINEMENT),
+            "voice mode ON must attach the voice system refinement"
+        );
+        // The refinement is non-empty and free of markdown markers, so it can't
+        // leak formatting into a spoken reply.
+        assert!(!VOICE_SYSTEM_REFINEMENT.trim().is_empty());
+        for marker in ['*', '_', '`', '#'] {
+            assert!(
+                !VOICE_SYSTEM_REFINEMENT.contains(marker),
+                "the refinement itself must avoid markdown markers ({marker})"
+            );
+        }
+    }
+
+    /// A user-driven voice-mode flip (the UI button) records the per-conversation
+    /// state and emits no effects, mirroring `SetSpeechEnabled`.
+    #[test]
+    fn set_voice_mode_records_state_scoped_to_conversation() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::SetVoiceMode {
+            conversation_id: "c1".to_string(),
+            enabled: true,
+        });
+        assert!(effects.is_empty(), "setting voice mode emits no effects");
+        assert!(state.voice_mode_for_current());
+        state.current_conversation_id = Some("c2".to_string());
+        assert!(
+            !state.voice_mode_for_current(),
+            "voice mode set on c1 must not leak into c2"
+        );
+    }
 }
