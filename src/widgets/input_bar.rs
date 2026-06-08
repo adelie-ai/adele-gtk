@@ -9,9 +9,13 @@ use gtk4::{
 
 use crate::voice_client::VoiceState;
 
-/// Callback fired when the user flips the speech toggle (issue #76). The bool
-/// is the new "speech enabled" state for the active conversation.
+/// Callback fired when the user flips the read-aloud toggle (issue #76/#78). The
+/// bool is the new "read aloud" state for the active conversation.
 type SpeechToggledCb = Box<dyn Fn(bool)>;
+
+/// Callback fired when the user flips the voice-mode toggle (issue #78). The
+/// bool is the new "voice mode" state for the active conversation.
+type VoiceModeToggledCb = Box<dyn Fn(bool)>;
 
 /// Input bar widget with a record/mic button, a text view, and a send button.
 pub struct InputBar {
@@ -26,18 +30,31 @@ pub struct InputBar {
     pub mic_button: Button,
     /// The mic icon, swapped per pipeline state to mirror the plasmoid's glyphs.
     mic_image: Image,
-    /// Per-conversation hard "speech enabled" toggle (issue #76). Default OFF.
-    /// When OFF, no path produces audio; when ON, the assistant may narrate
-    /// replies and `say_this` is spoken. The window owns the authoritative
+    /// Per-conversation "read aloud" (accessibility) toggle (issue #76, reframed
+    /// in #78). Default OFF. LLM-unaware: when ON every reply auto-routes to the
+    /// Speaker and `say_this` is spoken. The window owns the authoritative
     /// per-conversation state and drives `set_speech_active` on conversation
     /// switch; this button is the affordance + write source.
     pub speech_button: ToggleButton,
-    /// The speaker glyph on the toggle, swapped on/off.
+    /// The speaker glyph on the read-aloud toggle, swapped on/off.
     speech_image: Image,
-    /// User callback for toggle flips. Guarded by `suppress` so a programmatic
-    /// `set_speech_active` (on conversation switch) does not echo a write back.
+    /// User callback for read-aloud toggle flips. Guarded by `suppress` so a
+    /// programmatic `set_speech_active` (on conversation switch) does not echo a
+    /// write back.
     on_speech_toggled: Rc<RefCell<Option<SpeechToggledCb>>>,
-    /// Re-entrancy guard for `set_speech_active`, mirroring `voice_tab`.
+    /// Per-conversation soft-sticky "voice mode" toggle (issue #78). Default OFF.
+    /// The model drives the same state via `request_voice` / `stop_voice`; this
+    /// button lets the user enter/leave it directly. When ON, replies are
+    /// narrated AND shaped for speech (a read-aloud `system_refinement` on send).
+    pub voice_mode_button: ToggleButton,
+    /// The voice-mode glyph, swapped on/off.
+    voice_mode_image: Image,
+    /// User callback for voice-mode toggle flips. Guarded by `suppress` so a
+    /// programmatic `set_voice_mode_active` (on conversation switch / model
+    /// drive) does not echo a write back.
+    on_voice_mode_toggled: Rc<RefCell<Option<VoiceModeToggledCb>>>,
+    /// Re-entrancy guard shared by `set_speech_active` and
+    /// `set_voice_mode_active`, mirroring `voice_tab`.
     suppress: Rc<Cell<bool>>,
     /// The last pipeline state reflected on the button. The window's click
     /// handler reads it to decide barge-in (click while `Speaking` →
@@ -45,9 +62,9 @@ pub struct InputBar {
     state: Rc<Cell<VoiceState>>,
 }
 
-/// Themed-icon fallback chain for the speech toggle, by enabled state (#76).
+/// Themed-icon fallback chain for the read-aloud toggle, by enabled state (#76).
 /// ON shows a speaker with sound; OFF shows a muted speaker, mirroring the
-/// "audio never plays while off" master cut-off.
+/// "audio never plays while off" cut-off.
 fn speech_icons_for(enabled: bool) -> &'static [&'static str] {
     if enabled {
         &["audio-volume-high-symbolic", "audio-volume-high"]
@@ -56,13 +73,44 @@ fn speech_icons_for(enabled: bool) -> &'static [&'static str] {
     }
 }
 
-/// Tooltip for the speech toggle by state (#76). The toggle is the hard
-/// master cut-off, so the copy makes the consequence explicit.
+/// Tooltip for the read-aloud (accessibility) toggle by state (#76, reframed in
+/// #78). Read-aloud auto-narrates every reply when ON; the copy uses the
+/// accessibility framing rather than the raw "speech enabled" wording.
 fn speech_tooltip_for(enabled: bool) -> &'static str {
     if enabled {
-        "Speech enabled — Adele may speak replies in this conversation. Click to mute."
+        "Read aloud — narrate every reply in this conversation. Click to mute."
     } else {
-        "Speech disabled — no audio plays in this conversation. Click to enable."
+        "Read aloud is off — replies are not read aloud in this conversation. Click to enable."
+    }
+}
+
+/// Themed-icon fallback chain for the voice-mode toggle, by state (#78). ON
+/// shows a chat-bubble/voice glyph; OFF shows a muted variant — distinct from
+/// the read-aloud speaker glyphs so the two controls read as separate.
+fn voice_mode_icons_for(enabled: bool) -> &'static [&'static str] {
+    if enabled {
+        &[
+            "user-available-symbolic",
+            "audio-input-microphone-symbolic",
+            "audio-input-microphone",
+        ]
+    } else {
+        &[
+            "user-offline-symbolic",
+            "audio-input-microphone-muted-symbolic",
+            "audio-input-microphone-muted",
+        ]
+    }
+}
+
+/// Tooltip for the voice-mode toggle by state (#78). Voice mode narrates and
+/// shapes replies for speech; entering it is a mode of interaction, so the copy
+/// frames it as talking by voice.
+fn voice_mode_tooltip_for(enabled: bool) -> &'static str {
+    if enabled {
+        "Voice mode on — replies are spoken and kept conversational. Click to go back to text."
+    } else {
+        "Voice mode off — text only. Click to talk by voice (replies spoken and shaped for the ear)."
     }
 }
 
@@ -146,9 +194,9 @@ impl InputBar {
         scrolled.set_child(Some(&text_view));
         container.append(&scrolled);
 
-        // Per-conversation speech toggle (issue #76), between the entry and
-        // Send. Default OFF (the master audio cut-off); the window sets the
-        // active conversation's state on switch via `set_speech_active`.
+        // Per-conversation read-aloud toggle (issue #76, reframed in #78),
+        // between the entry and Send. Default OFF; the window sets the active
+        // conversation's state on switch via `set_speech_active`.
         let speech_image =
             Image::from_gicon(&gtk4::gio::ThemedIcon::from_names(speech_icons_for(false)));
         let speech_button = ToggleButton::new();
@@ -159,6 +207,21 @@ impl InputBar {
         speech_button.set_tooltip_text(Some(speech_tooltip_for(false)));
         container.append(&speech_button);
 
+        // Per-conversation voice-mode toggle (issue #78), beside read-aloud.
+        // Default OFF; the window sets the active conversation's state on switch
+        // (and on a model `request_voice`/`stop_voice`) via
+        // `set_voice_mode_active`.
+        let voice_mode_image = Image::from_gicon(&gtk4::gio::ThemedIcon::from_names(
+            voice_mode_icons_for(false),
+        ));
+        let voice_mode_button = ToggleButton::new();
+        voice_mode_button.set_child(Some(&voice_mode_image));
+        voice_mode_button.add_css_class("voice-mode-button");
+        voice_mode_button.set_valign(gtk4::Align::End);
+        voice_mode_button.set_margin_bottom(4);
+        voice_mode_button.set_tooltip_text(Some(voice_mode_tooltip_for(false)));
+        container.append(&voice_mode_button);
+
         let send_button = Button::with_label("Send");
         send_button.add_css_class("send-button");
         send_button.set_valign(gtk4::Align::End);
@@ -166,6 +229,10 @@ impl InputBar {
         container.append(&send_button);
 
         let on_speech_toggled: Rc<RefCell<Option<SpeechToggledCb>>> = Rc::new(RefCell::new(None));
+        let on_voice_mode_toggled: Rc<RefCell<Option<VoiceModeToggledCb>>> =
+            Rc::new(RefCell::new(None));
+        // A single re-entrancy guard for both toggles: a programmatic
+        // `set_*_active` must not echo a write back through its callback.
         let suppress = Rc::new(Cell::new(false));
 
         speech_button.connect_toggled(glib::clone!(
@@ -192,6 +259,28 @@ impl InputBar {
             }
         ));
 
+        voice_mode_button.connect_toggled(glib::clone!(
+            #[strong]
+            on_voice_mode_toggled,
+            #[strong]
+            suppress,
+            #[weak]
+            voice_mode_image,
+            move |btn| {
+                let enabled = btn.is_active();
+                voice_mode_image.set_from_gicon(&gtk4::gio::ThemedIcon::from_names(
+                    voice_mode_icons_for(enabled),
+                ));
+                btn.set_tooltip_text(Some(voice_mode_tooltip_for(enabled)));
+                if suppress.get() {
+                    return;
+                }
+                if let Some(cb) = on_voice_mode_toggled.borrow().as_ref() {
+                    cb(enabled);
+                }
+            }
+        ));
+
         Self {
             container,
             text_view,
@@ -201,19 +290,21 @@ impl InputBar {
             speech_button,
             speech_image,
             on_speech_toggled,
+            voice_mode_button,
+            voice_mode_image,
+            on_voice_mode_toggled,
             suppress,
             state: Rc::new(Cell::new(VoiceState::Idle)),
         }
     }
 
-    /// Register the callback fired when the user flips the speech toggle
-    /// (issue #76). The argument is the new per-conversation "speech enabled"
-    /// state.
+    /// Register the callback fired when the user flips the read-aloud toggle
+    /// (issue #76). The argument is the new per-conversation "read aloud" state.
     pub fn connect_speech_toggled<F: Fn(bool) + 'static>(&self, f: F) {
         *self.on_speech_toggled.borrow_mut() = Some(Box::new(f));
     }
 
-    /// Reflect the active conversation's speech state on the toggle WITHOUT
+    /// Reflect the active conversation's read-aloud state on the toggle WITHOUT
     /// echoing a write back (issue #76). Called by the window on conversation
     /// switch so the button always shows the conversation it belongs to —
     /// per-conversation state, no cross-conversation bleed.
@@ -228,6 +319,29 @@ impl InputBar {
             )));
         self.speech_button
             .set_tooltip_text(Some(speech_tooltip_for(enabled)));
+        self.suppress.set(false);
+    }
+
+    /// Register the callback fired when the user flips the voice-mode toggle
+    /// (issue #78). The argument is the new per-conversation "voice mode" state.
+    pub fn connect_voice_mode_toggled<F: Fn(bool) + 'static>(&self, f: F) {
+        *self.on_voice_mode_toggled.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Reflect the active conversation's voice-mode state on the toggle WITHOUT
+    /// echoing a write back (issue #78). Called by the window on conversation
+    /// switch and when the model drives voice mode via `request_voice` /
+    /// `stop_voice`, so the button always tracks the conversation's state — no
+    /// cross-conversation bleed.
+    pub fn set_voice_mode_active(&self, enabled: bool) {
+        self.suppress.set(true);
+        self.voice_mode_button.set_active(enabled);
+        self.voice_mode_image
+            .set_from_gicon(&gtk4::gio::ThemedIcon::from_names(voice_mode_icons_for(
+                enabled,
+            )));
+        self.voice_mode_button
+            .set_tooltip_text(Some(voice_mode_tooltip_for(enabled)));
         self.suppress.set(false);
     }
 
