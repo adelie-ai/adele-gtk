@@ -132,6 +132,17 @@ impl ChatView {
         self.render();
     }
 
+    /// Render an inline note in the transcript (issue #76). Used for the
+    /// `(speech mode disabled) …` downgrade when a `say_this` aside arrives with
+    /// speech off: the text is shown rather than dropped. Rendered with the
+    /// `assistant` role so it sits in the reply column; the caller pre-formats
+    /// the `(speech mode disabled)` prefix.
+    pub fn add_inline_note(&mut self, content: &str) {
+        self.messages
+            .push(("assistant".to_string(), content.to_string()));
+        self.render();
+    }
+
     /// Clear the view.
     pub fn clear(&mut self) {
         self.messages.clear();

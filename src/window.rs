@@ -56,6 +56,19 @@ impl WindowState {
     }
 }
 
+/// Extract the `text` argument from a `say_this` client-tool call (issue #76).
+///
+/// Returns `None` (rather than panicking) when `arguments` is not an object,
+/// the `text` field is absent, or it isn't a string — a hostile or buggy
+/// payload must resolve to an `Err` result, never crash the turn. An empty
+/// string is accepted (the LLM asked to say nothing; the result still resolves).
+fn say_this_text(arguments: &serde_json::Value) -> Option<String> {
+    arguments
+        .get("text")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 /// A single observable side-effect produced by [`WindowState::apply`].
 ///
 /// `apply` is a pure decision function: it mutates `WindowState` and returns
@@ -395,10 +408,19 @@ impl WindowState {
                             content: full_response.clone(),
                         });
                     }
-                    let mut effects = vec![
-                        Effect::ClearChatStatus,
-                        Effect::CompleteStreaming(full_response),
-                    ];
+                    // Reply narration (issue #76): when the active conversation
+                    // has speech hard-enabled, narrate the finalized reply via
+                    // the embedded `Speaker`. Gated entirely here so the master
+                    // cut-off holds — with speech OFF no `Speak` effect exists,
+                    // so no path plays audio. (The executor additionally no-ops
+                    // when there is no embedded engine, e.g. the daemon path,
+                    // which narrates its own replies.)
+                    let narrate = self.speech_enabled_for_current();
+                    let mut effects = vec![Effect::ClearChatStatus];
+                    if narrate {
+                        effects.push(Effect::Speak(full_response.clone()));
+                    }
+                    effects.push(Effect::CompleteStreaming(full_response));
                     // The turn may have changed the scratchpad (Adele's todos);
                     // refresh the pane. (The live `ScratchpadChanged` event also
                     // covers this, but a turn-boundary refetch is a cheap
@@ -544,11 +566,85 @@ impl WindowState {
                     vec![]
                 }
             }
-            // STUB (failing-tests commit): real handling lands in the
-            // implementation commit. Returning no effects makes the #76 tests
-            // fail on their assertions rather than fail to compile.
-            UiMessage::SetSpeechEnabled { .. } => vec![],
-            UiMessage::ClientToolCall { .. } => vec![],
+            UiMessage::SetSpeechEnabled {
+                conversation_id,
+                enabled,
+            } => {
+                // Record the per-conversation hard toggle. Pure state change;
+                // the button already reflects itself (it is the write source).
+                // Keyed by conversation so it never bleeds across conversations.
+                self.conversation_speech_enabled
+                    .insert(conversation_id, enabled);
+                vec![]
+            }
+            UiMessage::ClientToolCall {
+                task_id,
+                conversation_id: _,
+                tool_call_id,
+                tool_name,
+                arguments,
+            } => {
+                // ALWAYS resolve the call (issue #76) so the suspended turn
+                // resumes — the previous code dropped it and wedged the turn.
+                //
+                // `say_this` is the only tool this client honours. Note we gate
+                // on the *active* conversation's toggle, not the call's
+                // `conversation_id`: a say_this for some other (e.g. a
+                // concurrent voice session's) conversation must never borrow a
+                // different conversation's ON state to play audio on this
+                // client. With #261's session-scoped registration the daemon
+                // already scopes tools per session; this is the belt-and-braces
+                // local guard.
+                if tool_name == "say_this" {
+                    match say_this_text(&arguments) {
+                        Some(text) if self.speech_enabled_for_current() => {
+                            // Hard toggle ON → speak it.
+                            vec![
+                                Effect::Speak(text),
+                                Effect::SubmitClientToolResult {
+                                    task_id,
+                                    tool_call_id,
+                                    result: Ok("spoken".to_string()),
+                                },
+                            ]
+                        }
+                        Some(text) => {
+                            // Hard toggle OFF → show, don't speak. The turn
+                            // still completes; no audio on any path.
+                            let note = format!("(speech mode disabled) {text}");
+                            vec![
+                                Effect::AddInlineNote(note),
+                                Effect::SubmitClientToolResult {
+                                    task_id,
+                                    tool_call_id,
+                                    result: Ok("speech mode disabled; shown to the user as text \
+                                         instead of spoken"
+                                        .to_string()),
+                                },
+                            ]
+                        }
+                        None => {
+                            // Malformed arguments (missing/!string `text`):
+                            // never panic, resolve an Err so the turn completes.
+                            vec![Effect::SubmitClientToolResult {
+                                task_id,
+                                tool_call_id,
+                                result: Err(
+                                    "say_this requires a string `text` argument".to_string()
+                                ),
+                            }]
+                        }
+                    }
+                } else {
+                    // Any other client tool: this client has no runtime for it,
+                    // but it must still be resolved or the turn wedges.
+                    vec![Effect::SubmitClientToolResult {
+                        task_id,
+                        tool_call_id,
+                        result: Err(format!("this client cannot run the tool \"{tool_name}\"")),
+                    }]
+                }
+            }
             UiMessage::Disconnected { reason } => {
                 let mut effects = vec![
                     Effect::ClearClient,
@@ -1426,6 +1522,29 @@ impl AdelieWindow {
             }
         }
 
+        // Per-conversation speech toggle (issue #76). A user flip routes a
+        // `SetSpeechEnabled` for the *current* conversation through the same
+        // handler as everything else, so the pure `apply` records it. The
+        // `set_speech_active` reflection on conversation switch (below, in the
+        // `LoadConversationIntoChat` effect) is suppressed, so it never echoes
+        // back here. With no active conversation the flip is dropped (the
+        // button is only meaningful against a conversation).
+        input_bar.connect_speech_toggled(glib::clone!(
+            #[strong]
+            state,
+            #[strong]
+            bridge,
+            move |enabled| {
+                let Some(conv_id) = state.borrow().current_conversation_id.clone() else {
+                    return;
+                };
+                let _ = bridge.ui_sender().send(UiMessage::SetSpeechEnabled {
+                    conversation_id: conv_id,
+                    enabled,
+                });
+            }
+        ));
+
         // Hamburger menu: Switch Connection → open the picker in a new
         // window. The current connection's window is intentionally left open;
         // selecting a profile spawns a fresh AdelieWindow alongside it.
@@ -2085,6 +2204,13 @@ fn handle_ui_message(
             }
             Effect::LoadConversationIntoChat(filtered) => {
                 chat_view.borrow_mut().load_conversation(&filtered);
+                // Reflect the newly-active conversation's speech toggle on the
+                // input bar (issue #76). `apply` has already pointed
+                // `current_conversation_id` at this conversation, so this reads
+                // the right per-conversation state. Suppressed inside
+                // `set_speech_active`, so it doesn't echo a write back.
+                let enabled = state.borrow().speech_enabled_for_current();
+                input_bar.set_speech_active(enabled);
             }
             Effect::ReloadConversation(id) => {
                 // Re-fetch an already-open conversation (reconnect / debug /
@@ -2202,10 +2328,47 @@ fn handle_ui_message(
                 let rows = tasks_panel.task_view_models_for(conv.as_deref(), now_epoch_ms());
                 side_pane.set_tasks(&rows);
             }
-            // STUBS (failing-tests commit): wired in the implementation commit.
-            Effect::Speak(_) => {}
-            Effect::AddInlineNote(_) => {}
-            Effect::SubmitClientToolResult { .. } => {}
+            Effect::Speak(text) => {
+                // Speak via the embedded engine. `apply` only emits this when
+                // the active conversation has speech ON, so this is the spoken
+                // path of both reply narration and a `say_this` aside. No-op on
+                // the daemon path (`embedded_voice` is `None` there — the daemon
+                // narrates its own replies), which keeps the master cut-off:
+                // audio is produced by exactly one engine.
+                if let Some(engine) = (**embedded_voice).clone() {
+                    let ui_tx = ui_tx.clone();
+                    crate::async_bridge::spawn_on_runtime(async move {
+                        if let Err(e) = engine.say(&text).await {
+                            let _ = ui_tx.send(UiMessage::Error(format!("Voice: {e}")));
+                        }
+                    });
+                }
+            }
+            Effect::AddInlineNote(note) => {
+                chat_view.borrow_mut().add_inline_note(&note);
+            }
+            Effect::SubmitClientToolResult {
+                task_id,
+                tool_call_id,
+                result,
+            } => {
+                // Post the outcome back to the daemon so the suspended turn
+                // resumes (issue #76). Spawned off the GTK thread; failures to
+                // deliver are logged (the daemon's suspension timeout, #262, is
+                // the backstop if delivery never lands).
+                if let Some(connector) = client.borrow().clone() {
+                    crate::async_bridge::spawn_on_runtime(async move {
+                        if let Err(e) = connector
+                            .submit_client_tool_result(&task_id, &tool_call_id, result)
+                            .await
+                        {
+                            tracing::warn!("submit_client_tool_result failed: {e}");
+                        }
+                    });
+                } else {
+                    tracing::warn!("no connector to submit client-tool result for task {task_id}");
+                }
+            }
         }
     }
 }
