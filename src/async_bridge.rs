@@ -11,6 +11,30 @@ use tokio::sync::mpsc;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
+/// The three-way voice-**output** level for a conversation (issue #80), exposed
+/// by the `Adele:` dropdown. A dedicated enum (not two bools) because the level
+/// is genuinely three-valued and the gate logic differs per variant: a bool
+/// pair would admit a nonsensical "both" state and scatter the
+/// Disabled/OnDemand/Always distinction across call sites. Default is
+/// [`AdeleOutput::Disabled`] (never speaks).
+///
+/// Replaces phase-2's two independent toggles, which mapped directly: the
+/// read-aloud toggle was [`AdeleOutput::Always`] and the voice-mode toggle was
+/// [`AdeleOutput::OnDemand`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AdeleOutput {
+    /// Never speaks. A `say_this` aside downgrades to inline text.
+    #[default]
+    Disabled,
+    /// Speaks replies only while `You == Enabled` (conversing by voice), shaped
+    /// for the ear; speaks `say_this` asides regardless of `You`. The model's
+    /// `request_voice` selects this.
+    OnDemand,
+    /// Reads every reply aloud in full (made speakable, not shortened) —
+    /// accessibility. Independent of `You`.
+    Always,
+}
+
 fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -151,26 +175,27 @@ pub enum UiMessage {
         conversation_id: String,
     },
 
-    // --- Speech toggle (issue #76) ----------------------------------------
-    /// The user flipped the per-conversation hard "speech enabled" toggle in
-    /// the input bar. Carries the conversation the toggle belongs to (so a
-    /// stale toggle from a since-switched conversation can't bleed) and the new
-    /// state. Default is OFF; while OFF no path produces audio. See issue #76.
-    SetSpeechEnabled {
+    // --- Voice input (`You:` dropdown, issue #80) -------------------------
+    /// The user changed the per-conversation `You:` (voice input) dropdown in
+    /// the input bar. Carries the conversation the setting belongs to (so a
+    /// stale setting from a since-switched conversation can't bleed) and whether
+    /// voice input is Enabled (`true`, push-to-talk available) or Disabled
+    /// (`false`, type only). Default is Disabled. See issue #80.
+    SetVoiceIn {
         conversation_id: String,
         enabled: bool,
     },
 
-    // --- Voice mode (issue #78, phase-2) ----------------------------------
-    /// The user flipped the per-conversation soft-sticky "voice mode" toggle in
+    // --- Voice output (`Adele:` dropdown, issue #80) ----------------------
+    /// The user changed the per-conversation `Adele:` (voice output) dropdown in
     /// the input bar (the model drives the same state via the `request_voice` /
-    /// `stop_voice` client tools). Carries the conversation it belongs to and
-    /// the new state. Default is OFF. When ON, replies are narrated (same
-    /// routing as read-aloud) AND a concise read-aloud `system_refinement` is
-    /// attached on send so replies are shaped for speech. See issue #78.
-    SetVoiceMode {
+    /// `stop_voice` client tools, which select OnDemand / Disabled). Carries the
+    /// conversation it belongs to and the new output level. Default is Disabled.
+    /// The level decides reply narration (with `You`) and the send-time
+    /// `system_refinement`. See issue #80.
+    SetAdeleOutput {
         conversation_id: String,
-        enabled: bool,
+        level: AdeleOutput,
     },
 
     // --- Client-local tool calls (issue #76) ------------------------------
@@ -308,21 +333,21 @@ impl std::fmt::Debug for UiMessage {
                 .debug_struct("ScratchpadChanged")
                 .field("conversation_id", conversation_id)
                 .finish(),
-            UiMessage::SetSpeechEnabled {
+            UiMessage::SetVoiceIn {
                 conversation_id,
                 enabled,
             } => f
-                .debug_struct("SetSpeechEnabled")
+                .debug_struct("SetVoiceIn")
                 .field("conversation_id", conversation_id)
                 .field("enabled", enabled)
                 .finish(),
-            UiMessage::SetVoiceMode {
+            UiMessage::SetAdeleOutput {
                 conversation_id,
-                enabled,
+                level,
             } => f
-                .debug_struct("SetVoiceMode")
+                .debug_struct("SetAdeleOutput")
                 .field("conversation_id", conversation_id)
-                .field("enabled", enabled)
+                .field("level", level)
                 .finish(),
             UiMessage::ClientToolCall {
                 task_id,

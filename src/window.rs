@@ -16,7 +16,7 @@ use gtk4::{
 };
 use tokio::sync::mpsc;
 
-use crate::async_bridge::{AsyncBridge, UiMessage, connection_manager};
+use crate::async_bridge::{AdeleOutput, AsyncBridge, UiMessage, connection_manager};
 use crate::management_client;
 use crate::voice_client::{VoiceController, VoiceState};
 use crate::widgets::chat_view::ChatView;
@@ -35,73 +35,100 @@ struct WindowState {
     pending_request_id: Option<String>,
     streaming_buffer: String,
     debug_enabled: bool,
-    /// Per-conversation "read aloud" (accessibility) toggle (issue #76, reframed
-    /// in #78), keyed by conversation id. Default (absent key) is **OFF**. When
-    /// ON, every reply auto-routes to the Speaker (LLM-unaware). State is
-    /// per-conversation, so enabling it in one conversation never leaks audio
-    /// into another.
-    conversation_speech_enabled: HashMap<String, bool>,
-    /// Per-conversation soft-sticky "voice mode" toggle (issue #78), keyed by
-    /// conversation id. Default (absent key) is **OFF**. Entered by the user
-    /// (UI) or the model (`request_voice`), left via UI or `stop_voice`. When
-    /// ON: replies are narrated (same routing as read-aloud) AND a concise
-    /// read-aloud `system_refinement` is attached on send. Independent of
-    /// read-aloud — either being ON narrates.
-    conversation_voice_mode: HashMap<String, bool>,
+    /// Per-conversation `You:` (voice input) state (issue #80), keyed by
+    /// conversation id. Default (absent key) is **Disabled** (type only). When
+    /// Enabled, the input bar shows a push-to-talk control and — combined with
+    /// `Adele == OnDemand` — gates reply narration. Per-conversation, so
+    /// enabling it in one conversation never affects another.
+    conversation_voice_in: HashMap<String, bool>,
+    /// Per-conversation `Adele:` (voice output) level (issue #80), keyed by
+    /// conversation id. Default (absent key) is **Disabled** (never speaks).
+    /// Set by the user (the dropdown) or the model (`request_voice` → OnDemand,
+    /// `stop_voice` → Disabled). Decides reply narration (with `You`), the
+    /// `say_this` gate, and the send-time `system_refinement`. Replaces phase-2's
+    /// two toggles (read-aloud == Always, voice-mode == OnDemand).
+    conversation_adele_output: HashMap<String, AdeleOutput>,
 }
 
-/// Concise read-aloud system refinement attached on send while voice mode is ON
-/// (issue #78). Mirrors the *essence* of the voice daemon's
-/// `spoken_response_hint` (brief, conversational, no markdown, symbols/acronyms
-/// spelled out, written for the ear) without duplicating its full paragraph.
+/// System refinement attached on send while `Adele == OnDemand` (issue #80).
+/// Replies are spoken only while conversing by voice, so shape them **for the
+/// ear**: brief, conversational, no markdown, symbols/acronyms spelled out.
 /// Deliberately free of markdown markers so it can't itself leak formatting.
-const VOICE_SYSTEM_REFINEMENT: &str = "This reply will be read aloud, so write it to be spoken, not read. Keep it brief and \
+const ON_DEMAND_SYSTEM_REFINEMENT: &str = "This reply will be read aloud, so write it to be spoken, not read. Keep it brief and \
      conversational, a few short sentences at most. Use no markdown or formatting of any kind, \
      and no emoji. Spell out acronyms and abbreviations as full words and avoid symbols that do \
      not read well aloud (say 'and' not an ampersand, 'percent' not a percent sign, 'dollars' not \
      a dollar sign). Do not read out URLs, file paths, or email addresses; describe them in words \
      instead, and write numbers, dates, and times the way you would say them.";
 
+/// System refinement attached on send while `Adele == Always` (issue #80).
+/// Every reply is read aloud for accessibility, so make it **speakable but not
+/// shortened**: keep the full content, just strip formatting and spell out
+/// symbols. Crucially it does NOT ask for brevity (that's the OnDemand job) —
+/// Always reads the whole answer. Free of markdown markers itself.
+const ALWAYS_SYSTEM_REFINEMENT: &str = "This reply will be read aloud in full, so write it to be spoken, not read, without \
+     leaving anything out. Do not shorten or summarize — cover everything you would normally \
+     say, just phrased for the ear. Use no markdown or formatting of any kind, and no emoji. \
+     Spell out acronyms and abbreviations as full words and avoid symbols that do not read well \
+     aloud (say 'and' not an ampersand, 'percent' not a percent sign, 'dollars' not a dollar \
+     sign). Do not read out URLs, file paths, or email addresses; describe them in words instead, \
+     and write numbers, dates, and times the way you would say them.";
+
 impl WindowState {
-    /// Whether read-aloud is enabled for the *currently active* conversation.
-    /// `false` when there is no active conversation or the toggle was never set
-    /// (default OFF).
-    fn speech_enabled_for_current(&self) -> bool {
+    /// Whether `You:` (voice input) is Enabled for the *currently active*
+    /// conversation. `false` when there is no active conversation or it was
+    /// never set (default Disabled).
+    fn voice_in_for_current(&self) -> bool {
         self.current_conversation_id
             .as_deref()
-            .and_then(|id| self.conversation_speech_enabled.get(id))
+            .and_then(|id| self.conversation_voice_in.get(id))
             .copied()
             .unwrap_or(false)
     }
 
-    /// Whether voice mode is on for the *currently active* conversation.
-    /// `false` when there is no active conversation or it was never set
-    /// (default OFF).
-    fn voice_mode_for_current(&self) -> bool {
+    /// The `Adele:` (voice output) level for the *currently active*
+    /// conversation. `Disabled` when there is no active conversation or it was
+    /// never set (default Disabled).
+    fn adele_output_for_current(&self) -> AdeleOutput {
         self.current_conversation_id
             .as_deref()
-            .and_then(|id| self.conversation_voice_mode.get(id))
+            .and_then(|id| self.conversation_adele_output.get(id))
             .copied()
-            .unwrap_or(false)
+            .unwrap_or_default()
     }
 
-    /// Whether a reply is spoken for the active conversation: read-aloud OR
-    /// voice mode (issue #78). The single audio gate both reply narration and
-    /// `say_this` consult.
+    /// Whether a *reply* is spoken for the active conversation (issue #80):
+    /// `Adele == Always` OR (`Adele == OnDemand` AND `You == Enabled`). The gate
+    /// the reply-narration path consults; `Disabled` never narrates.
     fn narrate_for_current(&self) -> bool {
-        self.speech_enabled_for_current() || self.voice_mode_for_current()
+        match self.adele_output_for_current() {
+            AdeleOutput::Always => true,
+            AdeleOutput::OnDemand => self.voice_in_for_current(),
+            AdeleOutput::Disabled => false,
+        }
+    }
+
+    /// Whether a `say_this` aside is spoken for the active conversation (issue
+    /// #80): spoken iff `Adele ∈ {OnDemand, Always}` (independent of `You`).
+    /// `Disabled` downgrades the aside to inline text.
+    fn say_this_spoken_for_current(&self) -> bool {
+        !matches!(self.adele_output_for_current(), AdeleOutput::Disabled)
     }
 }
 
-/// The read-aloud system refinement to attach on the next send, or `None` when
-/// voice mode is off for the active conversation (issue #78). Pure decision the
-/// send path consults to choose `send_prompt_with_system_refinement`. Free
-/// function (not a method) so the send closure can call it through a snapshot
-/// without holding a `WindowState` borrow across the await.
+/// The system refinement to attach on the next send, or `None` (issue #80),
+/// chosen by the active conversation's `Adele:` level: `OnDemand` →
+/// brief/conversational/speakable; `Always` → speakable-but-full (don't
+/// shorten); `Disabled` → none. Pure decision the send path consults to choose
+/// `send_prompt_with_system_refinement`. Free function (not a method) so the
+/// send closure can call it through a snapshot without holding a `WindowState`
+/// borrow across the await.
 fn refinement_for_send(state: &WindowState) -> Option<&'static str> {
-    state
-        .voice_mode_for_current()
-        .then_some(VOICE_SYSTEM_REFINEMENT)
+    match state.adele_output_for_current() {
+        AdeleOutput::OnDemand => Some(ON_DEMAND_SYSTEM_REFINEMENT),
+        AdeleOutput::Always => Some(ALWAYS_SYSTEM_REFINEMENT),
+        AdeleOutput::Disabled => None,
+    }
 }
 
 /// The session-scoped client tools this client advertises so the model can
@@ -242,12 +269,13 @@ enum Effect {
     /// `(speech mode disabled) …` downgrade when `say_this` arrives with speech
     /// OFF, so the text is shown rather than dropped.
     AddInlineNote(String),
-    /// Reflect the active conversation's voice-mode state on the input-bar
-    /// toggle (issue #78). Emitted when the model drives voice mode via
-    /// `request_voice` / `stop_voice` so the button tracks the model's change
-    /// (the user-driven path needs no echo — the button is its own write
-    /// source). Suppressed inside `set_voice_mode_active`, so it never loops.
-    SetVoiceModeButton(bool),
+    /// Reflect the active conversation's `Adele:` output level on the input-bar
+    /// dropdown (issue #80). Emitted when the model drives the level via
+    /// `request_voice` (→ OnDemand) / `stop_voice` (→ Disabled) so the dropdown
+    /// tracks the model's change (the user-driven path needs no echo — the
+    /// dropdown is its own write source). Suppressed inside
+    /// `set_adele_output_active`, so it never loops.
+    SetAdeleOutputDropdown(AdeleOutput),
     /// Resolve a suspended client-tool call back to the daemon via
     /// `submit_client_tool_result` so the parked turn resumes (issue #76). Every
     /// `ClientToolCall` yields exactly one of these — `Ok` on success, `Err`
@@ -312,7 +340,9 @@ impl std::fmt::Debug for Effect {
             Effect::RefreshSidePaneTasks => f.write_str("RefreshSidePaneTasks"),
             Effect::Speak(t) => f.debug_tuple("Speak").field(t).finish(),
             Effect::AddInlineNote(t) => f.debug_tuple("AddInlineNote").field(t).finish(),
-            Effect::SetVoiceModeButton(b) => f.debug_tuple("SetVoiceModeButton").field(b).finish(),
+            Effect::SetAdeleOutputDropdown(l) => {
+                f.debug_tuple("SetAdeleOutputDropdown").field(l).finish()
+            }
             Effect::SubmitClientToolResult {
                 task_id,
                 tool_call_id,
@@ -491,12 +521,12 @@ impl WindowState {
                             content: full_response.clone(),
                         });
                     }
-                    // Reply narration (issue #76/#78): narrate the finalized
-                    // reply via the embedded `Speaker` when the active
-                    // conversation has read-aloud ON *or* voice mode ON. Gated
-                    // entirely here so the cut-off holds — with both OFF no
-                    // `Speak` effect exists, so no path plays audio. (The
-                    // executor additionally no-ops when there is no embedded
+                    // Reply narration (issue #80): narrate the finalized reply
+                    // via the embedded `Speaker` when the gate holds — `Adele ==
+                    // Always` OR (`Adele == OnDemand` AND `You == Enabled`).
+                    // Gated entirely here so the cut-off holds: when the gate is
+                    // false no `Speak` effect exists, so no path plays audio.
+                    // (The executor additionally no-ops when there is no embedded
                     // engine, e.g. the daemon path, which narrates its own
                     // replies.)
                     let narrate = self.narrate_for_current();
@@ -650,27 +680,27 @@ impl WindowState {
                     vec![]
                 }
             }
-            UiMessage::SetSpeechEnabled {
+            UiMessage::SetVoiceIn {
                 conversation_id,
                 enabled,
             } => {
-                // Record the per-conversation read-aloud toggle. Pure state
-                // change; the button already reflects itself (it is the write
-                // source). Keyed by conversation so it never bleeds across them.
-                self.conversation_speech_enabled
-                    .insert(conversation_id, enabled);
+                // Record the per-conversation `You:` (voice input) setting (issue
+                // #80). Pure state change; the dropdown is the write source here
+                // (the user changed it), so no UI reflection is needed. Keyed by
+                // conversation so it never bleeds across them.
+                self.conversation_voice_in.insert(conversation_id, enabled);
                 vec![]
             }
-            UiMessage::SetVoiceMode {
+            UiMessage::SetAdeleOutput {
                 conversation_id,
-                enabled,
+                level,
             } => {
-                // Record the per-conversation voice-mode toggle (issue #78).
-                // Pure state change; the button is the write source here (the
-                // user clicked it), so no UI reflection is needed. Keyed by
-                // conversation so it never bleeds across them.
-                self.conversation_voice_mode
-                    .insert(conversation_id, enabled);
+                // Record the per-conversation `Adele:` (voice output) level
+                // (issue #80). Pure state change; the dropdown is the write
+                // source here (the user changed it), so no UI reflection is
+                // needed. Keyed by conversation so it never bleeds across them.
+                self.conversation_adele_output
+                    .insert(conversation_id, level);
                 vec![]
             }
             UiMessage::ClientToolCall {
@@ -691,10 +721,11 @@ impl WindowState {
                 // per session; this is the belt-and-braces local guard.
                 match tool_name.as_str() {
                     "say_this" => match say_this_text(&arguments) {
-                        // Audio gate broadened in #78 to (read-aloud OR voice
-                        // mode): speak the aside when either is on for the
-                        // active conversation.
-                        Some(text) if self.narrate_for_current() => vec![
+                        // say_this gate (issue #80): the aside is spoken iff
+                        // `Adele ∈ {OnDemand, Always}` for the active
+                        // conversation — independent of `You`. `Disabled`
+                        // downgrades it to inline text below.
+                        Some(text) if self.say_this_spoken_for_current() => vec![
                             Effect::Speak(text),
                             Effect::SubmitClientToolResult {
                                 task_id,
@@ -703,7 +734,7 @@ impl WindowState {
                             },
                         ],
                         Some(text) => {
-                            // Both controls OFF → show, don't speak. The turn
+                            // Adele == Disabled → show, don't speak. The turn
                             // still completes; no audio on any path.
                             let note = format!("(speech mode disabled) {text}");
                             vec![
@@ -730,18 +761,20 @@ impl WindowState {
                         }
                     },
                     // The model asks to switch this conversation into spoken
-                    // voice mode (issue #78). Applies to the ACTIVE conversation
-                    // (consistent with say_this's active-conversation gating);
-                    // sticks until left. Reflect it on the button so the UI
-                    // tracks the model's change, and always resolve a result.
-                    // `request_voice` / `stop_voice` take no arguments, so a junk
-                    // payload is simply ignored — never a panic.
+                    // voice mode (issue #80): set `Adele = OnDemand`. Applies to
+                    // the ACTIVE conversation (consistent with say_this's
+                    // active-conversation gating); sticks until left. Reflect it
+                    // on the dropdown so the UI tracks the model's change, and
+                    // always resolve a result. `request_voice` / `stop_voice`
+                    // take no arguments, so a junk payload is simply ignored —
+                    // never a panic.
                     "request_voice" => {
                         if let Some(id) = self.current_conversation_id.clone() {
-                            self.conversation_voice_mode.insert(id, true);
+                            self.conversation_adele_output
+                                .insert(id, AdeleOutput::OnDemand);
                         }
                         vec![
-                            Effect::SetVoiceModeButton(true),
+                            Effect::SetAdeleOutputDropdown(AdeleOutput::OnDemand),
                             Effect::SubmitClientToolResult {
                                 task_id,
                                 tool_call_id,
@@ -753,10 +786,11 @@ impl WindowState {
                     }
                     "stop_voice" => {
                         if let Some(id) = self.current_conversation_id.clone() {
-                            self.conversation_voice_mode.insert(id, false);
+                            self.conversation_adele_output
+                                .insert(id, AdeleOutput::Disabled);
                         }
                         vec![
-                            Effect::SetVoiceModeButton(false),
+                            Effect::SetAdeleOutputDropdown(AdeleOutput::Disabled),
                             Effect::SubmitClientToolResult {
                                 task_id,
                                 tool_call_id,
@@ -1074,8 +1108,8 @@ impl AdelieWindow {
             pending_request_id: None,
             streaming_buffer: String::new(),
             debug_enabled: false,
-            conversation_speech_enabled: HashMap::new(),
-            conversation_voice_mode: HashMap::new(),
+            conversation_voice_in: HashMap::new(),
+            conversation_adele_output: HashMap::new(),
         }));
 
         // Wrap widgets in Rc for closures
@@ -1677,14 +1711,14 @@ impl AdelieWindow {
             }
         }
 
-        // Per-conversation speech toggle (issue #76). A user flip routes a
-        // `SetSpeechEnabled` for the *current* conversation through the same
-        // handler as everything else, so the pure `apply` records it. The
-        // `set_speech_active` reflection on conversation switch (below, in the
-        // `LoadConversationIntoChat` effect) is suppressed, so it never echoes
-        // back here. With no active conversation the flip is dropped (the
-        // button is only meaningful against a conversation).
-        input_bar.connect_speech_toggled(glib::clone!(
+        // Per-conversation `You:` (voice input) dropdown (issue #80). A user
+        // change routes a `SetVoiceIn` for the *current* conversation through
+        // the same handler as everything else, so the pure `apply` records it.
+        // The `set_voice_in_active` reflection on conversation switch (below, in
+        // the `LoadConversationIntoChat` effect) is suppressed, so it never
+        // echoes back here. With no active conversation the change is dropped
+        // (the dropdown is only meaningful against a conversation).
+        input_bar.connect_voice_in_changed(glib::clone!(
             #[strong]
             state,
             #[strong]
@@ -1693,30 +1727,31 @@ impl AdelieWindow {
                 let Some(conv_id) = state.borrow().current_conversation_id.clone() else {
                     return;
                 };
-                let _ = bridge.ui_sender().send(UiMessage::SetSpeechEnabled {
+                let _ = bridge.ui_sender().send(UiMessage::SetVoiceIn {
                     conversation_id: conv_id,
                     enabled,
                 });
             }
         ));
 
-        // Per-conversation voice-mode toggle (issue #78). A user flip routes a
-        // `SetVoiceMode` for the *current* conversation through the same handler
-        // so the pure `apply` records it. The `set_voice_mode_active` reflection
-        // on conversation switch / model drive is suppressed, so it never echoes
-        // back here. With no active conversation the flip is dropped.
-        input_bar.connect_voice_mode_toggled(glib::clone!(
+        // Per-conversation `Adele:` (voice output) dropdown (issue #80). A user
+        // change routes a `SetAdeleOutput` for the *current* conversation through
+        // the same handler so the pure `apply` records it. The
+        // `set_adele_output_active` reflection on conversation switch / model
+        // drive is suppressed, so it never echoes back here. With no active
+        // conversation the change is dropped.
+        input_bar.connect_adele_output_changed(glib::clone!(
             #[strong]
             state,
             #[strong]
             bridge,
-            move |enabled| {
+            move |level| {
                 let Some(conv_id) = state.borrow().current_conversation_id.clone() else {
                     return;
                 };
-                let _ = bridge.ui_sender().send(UiMessage::SetVoiceMode {
+                let _ = bridge.ui_sender().send(UiMessage::SetAdeleOutput {
                     conversation_id: conv_id,
-                    enabled,
+                    level,
                 });
             }
         ));
@@ -2396,17 +2431,17 @@ fn handle_ui_message(
             }
             Effect::LoadConversationIntoChat(filtered) => {
                 chat_view.borrow_mut().load_conversation(&filtered);
-                // Reflect the newly-active conversation's read-aloud + voice-mode
-                // toggles on the input bar (issue #76/#78). `apply` has already
+                // Reflect the newly-active conversation's `You:` + `Adele:`
+                // dropdowns on the input bar (issue #80). `apply` has already
                 // pointed `current_conversation_id` at this conversation, so
                 // these read the right per-conversation state. Suppressed inside
                 // each setter, so they don't echo a write back.
-                let (read_aloud, voice_mode) = {
+                let (voice_in, adele_output) = {
                     let s = state.borrow();
-                    (s.speech_enabled_for_current(), s.voice_mode_for_current())
+                    (s.voice_in_for_current(), s.adele_output_for_current())
                 };
-                input_bar.set_speech_active(read_aloud);
-                input_bar.set_voice_mode_active(voice_mode);
+                input_bar.set_voice_in_active(voice_in);
+                input_bar.set_adele_output_active(adele_output);
             }
             Effect::ReloadConversation(id) => {
                 // Re-fetch an already-open conversation (reconnect / debug /
@@ -2543,11 +2578,12 @@ fn handle_ui_message(
             Effect::AddInlineNote(note) => {
                 chat_view.borrow_mut().add_inline_note(&note);
             }
-            Effect::SetVoiceModeButton(enabled) => {
-                // The model drove voice mode (request_voice / stop_voice);
-                // reflect it on the toggle. Suppressed inside, so it doesn't
-                // echo a `SetVoiceMode` write back through the user callback.
-                input_bar.set_voice_mode_active(enabled);
+            Effect::SetAdeleOutputDropdown(level) => {
+                // The model drove the output level (request_voice → OnDemand /
+                // stop_voice → Disabled); reflect it on the dropdown. Suppressed
+                // inside, so it doesn't echo a `SetAdeleOutput` write back
+                // through the user callback.
+                input_bar.set_adele_output_active(level);
             }
             Effect::SubmitClientToolResult {
                 task_id,
@@ -3547,8 +3583,12 @@ mod tests {
             current_conversation_id: Some("c1".to_string()),
             ..Default::default()
         };
-        state.conversation_voice_in.insert("c1".to_string(), voice_in);
-        state.conversation_adele_output.insert("c1".to_string(), adele);
+        state
+            .conversation_voice_in
+            .insert("c1".to_string(), voice_in);
+        state
+            .conversation_adele_output
+            .insert("c1".to_string(), adele);
         state
     }
 
@@ -3612,7 +3652,10 @@ mod tests {
                     if task_id == "task-1" && tool_call_id == "call-1"
             )
         });
-        assert!(resolved, "say_this must always resolve a result: {effects:?}");
+        assert!(
+            resolved,
+            "say_this must always resolve a result: {effects:?}"
+        );
     }
 
     /// Adele=Always: every reply is spoken (and finalized), independent of You.
@@ -3652,7 +3695,9 @@ mod tests {
             "Always must speak a say_this aside: {effects:?}"
         );
         assert!(
-            !effects.iter().any(|e| matches!(e, Effect::AddInlineNote(_))),
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::AddInlineNote(_))),
             "no inline downgrade when spoken: {effects:?}"
         );
         assert!(
@@ -3669,7 +3714,10 @@ mod tests {
     #[test]
     fn adele_on_demand_with_you_enabled_speaks_reply() {
         let mut state = state_with(true, AdeleOutput::OnDemand);
-        assert!(state.narrate_for_current(), "OnDemand + You=Enabled narrates");
+        assert!(
+            state.narrate_for_current(),
+            "OnDemand + You=Enabled narrates"
+        );
         let effects = stream_complete_in(&mut state, "an answer");
         assert!(
             effects
@@ -3711,7 +3759,9 @@ mod tests {
             "OnDemand say_this aside must speak even when You=Disabled: {effects:?}"
         );
         assert!(
-            !effects.iter().any(|e| matches!(e, Effect::AddInlineNote(_))),
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::AddInlineNote(_))),
             "no inline downgrade when spoken: {effects:?}"
         );
     }
@@ -3885,7 +3935,10 @@ mod tests {
                 .iter()
                 .filter(|e| matches!(e, Effect::SubmitClientToolResult { .. }))
                 .count();
-            assert_eq!(results, 1, "{tool} must resolve exactly one result: {effects:?}");
+            assert_eq!(
+                results, 1,
+                "{tool} must resolve exactly one result: {effects:?}"
+            );
         }
     }
 
@@ -4015,7 +4068,11 @@ mod tests {
         assert_ne!(ON_DEMAND_SYSTEM_REFINEMENT, ALWAYS_SYSTEM_REFINEMENT);
         // OnDemand asks for brevity; Always explicitly does not shorten.
         assert!(ON_DEMAND_SYSTEM_REFINEMENT.to_lowercase().contains("brief"));
-        assert!(ALWAYS_SYSTEM_REFINEMENT.to_lowercase().contains("do not shorten"));
+        assert!(
+            ALWAYS_SYSTEM_REFINEMENT
+                .to_lowercase()
+                .contains("do not shorten")
+        );
         for refinement in [ON_DEMAND_SYSTEM_REFINEMENT, ALWAYS_SYSTEM_REFINEMENT] {
             assert!(!refinement.trim().is_empty());
             for marker in ['*', '_', '`', '#'] {
