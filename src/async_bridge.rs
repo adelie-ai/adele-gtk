@@ -150,6 +150,32 @@ pub enum UiMessage {
     ScratchpadChanged {
         conversation_id: String,
     },
+
+    // --- Speech toggle (issue #76) ----------------------------------------
+    /// The user flipped the per-conversation hard "speech enabled" toggle in
+    /// the input bar. Carries the conversation the toggle belongs to (so a
+    /// stale toggle from a since-switched conversation can't bleed) and the new
+    /// state. Default is OFF; while OFF no path produces audio. See issue #76.
+    SetSpeechEnabled {
+        conversation_id: String,
+        enabled: bool,
+    },
+
+    // --- Client-local tool calls (issue #76) ------------------------------
+    /// The daemon suspended a turn on a client-local tool call and is waiting
+    /// for this client to post the outcome (#107/#231). Carried verbatim from
+    /// [`SignalEvent::ClientToolCall`]; the window must ALWAYS resolve it via
+    /// `submit_client_tool_result` (even when it can't honour the tool) so the
+    /// suspended turn never wedges. `say_this` is handled specially: spoken
+    /// when the conversation's speech toggle is on, otherwise shown inline as
+    /// `(speech mode disabled) …`. See issue #76.
+    ClientToolCall {
+        task_id: String,
+        conversation_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        arguments: serde_json::Value,
+    },
 }
 
 // Manual `Debug` (can't derive: `Connector` is not `Debug`). Only
@@ -269,6 +295,28 @@ impl std::fmt::Debug for UiMessage {
             UiMessage::ScratchpadChanged { conversation_id } => f
                 .debug_struct("ScratchpadChanged")
                 .field("conversation_id", conversation_id)
+                .finish(),
+            UiMessage::SetSpeechEnabled {
+                conversation_id,
+                enabled,
+            } => f
+                .debug_struct("SetSpeechEnabled")
+                .field("conversation_id", conversation_id)
+                .field("enabled", enabled)
+                .finish(),
+            UiMessage::ClientToolCall {
+                task_id,
+                conversation_id,
+                tool_call_id,
+                tool_name,
+                arguments,
+            } => f
+                .debug_struct("ClientToolCall")
+                .field("task_id", task_id)
+                .field("conversation_id", conversation_id)
+                .field("tool_call_id", tool_call_id)
+                .field("tool_name", tool_name)
+                .field("arguments", arguments)
                 .finish(),
         }
     }
@@ -571,14 +619,25 @@ fn signal_to_ui_message(signal: SignalEvent) -> UiMessage {
         SignalEvent::ScratchpadChanged { conversation_id } => {
             UiMessage::ScratchpadChanged { conversation_id }
         }
-        // Client-local MCP tool execution (#107/#231) is not implemented in the
-        // GTK client — it has no local tool runtime to satisfy the call. Surface
-        // it as a status string so the parked turn is at least visible; the
-        // daemon eventually times the suspended call out. Wiring real
-        // client-side tool execution here is a separate feature.
-        SignalEvent::ClientToolCall { tool_name, .. } => UiMessage::StatusUpdate(format!(
-            "Assistant requested a client-side tool ({tool_name}) this client can't run."
-        )),
+        // Client-local tool execution (#107/#231/#76). The window must ALWAYS
+        // resolve this (via `submit_client_tool_result`) or the suspended turn
+        // wedges — the previous status-string mapping silently dropped it.
+        // `say_this` is honoured (spoken or shown inline) per the conversation's
+        // speech toggle; any other tool name is resolved with an error result so
+        // the turn still completes. See issue #76.
+        SignalEvent::ClientToolCall {
+            task_id,
+            conversation_id,
+            tool_call_id,
+            tool_name,
+            arguments,
+        } => UiMessage::ClientToolCall {
+            task_id,
+            conversation_id,
+            tool_call_id,
+            tool_name,
+            arguments,
+        },
         SignalEvent::Disconnected { reason } => UiMessage::Disconnected { reason },
     }
 }
@@ -772,6 +831,37 @@ mod tests {
         match msg {
             UiMessage::Disconnected { reason } => assert_eq!(reason, "lost"),
             other => panic!("expected Disconnected, got {other:?}"),
+        }
+    }
+
+    /// Issue #76: a `ClientToolCall` signal must map to the typed
+    /// `UiMessage::ClientToolCall` carrying every field verbatim — not the old
+    /// lossy `StatusUpdate` string, which dropped the ids and wedged the turn
+    /// (the window could never post a result without them).
+    #[test]
+    fn signal_client_tool_call_routes_to_typed_ui_message_with_all_fields() {
+        let msg = signal_to_ui_message(SignalEvent::ClientToolCall {
+            task_id: "task-9".to_string(),
+            conversation_id: "conv-7".to_string(),
+            tool_call_id: "call-3".to_string(),
+            tool_name: "say_this".to_string(),
+            arguments: serde_json::json!({ "text": "hi there" }),
+        });
+        match msg {
+            UiMessage::ClientToolCall {
+                task_id,
+                conversation_id,
+                tool_call_id,
+                tool_name,
+                arguments,
+            } => {
+                assert_eq!(task_id, "task-9");
+                assert_eq!(conversation_id, "conv-7");
+                assert_eq!(tool_call_id, "call-3");
+                assert_eq!(tool_name, "say_this");
+                assert_eq!(arguments, serde_json::json!({ "text": "hi there" }));
+            }
+            other => panic!("expected ClientToolCall, got {other:?}"),
         }
     }
 }
