@@ -203,6 +203,12 @@ impl InputBar {
         let voice_row = GtkBox::new(Orientation::Horizontal, 8);
         voice_row.add_css_class("voice-controls-row");
 
+        // Lead-in label so the `You:` / `Adele:` dropdowns read unambiguously as
+        // voice controls rather than free-floating options (issue #80).
+        let voice_leadin = Label::new(Some("Voice:"));
+        voice_leadin.add_css_class("voice-controls-leadin");
+        voice_row.append(&voice_leadin);
+
         let you_label = Label::new(Some("You:"));
         you_label.add_css_class("voice-control-label");
         voice_row.append(&you_label);
