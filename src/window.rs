@@ -898,14 +898,24 @@ impl AdelieWindow {
         tasks_window.set_hide_on_close(true);
         let tasks_window = Rc::new(tasks_window);
 
+        // Window-lifetime shutdown signal (GTK-1). The `connection_manager`
+        // task (spawned below) subscribes to this; `close-request` flips it so
+        // the manager stops reconnecting, drops its `Arc<Connector>` clone
+        // (ending the daemon session), and drops its `ui_tx` clone — the first
+        // domino in letting the bridge channel close and the widget tree free.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
         // The popup isn't owned by the `Application`, so closing the main window
         // won't reap it on its own. Destroy it when the chat window closes so it
         // never lingers past client exit (`hide_on_close` is bypassed by an
-        // explicit `destroy`).
+        // explicit `destroy`). The same close also signals connection shutdown
+        // (GTK-1) — both for the titlebar close button and the Disconnect menu
+        // item (which routes through `window.close()`).
         window.connect_close_request(glib::clone!(
             #[strong]
             tasks_window,
             move |_| {
+                let _ = shutdown_tx.send(true);
                 tasks_window.destroy();
                 glib::Propagation::Proceed
             }
@@ -1294,10 +1304,12 @@ impl AdelieWindow {
         // Spawn persistent connection manager (connect → forward → reconnect).
         // It now delivers the freshly connected `Connector` to the main thread
         // via `UiMessage::ClientReady` on the same channel as every other UI
-        // message (handled in `handle_ui_message`).
+        // message (handled in `handle_ui_message`). It exits when the window's
+        // `close-request` signals `shutdown_rx` (GTK-1), dropping its connector
+        // and sender clones.
         {
             let ui_tx = bridge.ui_sender();
-            bridge.spawn(connection_manager(config.clone(), ui_tx));
+            bridge.spawn(connection_manager(config.clone(), ui_tx, shutdown_rx));
         }
 
         // Sidebar row activation → load conversation
