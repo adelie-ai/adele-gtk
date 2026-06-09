@@ -33,6 +33,12 @@ struct WindowState {
     current_conversation_id: Option<String>,
     current_conversation: Option<ConversationDetail>,
     pending_request_id: Option<String>,
+    /// The conversation the in-flight stream belongs to, recorded **at send
+    /// time** from `PromptSent` (GTK-2, "the stream knows its conversation").
+    /// Chunk rendering, completion, narration, and the chat status line are
+    /// keyed off this — never off whichever conversation happens to be open
+    /// when an event arrives. Cleared with `pending_request_id`.
+    pending_conversation_id: Option<String>,
     streaming_buffer: String,
     debug_enabled: bool,
     /// Per-conversation `You:` (voice input) state (issue #80), keyed by
@@ -464,7 +470,10 @@ impl WindowState {
                 }
                 vec![Effect::SetConversations(self.conversations.clone())]
             }
-            UiMessage::PromptSent { task_id: _ } => {
+            UiMessage::PromptSent {
+                task_id: _,
+                conversation_id,
+            } => {
                 // The wire ack carries either a `task_id` (post-#114
                 // `SendMessageAck`) or an empty string (legacy `Ack`). Neither
                 // is the chunk-stream `request_id` — that is daemon-generated
@@ -472,6 +481,10 @@ impl WindowState {
                 // sentinel until then; `StreamChunk` claims it on first frame.
                 // See issue #31.
                 self.pending_request_id = Some("__pending__".to_string());
+                // Tie the stream to its conversation as captured at send time
+                // (GTK-2): every later stream event is judged against this id,
+                // not against whatever conversation is open when it arrives.
+                self.pending_conversation_id = Some(conversation_id);
                 self.streaming_buffer.clear();
                 vec![]
             }
@@ -1111,16 +1124,7 @@ impl AdelieWindow {
         window.set_child(Some(&paned));
 
         // Shared state
-        let state = Rc::new(RefCell::new(WindowState {
-            conversations: Vec::new(),
-            current_conversation_id: None,
-            current_conversation: None,
-            pending_request_id: None,
-            streaming_buffer: String::new(),
-            debug_enabled: false,
-            conversation_voice_in: HashMap::new(),
-            conversation_adele_output: HashMap::new(),
-        }));
+        let state = Rc::new(RefCell::new(WindowState::default()));
 
         // Wrap widgets in Rc for closures
         let sidebar = Rc::new(sidebar);
@@ -1679,7 +1683,14 @@ impl AdelieWindow {
                             };
                             match result {
                                 Ok(task_id) => {
-                                    let _ = tx.send(UiMessage::PromptSent { task_id });
+                                    // `conv_id` was captured at send time (GTK-2):
+                                    // even if the user has switched conversations
+                                    // by the time the ack arrives, the stream is
+                                    // tied to the conversation it was sent into.
+                                    let _ = tx.send(UiMessage::PromptSent {
+                                        task_id,
+                                        conversation_id: conv_id,
+                                    });
                                 }
                                 Err(e) => {
                                     let _ = tx.send(UiMessage::Error(format!("Send error: {e}")));
@@ -2883,10 +2894,186 @@ mod tests {
         };
         let effects = state.apply(UiMessage::PromptSent {
             task_id: "ack-1".to_string(),
+            conversation_id: "c1".to_string(),
         });
         assert!(effects.is_empty(), "PromptSent performs no widget effects");
         assert_eq!(state.pending_request_id.as_deref(), Some("__pending__"));
         assert!(state.streaming_buffer.is_empty());
+    }
+
+    /// GTK-2: the stream knows its conversation — `PromptSent` records the
+    /// send-time conversation id so later stream events can be judged against
+    /// the originating conversation, not whichever one is open.
+    #[test]
+    fn prompt_sent_records_originating_conversation() {
+        let mut state = WindowState {
+            // The user already switched to c2 by the time the ack arrived; the
+            // recorded conversation must still be the send-time one.
+            current_conversation_id: Some("c2".to_string()),
+            ..Default::default()
+        };
+        state.apply(UiMessage::PromptSent {
+            task_id: "ack-1".to_string(),
+            conversation_id: "c1".to_string(),
+        });
+        assert_eq!(state.pending_conversation_id.as_deref(), Some("c1"));
+    }
+
+    // --- GTK-2: in-flight stream vs conversation switch -------------------
+
+    /// Pin a pending stream originating in `from`, viewed from `current`.
+    fn mid_stream_state(from: &str, current: &str) -> WindowState {
+        WindowState {
+            pending_request_id: Some("req-real".to_string()),
+            pending_conversation_id: Some(from.to_string()),
+            current_conversation_id: Some(current.to_string()),
+            current_conversation: Some(detail(current, vec![msg("user", "hi")])),
+            streaming_buffer: "partial ".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// GTK-2 acceptance: a chunk arriving after the user switched away keeps
+    /// buffering for the originating conversation but is NOT rendered into the
+    /// newly opened conversation's chat.
+    #[test]
+    fn chunk_after_conversation_switch_is_buffered_not_rendered() {
+        let mut state = mid_stream_state("c1", "c2");
+        let effects = state.apply(UiMessage::StreamChunk {
+            request_id: "req-real".to_string(),
+            chunk: "more".to_string(),
+        });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::ReceiveChunk(_))),
+            "a background stream's chunk must not render into the open conversation: {effects:?}"
+        );
+        assert_eq!(
+            state.streaming_buffer, "partial more",
+            "the chunk must still accumulate for the originating conversation"
+        );
+    }
+
+    /// GTK-2 acceptance: `StreamComplete` after a switch finalizes the
+    /// originating conversation only — the currently open conversation's cache
+    /// and chat view stay untouched.
+    #[test]
+    fn complete_after_switch_does_not_append_to_current_conversation() {
+        let mut state = mid_stream_state("c1", "c2");
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-real".to_string(),
+            full_response: "the answer".to_string(),
+        });
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::CompleteStreaming(_))),
+            "a background completion must not finalize into the open chat: {effects:?}"
+        );
+        let current = state.current_conversation.as_ref().unwrap();
+        assert!(
+            current.messages.iter().all(|m| m.content != "the answer"),
+            "the reply must not be appended to the wrong conversation"
+        );
+        assert!(state.pending_request_id.is_none(), "stream is over");
+        assert!(state.pending_conversation_id.is_none(), "stream is over");
+    }
+
+    /// GTK-2: an `AssistantStatus` for a background stream must not paint the
+    /// open conversation's status line.
+    #[test]
+    fn assistant_status_for_background_stream_is_not_shown() {
+        let mut state = mid_stream_state("c1", "c2");
+        let effects = state.apply(UiMessage::AssistantStatus {
+            request_id: "req-real".to_string(),
+            message: "Searching...".to_string(),
+        });
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetChatStatus(_))),
+            "background status must not show over another conversation: {effects:?}"
+        );
+    }
+
+    /// GTK-2: switching away mid-stream clears the chat status line that
+    /// belonged to the streaming conversation's turn.
+    #[test]
+    fn switching_away_mid_stream_clears_chat_status() {
+        let mut state = mid_stream_state("c1", "c1");
+        let effects = state.apply(UiMessage::ConversationLoaded(detail("c2", vec![])));
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::ClearChatStatus)),
+            "the streaming turn's status must not linger over c2: {effects:?}"
+        );
+    }
+
+    /// GTK-2: switching back to the streaming conversation mid-stream re-seeds
+    /// the partial reply into the chat view (the buffered prefix would
+    /// otherwise be missing until completion).
+    #[test]
+    fn switching_back_to_streaming_conversation_reseeds_partial_reply() {
+        let mut state = mid_stream_state("c1", "c2");
+        let effects = state.apply(UiMessage::ConversationLoaded(detail("c1", vec![])));
+        let position_load = effects
+            .iter()
+            .position(|e| matches!(e, Effect::LoadConversationIntoChat(_)));
+        let position_seed = effects
+            .iter()
+            .position(|e| matches!(e, Effect::ReceiveChunk(c) if c == "partial "));
+        assert!(
+            position_seed.is_some(),
+            "the buffered partial reply must be re-seeded: {effects:?}"
+        );
+        assert!(
+            position_load < position_seed,
+            "the seed must render after the conversation loads: {effects:?}"
+        );
+    }
+
+    /// GTK-2 unhappy path: a disconnect while the streaming conversation is
+    /// backgrounded must not finalize the truncated buffer into the open
+    /// conversation.
+    #[test]
+    fn disconnect_mid_stream_after_switch_does_not_finalize_into_current() {
+        let mut state = mid_stream_state("c1", "c2");
+        let effects = state.apply(UiMessage::Disconnected {
+            reason: "socket closed".to_string(),
+        });
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::CompleteStreaming(_))),
+            "the truncated background stream must not render into c2: {effects:?}"
+        );
+        let current = state.current_conversation.as_ref().unwrap();
+        assert!(
+            current
+                .messages
+                .iter()
+                .all(|m| !m.content.contains("[Connection lost]")),
+            "the [Connection lost] marker must not land in the wrong conversation"
+        );
+        assert!(state.pending_request_id.is_none());
+        assert!(state.pending_conversation_id.is_none());
+    }
+
+    /// GTK-2/GTK-4: reply narration follows the originating conversation —
+    /// a completion for a backgrounded conversation produces no audio even
+    /// when that conversation's gate is wide open (`Adele == Always`).
+    #[test]
+    fn narration_skipped_when_originating_conversation_backgrounded() {
+        let mut state = mid_stream_state("c1", "c2");
+        state
+            .conversation_adele_output
+            .insert("c1".to_string(), AdeleOutput::Always);
+        let effects = state.apply(UiMessage::StreamComplete {
+            request_id: "req-real".to_string(),
+            full_response: "an answer".to_string(),
+        });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "a background conversation's reply must not be narrated: {effects:?}"
+        );
     }
 
     #[test]
@@ -3673,6 +3860,7 @@ mod tests {
     /// pinned pending request — the reply-narration trigger.
     fn stream_complete_in(state: &mut WindowState, full_response: &str) -> Vec<Effect> {
         state.pending_request_id = Some("req".to_string());
+        state.pending_conversation_id = Some("c1".to_string());
         state.current_conversation = Some(detail("c1", vec![]));
         state.apply(UiMessage::StreamComplete {
             request_id: "req".to_string(),
@@ -4053,58 +4241,143 @@ mod tests {
         assert_eq!(state.adele_output_for_current(), AdeleOutput::Always);
     }
 
-    /// A `request_voice` tagged for a non-active conversation applies to the
-    /// ACTIVE conversation (mirrors say_this's gating) and never writes the
-    /// foreign conversation's state — but still resolves.
+    // --- GTK-4: client tools keyed off the *call's* conversation ----------
+
+    /// GTK-4 acceptance: a `say_this` for a background conversation produces
+    /// no audio — even when that conversation's own gate is open — and the
+    /// text is downgraded to an inline note so it isn't lost. The turn still
+    /// resolves exactly once.
     #[test]
-    fn request_voice_for_other_conversation_uses_active_no_bleed() {
+    fn say_this_for_background_conversation_no_audio_inline_note() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        // The call's conversation has speech wide open — but it isn't in view.
+        state
+            .conversation_adele_output
+            .insert("c2".to_string(), AdeleOutput::Always);
+        let effects = state.apply(say_this_call("c2", "background aside"));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "a background conversation's say_this must never play audio: {effects:?}"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::AddInlineNote(t) if t.contains("background aside"))),
+            "the aside must be shown as text instead: {effects:?}"
+        );
+        let results = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::SubmitClientToolResult { result: Ok(_), .. }))
+            .count();
+        assert_eq!(results, 1, "exactly one Ok result: {effects:?}");
+    }
+
+    /// GTK-4: a background `say_this` must not borrow the *active*
+    /// conversation's open gate either — the old code gated on the active
+    /// conversation and played the foreign aside under it.
+    #[test]
+    fn background_say_this_does_not_borrow_active_conversations_gate() {
+        let mut state = state_with(true, AdeleOutput::Always); // active c1, gate open
+        let effects = state.apply(say_this_call("c2", "should not play"));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "c2's aside must not play under c1's gate: {effects:?}"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::AddInlineNote(_))),
+            "the aside downgrades to text: {effects:?}"
+        );
+    }
+
+    /// GTK-4: the `say_this` gate is keyed off the call's conversation when it
+    /// IS the active one — `Disabled` there downgrades to the inline note even
+    /// if some other conversation has speech on.
+    #[test]
+    fn active_say_this_gates_on_its_own_conversations_level() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        state
+            .conversation_adele_output
+            .insert("c9".to_string(), AdeleOutput::Always); // unrelated
+        let effects = state.apply(say_this_call("c1", "quiet aside"));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "c1 is Disabled; no audio: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(
+                |e| matches!(e, Effect::AddInlineNote(t) if t == "(speech mode disabled) quiet aside")
+            ),
+            "expected the inline downgrade note: {effects:?}"
+        );
+    }
+
+    /// GTK-4 acceptance: `request_voice` for a background conversation flips
+    /// THAT conversation's level — not the viewed one's — and does not touch
+    /// the dropdown (which reflects the viewed conversation). Still resolves.
+    #[test]
+    fn request_voice_targets_call_conversation_when_backgrounded() {
         let mut state = WindowState {
             current_conversation_id: Some("c1".to_string()),
             ..Default::default()
         };
         let effects = state.apply(voice_tool_call("c2", "request_voice"));
         assert_eq!(
+            state.conversation_adele_output.get("c2").copied(),
+            Some(AdeleOutput::OnDemand),
+            "request_voice must write the call's conversation"
+        );
+        assert_eq!(
             state.adele_output_for_current(),
-            AdeleOutput::OnDemand,
-            "request_voice applies to the active conversation"
+            AdeleOutput::Disabled,
+            "the viewed conversation must not be flipped into voice mode"
         );
         assert!(
-            !state.conversation_adele_output.contains_key("c2"),
-            "a foreign-tagged call must not write c2's state: {:?}",
-            state.conversation_adele_output
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetAdeleOutputDropdown(_))),
+            "the dropdown shows the viewed conversation; a background change must not touch it: {effects:?}"
         );
         assert!(
             effects
                 .iter()
-                .any(|e| matches!(e, Effect::SubmitClientToolResult { .. })),
+                .any(|e| matches!(e, Effect::SubmitClientToolResult { result: Ok(_), .. })),
             "still always resolves: {effects:?}"
         );
     }
 
-    /// A `say_this` whose `conversation_id` differs from the active one is judged
-    /// against the *active* conversation's Adele level, never another's (no
-    /// cross-conversation bleed).
+    /// GTK-4: `stop_voice` for a background conversation clears THAT
+    /// conversation's level, leaves the viewed one alone, and skips the
+    /// dropdown.
     #[test]
-    fn say_this_for_other_conversation_uses_active_level_no_bleed() {
-        let mut state = WindowState {
-            current_conversation_id: Some("c1".to_string()),
-            ..Default::default()
-        };
-        // c2 has Adele=Always, but the active conversation is c1 (Disabled). A
-        // call tagged c2 must NOT borrow c2's level to play audio on this client.
+    fn stop_voice_targets_call_conversation_when_backgrounded() {
+        let mut state = state_with(true, AdeleOutput::OnDemand); // viewed c1
         state
             .conversation_adele_output
             .insert("c2".to_string(), AdeleOutput::Always);
-        let effects = state.apply(say_this_call("c2", "should not play"));
-        assert!(
-            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
-            "a call for a non-active conversation must not borrow its level: {effects:?}"
+        let effects = state.apply(voice_tool_call("c2", "stop_voice"));
+        assert_eq!(
+            state.conversation_adele_output.get("c2").copied(),
+            Some(AdeleOutput::Disabled),
+            "stop_voice must write the call's conversation"
+        );
+        assert_eq!(
+            state.adele_output_for_current(),
+            AdeleOutput::OnDemand,
+            "the viewed conversation must keep its level"
         );
         assert!(
-            effects
+            !effects
                 .iter()
-                .any(|e| matches!(e, Effect::SubmitClientToolResult { .. })),
-            "still always resolves: {effects:?}"
+                .any(|e| matches!(e, Effect::SetAdeleOutputDropdown(_))),
+            "a background change must not touch the dropdown: {effects:?}"
         );
     }
 
