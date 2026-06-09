@@ -385,12 +385,21 @@ impl AsyncBridge {
         F: Fn(UiMessage, &mpsc::UnboundedSender<UiMessage>) + 'static,
     {
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMessage>();
-        let handler_tx = ui_tx.clone();
+        // The loop must NOT hold a strong sender to its own channel (GTK-1):
+        // that made the channel permanently unclosable, so the loop — and the handler's
+        // captured widget Rcs — lived forever after the window closed. A weak
+        // sender is upgraded per message instead; once every strong sender
+        // (the bridge + spawned tasks' clones) is gone, `recv()` returns
+        // `None`, the loop exits, and the handler (with its widgets) drops.
+        let weak_tx = ui_tx.downgrade();
 
         // Spawn a local future on the GLib main context to receive messages
         glib::spawn_future_local(async move {
             while let Some(msg) = ui_rx.recv().await {
-                handler(msg, &handler_tx);
+                // All strong senders gone: nothing can act on follow-ups the
+                // handler would send, so stop draining and exit.
+                let Some(tx) = weak_tx.upgrade() else { break };
+                handler(msg, &tx);
             }
         });
 
@@ -430,7 +439,7 @@ where
 pub async fn connection_manager(
     config: ConnectionConfig,
     ui_tx: mpsc::UnboundedSender<UiMessage>,
-    _shutdown: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     const INITIAL_BACKOFF_SECS: u64 = 2;
     const MAX_BACKOFF_SECS: u64 = 30;
@@ -438,142 +447,27 @@ pub async fn connection_manager(
     let mut backoff_secs = INITIAL_BACKOFF_SECS;
 
     loop {
-        match Connector::connect(&config).await {
+        // Every await in the cycle (connect, the connected session, the
+        // backoff sleep) races the shutdown signal, so a closing window can
+        // interrupt the manager wherever it is.
+        let connect_result = tokio::select! {
+            result = Connector::connect(&config) => result,
+            _ = shutdown_requested(&mut shutdown) => return,
+        };
+
+        match connect_result {
             Ok(connector) => {
                 backoff_secs = INITIAL_BACKOFF_SECS;
-                // Subscribe before issuing any prompt so no early chunk is
-                // lost; the fanout pump inside the `Connector` keeps running as
-                // long as the `Arc<Connector>` is alive (held by the window).
-                let mut signal_rx = connector.subscribe();
-                let connector = Arc::new(connector);
-                // `client()` borrows the transport owned by the `Connector`;
-                // the connector outlives every use below (and the shared
-                // `Arc` clone handed to the GTK thread keeps the pump alive).
-                let transport = connector.client();
-
-                let label = connector.label().to_string();
-                if ui_tx.send(UiMessage::Connected { label }).is_err() {
-                    return;
-                }
-
-                // Hand the connector to the GTK main thread before the
-                // conversation list (which needs it). Same channel, so
-                // delivery stays ordered.
-                if ui_tx
-                    .send(UiMessage::ClientReady(Arc::clone(&connector)))
-                    .is_err()
-                {
-                    return;
-                }
-
-                // Refresh conversation list on connect
-                match transport.list_conversations().await {
-                    Ok(convs) => {
-                        if ui_tx.send(UiMessage::ConversationsLoaded(convs)).is_err() {
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        if ui_tx
-                            .send(UiMessage::Error(format!("Load conversations: {e}")))
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-
-                // Fetch available models when the transport supports it
-                // (the command channel — Uds and Ws; the D-Bus interface
-                // doesn't expose this command).
-                let listings = match transport.as_commands() {
-                    Some(cmds) => cmds
-                        .list_available_models(None, false)
-                        .await
-                        .unwrap_or_else(|e| {
-                            tracing::warn!("list_available_models failed: {e}");
-                            Vec::new()
-                        }),
-                    None => Vec::new(),
+                // Run the connected session; on shutdown the whole session
+                // future (connector, signal stream) is dropped here, which
+                // closes the transport and ends the daemon session.
+                let flow = tokio::select! {
+                    flow = drive_connection(connector, &ui_tx) => flow,
+                    _ = shutdown_requested(&mut shutdown) => return,
                 };
-                if ui_tx.send(UiMessage::ModelsLoaded(listings)).is_err() {
+                if flow.is_break() {
                     return;
                 }
-
-                // Resolve the interactive-purpose default model so the picker
-                // can show a concrete fallback for conversations with no stored
-                // selection (issue #53). Graceful: on failure (or a D-Bus
-                // transport that doesn't carry GetPurposes) we send `None` and
-                // the picker degrades to its last-resort "Model" label.
-                let default_model = match crate::management_client::get_purposes(transport).await {
-                    Ok(purposes) => interactive_default_from_purposes(&purposes),
-                    Err(e) => {
-                        tracing::warn!("get_purposes failed; default model unresolved: {e}");
-                        None
-                    }
-                };
-                if ui_tx
-                    .send(UiMessage::DefaultModelLoaded(default_model))
-                    .is_err()
-                {
-                    return;
-                }
-
-                // Subscribe to background-task events and fetch the initial
-                // snapshot over the command channel (Uds and Ws). The D-Bus
-                // surface does not expose background tasks (issue #116 covers
-                // that path).
-                if let Some(cmds) = transport.as_commands() {
-                    if let Err(e) = cmds
-                        .send_command(api::Command::SubscribeBackgroundTasks)
-                        .await
-                    {
-                        tracing::warn!("SubscribeBackgroundTasks failed: {e}");
-                    }
-                    match cmds
-                        .send_command(api::Command::ListBackgroundTasks {
-                            include_finished: false,
-                            limit: None,
-                        })
-                        .await
-                    {
-                        Ok(api::CommandResult::BackgroundTasks(tasks)) => {
-                            if ui_tx.send(UiMessage::TasksLoaded(tasks)).is_err() {
-                                return;
-                            }
-                        }
-                        Ok(other) => {
-                            tracing::warn!(
-                                "unexpected response for ListBackgroundTasks: {other:?}"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!("ListBackgroundTasks failed: {e}");
-                        }
-                    }
-                }
-
-                // Background-task updates now arrive via the streaming
-                // `SignalEvent::Task*` family below (issue #22 — replaces the
-                // earlier 5 s `ListBackgroundTasks` poll). The initial
-                // `ListBackgroundTasks` snapshot above seeds the panel; the
-                // streaming arms in `match signal` keep it live.
-
-                // Forward signals until disconnect. The `Connector`'s fanout
-                // emits a terminal `SignalEvent::Disconnected` and then closes
-                // this receiver when the underlying stream ends, so the normal
-                // path already delivers a `UiMessage::Disconnected` here.
-                while let Some(signal) = signal_rx.recv().await {
-                    if ui_tx.send(signal_to_ui_message(signal)).is_err() {
-                        return;
-                    }
-                }
-
-                // signal_rx closed without a Disconnected event (shouldn't
-                // happen normally, but handle it defensively)
-                let _ = ui_tx.send(UiMessage::Disconnected {
-                    reason: "Connection lost".to_string(),
-                });
             }
             Err(e) => {
                 if ui_tx
@@ -597,9 +491,172 @@ pub async fn connection_manager(
             return;
         }
 
-        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+            _ = shutdown_requested(&mut shutdown) => return,
+        }
         backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
     }
+}
+
+/// Resolves when window shutdown is requested: the value flipped to `true`
+/// (close-request fired) or the sender dropped (window torn down without an
+/// explicit signal). Never resolves while the window is alive and open.
+async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// One connected session: hand the connector to the GTK thread, run the
+/// initial fetches, then forward signals until the connection ends.
+///
+/// Returns [`ControlFlow::Break`] when `ui_tx` is closed (the window's receive
+/// loop is gone — the manager must exit) and [`ControlFlow::Continue`] when
+/// the connection dropped (the manager should reconnect).
+async fn drive_connection(
+    connector: Connector,
+    ui_tx: &mpsc::UnboundedSender<UiMessage>,
+) -> std::ops::ControlFlow<()> {
+    use std::ops::ControlFlow::{Break, Continue};
+
+    // Subscribe before issuing any prompt so no early chunk is
+    // lost; the fanout pump inside the `Connector` keeps running as
+    // long as the `Arc<Connector>` is alive (held by the window).
+    let mut signal_rx = connector.subscribe();
+    let connector = Arc::new(connector);
+    // `client()` borrows the transport owned by the `Connector`;
+    // the connector outlives every use below (and the shared
+    // `Arc` clone handed to the GTK thread keeps the pump alive).
+    let transport = connector.client();
+
+    let label = connector.label().to_string();
+    if ui_tx.send(UiMessage::Connected { label }).is_err() {
+        return Break(());
+    }
+
+    // Hand the connector to the GTK main thread before the
+    // conversation list (which needs it). Same channel, so
+    // delivery stays ordered.
+    if ui_tx
+        .send(UiMessage::ClientReady(Arc::clone(&connector)))
+        .is_err()
+    {
+        return Break(());
+    }
+
+    // Refresh conversation list on connect
+    match transport.list_conversations().await {
+        Ok(convs) => {
+            if ui_tx.send(UiMessage::ConversationsLoaded(convs)).is_err() {
+                return Break(());
+            }
+        }
+        Err(e) => {
+            if ui_tx
+                .send(UiMessage::Error(format!("Load conversations: {e}")))
+                .is_err()
+            {
+                return Break(());
+            }
+        }
+    }
+
+    // Fetch available models when the transport supports it
+    // (the command channel — Uds and Ws; the D-Bus interface
+    // doesn't expose this command).
+    let listings = match transport.as_commands() {
+        Some(cmds) => cmds
+            .list_available_models(None, false)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("list_available_models failed: {e}");
+                Vec::new()
+            }),
+        None => Vec::new(),
+    };
+    if ui_tx.send(UiMessage::ModelsLoaded(listings)).is_err() {
+        return Break(());
+    }
+
+    // Resolve the interactive-purpose default model so the picker
+    // can show a concrete fallback for conversations with no stored
+    // selection (issue #53). Graceful: on failure (or a D-Bus
+    // transport that doesn't carry GetPurposes) we send `None` and
+    // the picker degrades to its last-resort "Model" label.
+    let default_model = match crate::management_client::get_purposes(transport).await {
+        Ok(purposes) => interactive_default_from_purposes(&purposes),
+        Err(e) => {
+            tracing::warn!("get_purposes failed; default model unresolved: {e}");
+            None
+        }
+    };
+    if ui_tx
+        .send(UiMessage::DefaultModelLoaded(default_model))
+        .is_err()
+    {
+        return Break(());
+    }
+
+    // Subscribe to background-task events and fetch the initial
+    // snapshot over the command channel (Uds and Ws). The D-Bus
+    // surface does not expose background tasks (issue #116 covers
+    // that path).
+    if let Some(cmds) = transport.as_commands() {
+        if let Err(e) = cmds
+            .send_command(api::Command::SubscribeBackgroundTasks)
+            .await
+        {
+            tracing::warn!("SubscribeBackgroundTasks failed: {e}");
+        }
+        match cmds
+            .send_command(api::Command::ListBackgroundTasks {
+                include_finished: false,
+                limit: None,
+            })
+            .await
+        {
+            Ok(api::CommandResult::BackgroundTasks(tasks)) => {
+                if ui_tx.send(UiMessage::TasksLoaded(tasks)).is_err() {
+                    return Break(());
+                }
+            }
+            Ok(other) => {
+                tracing::warn!("unexpected response for ListBackgroundTasks: {other:?}");
+            }
+            Err(e) => {
+                tracing::warn!("ListBackgroundTasks failed: {e}");
+            }
+        }
+    }
+
+    // Background-task updates now arrive via the streaming
+    // `SignalEvent::Task*` family below (issue #22 — replaces the
+    // earlier 5 s `ListBackgroundTasks` poll). The initial
+    // `ListBackgroundTasks` snapshot above seeds the panel; the
+    // streaming arms in `match signal` keep it live.
+
+    // Forward signals until disconnect. The `Connector`'s fanout
+    // emits a terminal `SignalEvent::Disconnected` and then closes
+    // this receiver when the underlying stream ends, so the normal
+    // path already delivers a `UiMessage::Disconnected` here.
+    while let Some(signal) = signal_rx.recv().await {
+        if ui_tx.send(signal_to_ui_message(signal)).is_err() {
+            return Break(());
+        }
+    }
+
+    // signal_rx closed without a Disconnected event (shouldn't
+    // happen normally, but handle it defensively)
+    let _ = ui_tx.send(UiMessage::Disconnected {
+        reason: "Connection lost".to_string(),
+    });
+    Continue(())
 }
 
 /// The daemon sentinel meaning "inherit from the interactive purpose"; it
