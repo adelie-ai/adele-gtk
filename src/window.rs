@@ -1293,12 +1293,6 @@ impl AdelieWindow {
             } else {
                 None
             });
-        // Set when a turn was started by the embedded mic button, so only
-        // voice-initiated replies are spoken (a typed message stays silent).
-        // Lives outside `WindowState` to keep `apply()` pure; the reply-playback
-        // hook reads + clears it in the effect executor.
-        let voice_reply_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-
         // Connector wrapped in Arc for async tasks, Rc<RefCell<>> for GTK
         // thread. The `Connector` owns the transport; call `.client()` for the
         // `&TransportClient` surface (`as_commands()`, `AssistantClient` RPCs).
@@ -1340,8 +1334,6 @@ impl AdelieWindow {
             embedded_voice,
             #[strong]
             voice,
-            #[strong]
-            voice_reply_pending,
             move |msg, ui_tx| {
                 handle_ui_message(
                     msg,
@@ -1358,7 +1350,6 @@ impl AdelieWindow {
                     &toast_label,
                     &embedded_voice,
                     &voice,
-                    &voice_reply_pending,
                     ui_tx,
                 );
             }
@@ -1870,14 +1861,7 @@ impl AdelieWindow {
             // block) so it can reuse `send_action`; the daemon path wires the
             // mic separately in `wire_voice_controls`.
             if let Some(engine) = (*embedded_voice).clone() {
-                wire_embedded_mic(
-                    engine,
-                    &input_bar,
-                    &send_action,
-                    &state,
-                    &bridge,
-                    &voice_reply_pending,
-                );
+                wire_embedded_mic(engine, &input_bar, &send_action, &state, &bridge);
             }
         }
 
@@ -2390,8 +2374,8 @@ fn wire_voice_controls(
 /// (mic → Silero VAD endpoint → Whisper), drops the transcript into the input
 /// box, and fires the same `send_action` a typed message uses — so the spoken
 /// prompt lands in the active conversation through the app's normal assistant
-/// path. The reply is spoken by the `CompleteStreaming` hook (gated on
-/// `voice_reply_pending`, set here before the send).
+/// path. The reply is narrated only if the conversation's `AdeleOutput` gate
+/// holds (#80): dictation itself no longer forces narration (GTK-3).
 ///
 /// A click **while a reply is playing barges in** (stops playback) instead of
 /// starting a new turn, mirroring the daemon mic button. The button reflects
@@ -2405,7 +2389,6 @@ fn wire_embedded_mic(
     send_action: &Rc<impl Fn() + 'static>,
     state: &Rc<RefCell<WindowState>>,
     bridge: &Rc<AsyncBridge>,
-    voice_reply_pending: &Rc<Cell<bool>>,
 ) {
     // Guards against a second click starting an overlapping dictation while one
     // is already in flight (the mic stream + Whisper are single-shot per turn).
@@ -2422,8 +2405,6 @@ fn wire_embedded_mic(
         state,
         #[strong]
         bridge,
-        #[strong]
-        voice_reply_pending,
         #[strong]
         dictating,
         move |_| {
@@ -2468,8 +2449,6 @@ fn wire_embedded_mic(
                 #[strong]
                 send_action,
                 #[strong]
-                voice_reply_pending,
-                #[strong]
                 dictating,
                 #[strong]
                 bridge,
@@ -2501,10 +2480,10 @@ fn wire_embedded_mic(
 
                     match result {
                         Ok(Ok(Some(text))) => {
-                            // Mark the turn as voice-initiated so its reply is
-                            // spoken, then drop the transcript into the input
-                            // box and send it like a typed message.
-                            voice_reply_pending.set(true);
+                            // Drop the transcript into the input box and send it
+                            // like a typed message. Reply narration is decided by
+                            // the conversation's `AdeleOutput` gate (#80, GTK-3),
+                            // not by the fact that this turn was dictated.
                             input_bar.set_text(&text);
                             send_action();
                         }
@@ -2603,18 +2582,8 @@ fn handle_ui_message(
     toast_label: &Rc<Label>,
     embedded_voice: &Rc<Option<crate::voice_embedded::EmbeddedVoice>>,
     voice: &Rc<RefCell<Option<VoiceController>>>,
-    voice_reply_pending: &Rc<Cell<bool>>,
     ui_tx: &mpsc::UnboundedSender<UiMessage>,
 ) {
-    // Embedded voice (issue #65): a voice turn that ends in an error never
-    // reaches `CompleteStreaming`, so clear the "speak the reply" flag here on a
-    // stream error. Otherwise the flag would leak onto the next (possibly typed)
-    // turn and speak a reply the user didn't dictate. The successful path clears
-    // it in the `CompleteStreaming` effect below.
-    if matches!(msg, UiMessage::StreamError { .. }) {
-        voice_reply_pending.set(false);
-    }
-
     // Pure decision: mutate state + compute the effects to perform.
     let effects = state.borrow_mut().apply(msg);
 
@@ -2702,22 +2671,12 @@ fn handle_ui_message(
             }
             Effect::CompleteStreaming(full) => {
                 chat_view.borrow_mut().complete_streaming(&full);
-                // Voice (issues #65/#80): speak the reply only when this turn was
-                // started by the embedded mic button (so typed messages stay
-                // silent). The flag is consumed here. Narration is routed
-                // daemon-first and chunked through the shared `speak_text` helper
-                // (#80): on the embedded path `voice` is `None` so it uses the
-                // in-process engine; if a daemon is connected it speaks via the
-                // warm `SayText` instead — one short sentence per synth call.
-                if voice_reply_pending.replace(false) {
-                    let voice = voice.borrow().clone();
-                    let embedded = (**embedded_voice).clone();
-                    let ui_tx = ui_tx.clone();
-                    let reply = full.clone();
-                    crate::async_bridge::spawn_on_runtime(async move {
-                        speak_text(voice, embedded, ui_tx, reply).await;
-                    });
-                }
+                // Reply narration is owned entirely by the `AdeleOutput` gate
+                // (#80): `apply()` emits `Effect::Speak` iff the reply's
+                // conversation narrates, so there is nothing to do here. The
+                // legacy #65 `voice_reply_pending` hook that spoke every
+                // dictated reply regardless of the gate (and double-spoke
+                // alongside `Effect::Speak`) was deleted — see GTK-3.
             }
             Effect::SetModelSelection(selection) => {
                 model_picker.set_selection(selection.as_ref());
@@ -4163,6 +4122,51 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::AddInlineNote(_))),
             "no inline downgrade when spoken: {effects:?}"
+        );
+    }
+
+    // --- GTK-3: the AdeleOutput gate is the ONLY narration path -----------
+    // The legacy #65 `voice_reply_pending` hook (which spoke every dictated
+    // turn's reply regardless of the gate, and double-spoke alongside
+    // `Effect::Speak`) was deleted. These pin the post-deletion contract: a
+    // dictated turn narrates iff the conversation's gate holds, and never more
+    // than once.
+
+    /// GTK-3 acceptance: a dictated turn whose conversation has `Adele ==
+    /// Disabled` produces ZERO `Speak` effects (the gate is the only narration
+    /// path; dictation no longer force-speaks). The reply is still finalized.
+    #[test]
+    fn disabled_conversation_dictated_turn_emits_no_speak() {
+        // `You == Enabled` models a dictated turn; `Adele == Disabled` is the
+        // default output level. The old legacy hook would have spoken anyway.
+        let mut state = state_with(true, AdeleOutput::Disabled);
+        let effects = stream_complete_in(&mut state, "a silent reply");
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "Adele=Disabled must never narrate, even a dictated turn: {effects:?}"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::CompleteStreaming(t) if t == "a silent reply")),
+            "the reply text must still be finalized: {effects:?}"
+        );
+    }
+
+    /// GTK-3 acceptance: a dictated turn whose conversation narrates (`Adele ==
+    /// OnDemand` AND `You == Enabled`) produces EXACTLY ONE `Speak` effect — the
+    /// reducer is the single narration source, so there is no double-speak.
+    #[test]
+    fn narrating_conversation_dictated_turn_emits_exactly_one_speak() {
+        let mut state = state_with(true, AdeleOutput::OnDemand);
+        let effects = stream_complete_in(&mut state, "spoken once");
+        let speaks = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::Speak(t) if t == "spoken once"))
+            .count();
+        assert_eq!(
+            speaks, 1,
+            "exactly one Speak — no legacy hook double-narration: {effects:?}"
         );
     }
 
