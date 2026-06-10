@@ -102,16 +102,39 @@ fn color_scheme_prefers_dark(value: u32) -> bool {
     value == 1
 }
 
+thread_local! {
+    /// Displays this process has already installed the theme on. GTK is
+    /// single-threaded and effectively single-display, but tracking the actual
+    /// display(s) keeps the guard correct if a second one ever appears.
+    static THEMED_DISPLAYS: std::cell::RefCell<Vec<gdk::Display>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Install the app's theme handling for `display`.
 ///
 /// Installs the dark base palette unconditionally and the light overrides only
 /// while the GTK light preference is active, then keeps the choice in sync
 /// with `gtk-application-prefer-dark-theme`.
 ///
-/// Idempotent across windows: each call installs its own providers, but
-/// `style_context_add_provider_for_display` is a set keyed on the provider, so
-/// re-adding from a second window is harmless.
+/// **Idempotent per display (GTK-6):** the first call for a given display
+/// installs the providers and connects the preference-notify handler; later
+/// calls (e.g. from a second window) return immediately. Without this guard
+/// every window stacked a fresh pair of `CssProvider`s and another
+/// never-disconnected `Settings` notify handler on the shared display.
 pub fn install_for_display(display: &gdk::Display) {
+    let already = THEMED_DISPLAYS.with(|seen| {
+        let mut seen = seen.borrow_mut();
+        if seen.iter().any(|d| d == display) {
+            true
+        } else {
+            seen.push(display.clone());
+            false
+        }
+    });
+    if already {
+        return;
+    }
+
     let base_provider = CssProvider::new();
     base_provider.load_from_data(STYLE_CSS);
 

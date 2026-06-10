@@ -452,20 +452,36 @@ impl WindowState {
                     Effect::SetConversations(convs),
                     Effect::EnsureActiveConversation,
                 ];
-                // On *reconnect* the window still has an active conversation
-                // that is still present. `EnsureActiveConversation` only
-                // re-syncs the sidebar selection in that case (it does not
-                // reload the messages), so re-fetch the conversation to refresh
-                // the cached detail + chat (it may have changed while we were
-                // disconnected) — via `ReloadConversation`, which keeps the
-                // model picker intact. On the first connect there is no active
-                // conversation yet, so the initial load happens through
-                // `EnsureActiveConversation -> ConversationLoaded` (which does
-                // set the picker). See issue #72.
+                // The window already has an active conversation that is still
+                // present (reconnect, or a just-created conversation whose
+                // `ConversationCreated` set the active id). `EnsureActiveConversation`
+                // only re-syncs the sidebar selection in that case — it does not
+                // reload the messages — so fetch the conversation here:
+                //
+                // - detail already cached (a true reconnect refresh): use
+                //   `ReloadConversation`, which keeps the model picker intact
+                //   (issue #72).
+                // - detail NOT cached (a freshly-created conversation): use a
+                //   single `LoadConversation`, which arrives as
+                //   `ConversationLoaded` and sets the picker. This replaces the
+                //   old new-conversation flow that fetched twice — once
+                //   explicitly and once via this reload (GTK-10).
+                //
+                // On the very first connect there is no active conversation yet,
+                // so the initial load still happens through
+                // `EnsureActiveConversation -> ConversationLoaded`.
                 if let Some(id) = self.current_conversation_id.clone()
                     && self.conversations.iter().any(|c| c.id == id)
                 {
-                    effects.push(Effect::ReloadConversation(id));
+                    let detail_cached = self
+                        .current_conversation
+                        .as_ref()
+                        .is_some_and(|c| c.id == id);
+                    if detail_cached {
+                        effects.push(Effect::ReloadConversation(id));
+                    } else {
+                        effects.push(Effect::LoadConversation(id));
+                    }
                 }
                 effects
             }
@@ -1501,14 +1517,14 @@ impl AdelieWindow {
                         let client = connector.client();
                         match client.create_conversation("New Conversation").await {
                             Ok(id) => {
-                                let _ = tx.send(UiMessage::ConversationCreated { id: id.clone() });
-                                // Refresh conversation list
+                                // Set the new conversation active, then refresh
+                                // the list. The reducer's `ConversationsLoaded`
+                                // handler then issues a SINGLE picker-setting
+                                // `LoadConversation` for it (GTK-10) — no
+                                // separate explicit fetch here.
+                                let _ = tx.send(UiMessage::ConversationCreated { id });
                                 if let Ok(convs) = client.list_conversations().await {
                                     let _ = tx.send(UiMessage::ConversationsLoaded(convs));
-                                }
-                                // Load the new conversation
-                                if let Ok(detail) = client.get_conversation(&id).await {
-                                    let _ = tx.send(UiMessage::ConversationLoaded(detail));
                                 }
                             }
                             Err(e) => {
@@ -2672,7 +2688,8 @@ fn handle_ui_message(
                                 let _ = tx.send(UiMessage::ConversationLoaded(detail));
                             }
                             Err(e) => {
-                                let _ = tx.send(UiMessage::Error(format!("Load conversation: {e}")));
+                                let _ =
+                                    tx.send(UiMessage::Error(format!("Load conversation: {e}")));
                             }
                         }
                     });
@@ -2872,12 +2889,13 @@ fn ensure_active_conversation(
                 let client = connector.client();
                 match client.create_conversation("New Conversation").await {
                     Ok(id) => {
-                        let _ = tx.send(UiMessage::ConversationCreated { id: id.clone() });
+                        // Same single-load flow as the New button (GTK-10): set
+                        // it active + refresh the list; the reducer's
+                        // `ConversationsLoaded` issues one picker-setting
+                        // `LoadConversation`.
+                        let _ = tx.send(UiMessage::ConversationCreated { id });
                         if let Ok(convs) = client.list_conversations().await {
                             let _ = tx.send(UiMessage::ConversationsLoaded(convs));
-                        }
-                        if let Ok(detail) = client.get_conversation(&id).await {
-                            let _ = tx.send(UiMessage::ConversationLoaded(detail));
                         }
                     }
                     Err(e) => {
@@ -3393,8 +3411,14 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, Effect::ReloadConversation(_)))
             .count();
-        assert_eq!(loads, 1, "a fresh active conversation gets one LoadConversation: {effects:?}");
-        assert_eq!(reloads, 0, "and no picker-preserving ReloadConversation: {effects:?}");
+        assert_eq!(
+            loads, 1,
+            "a fresh active conversation gets one LoadConversation: {effects:?}"
+        );
+        assert_eq!(
+            reloads, 0,
+            "and no picker-preserving ReloadConversation: {effects:?}"
+        );
     }
 
     /// GTK-10: a reconnect (`ConversationsLoaded` while the active conversation's
@@ -3786,8 +3810,13 @@ mod tests {
         // Issue #72: on reconnect the (still-present) active conversation is
         // re-fetched via ReloadConversation — which refreshes the cache and
         // keeps the picker — instead of ConversationLoaded (which resets it).
+        // A true reconnect has the conversation's detail already cached (it was
+        // open before the link dropped); that cached detail is what selects the
+        // picker-preserving ReloadConversation over a fresh LoadConversation
+        // (GTK-10).
         let mut state = WindowState {
             current_conversation_id: Some("c1".to_string()),
+            current_conversation: Some(detail("c1", vec![msg("user", "earlier")])),
             ..Default::default()
         };
         let effects = state.apply(UiMessage::ConversationsLoaded(vec![summary(

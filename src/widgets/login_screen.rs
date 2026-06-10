@@ -113,8 +113,13 @@ impl LoginScreen {
         let connect_btn = Rc::new(connect_btn);
         let window_ref = window.clone();
 
-        // Use a shared flag so `populate` can schedule itself after a popover closes.
-        // The Rc<dyn Fn()> is built in two steps because the closure references itself.
+        // Use a shared cell so `populate` can re-run itself after a popover
+        // closes. The Rc<dyn Fn()> is built in two steps because the closure
+        // references itself. The self-reference is captured as a **`Weak`**
+        // (GTK-8): a strong capture would make the stored closure own the cell
+        // that owns the closure — a reference cycle that leaks the whole
+        // LoginScreen populate machinery for the process's life. Each
+        // invocation upgrades the weak back to a strong for its own duration.
         // Narrow allow: this self-referential closure cell is a one-off local; a
         // `type` alias would not reduce cognitive load and is out of scope here.
         #[allow(clippy::type_complexity)]
@@ -134,7 +139,7 @@ impl LoginScreen {
                 status_label,
                 #[weak]
                 window_ref,
-                #[strong(rename_to = populate_self)]
+                #[weak(rename_to = populate_self)]
                 populate,
                 move || {
                     // Clear existing rows
@@ -146,7 +151,7 @@ impl LoginScreen {
                     empty_label.set_visible(profs.is_empty());
                     connect_btn.set_sensitive(!profs.is_empty());
 
-                    for (idx, profile) in profs.iter().enumerate() {
+                    for profile in profs.iter() {
                         let row = ListBoxRow::new();
                         let hbox = GtkBox::new(Orientation::Horizontal, 8);
                         hbox.set_margin_start(12);
@@ -174,7 +179,11 @@ impl LoginScreen {
 
                         row.set_child(Some(&hbox));
 
-                        // Right-click context menu
+                        // Right-click context menu. Capture the profile id at
+                        // paint time (GTK-7) so Edit/Delete act on THIS profile
+                        // regardless of any repaint that reorders or drops rows
+                        // while the menu is open.
+                        let profile_id = profile.id.clone();
                         let gesture = GestureClick::new();
                         gesture.set_button(3);
                         gesture.connect_pressed(glib::clone!(
@@ -186,6 +195,8 @@ impl LoginScreen {
                             window_ref,
                             #[strong(rename_to = populate_inner)]
                             populate_self,
+                            #[strong]
+                            profile_id,
                             move |gesture, _n, x, y| {
                                 let Some(widget) = gesture.widget() else {
                                     return;
@@ -194,6 +205,9 @@ impl LoginScreen {
                                 let popover = Popover::new();
                                 popover.add_css_class("context-popover");
                                 popover.set_parent(&widget);
+                                // Unparent on close so the popover is released
+                                // instead of leaking parented to the row (GTK-5).
+                                popover.connect_closed(|p| p.unparent());
                                 popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
                                     x as i32, y as i32, 1, 1,
                                 )));
@@ -213,11 +227,13 @@ impl LoginScreen {
                                     window_inner,
                                     #[strong(rename_to = populate_edit)]
                                     populate_inner,
+                                    #[strong(rename_to = profile_id_edit)]
+                                    profile_id,
                                     move |_| {
                                         popover.popdown();
                                         let profile = {
                                             let profs = profiles_inner.borrow();
-                                            profs.get(idx).cloned()
+                                            profs.iter().find(|p| p.id == profile_id_edit).cloned()
                                         };
                                         if let Some(profile) = profile {
                                             setup_dialog::show_setup_dialog(
@@ -258,16 +274,21 @@ impl LoginScreen {
                                     status_ref,
                                     #[strong(rename_to = populate_del)]
                                     populate_inner,
+                                    #[strong(rename_to = profile_id_del)]
+                                    profile_id,
                                     move |_| {
                                         popover.popdown();
-                                        let profile_id = {
-                                            let profs = profiles_inner.borrow();
-                                            profs.get(idx).map(|p| p.id.clone())
-                                        };
-                                        if let Some(id) = profile_id {
-                                            let _ = CredentialStore::delete_credentials(&id);
+                                        // Delete the captured profile by id only
+                                        // if it still exists (GTK-7).
+                                        let exists = profiles_inner
+                                            .borrow()
+                                            .iter()
+                                            .any(|p| p.id == profile_id_del);
+                                        if exists {
+                                            let id = &profile_id_del;
+                                            let _ = CredentialStore::delete_credentials(id);
                                             let store = ProfileStore::new();
-                                            let _ = store.delete(&id);
+                                            let _ = store.delete(id);
                                             let new_profiles = store.load().unwrap_or_default();
                                             *profiles_inner.borrow_mut() = new_profiles;
                                             status_inner.set_text("Connection deleted");
