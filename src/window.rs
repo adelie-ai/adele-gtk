@@ -272,6 +272,13 @@ enum Effect {
     /// flows through `ConversationLoaded` and re-applies the picker selection),
     /// a reload must never clobber the user's pick — see issue #72.
     ReloadConversation(String),
+    /// Fetch a conversation as a *fresh switch*: the reply arrives as
+    /// `UiMessage::ConversationLoaded`, which applies the model picker selection.
+    /// Used when the active conversation has no cached detail yet (e.g. a
+    /// just-created conversation) so a single fetch both loads it and sets the
+    /// picker — replacing the old new-conversation flow's redundant second fetch
+    /// (GTK-10).
+    LoadConversation(String),
     /// Clear the chat view.
     ClearChat,
     /// Set the chat's transient status line.
@@ -370,6 +377,7 @@ impl std::fmt::Debug for Effect {
             Effect::ReloadConversation(id) => {
                 f.debug_tuple("ReloadConversation").field(id).finish()
             }
+            Effect::LoadConversation(id) => f.debug_tuple("LoadConversation").field(id).finish(),
             Effect::ClearChat => f.write_str("ClearChat"),
             Effect::SetChatStatus(m) => f.debug_tuple("SetChatStatus").field(m).finish(),
             Effect::ClearChatStatus => f.write_str("ClearChatStatus"),
@@ -524,6 +532,11 @@ impl WindowState {
             }
             UiMessage::ConversationDeleted { id } => {
                 self.conversations.retain(|c| c.id != id);
+                // Prune the deleted conversation's per-conversation voice state
+                // (GTK-9): otherwise the maps grow unbounded and a later id
+                // reuse could inherit a stale `You:`/`Adele:` setting.
+                self.conversation_voice_in.remove(&id);
+                self.conversation_adele_output.remove(&id);
                 let is_active = self.current_conversation_id.as_deref() == Some(&id);
                 if is_active {
                     self.current_conversation_id = None;
@@ -2648,6 +2661,23 @@ fn handle_ui_message(
                     });
                 }
             }
+            Effect::LoadConversation(id) => {
+                // Fresh switch-style load: the reply is `ConversationLoaded`,
+                // which applies the model picker selection (GTK-10).
+                if let Some(connector) = client.borrow().clone() {
+                    let tx = ui_tx.clone();
+                    crate::async_bridge::spawn_on_runtime(async move {
+                        match connector.client().get_conversation(&id).await {
+                            Ok(detail) => {
+                                let _ = tx.send(UiMessage::ConversationLoaded(detail));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(UiMessage::Error(format!("Load conversation: {e}")));
+                            }
+                        }
+                    });
+                }
+            }
             Effect::ClearChat => {
                 chat_view.borrow_mut().clear();
             }
@@ -3336,6 +3366,60 @@ mod tests {
                 ]
             ),
             "no streaming buffer => no CompleteStreaming: {effects:?}"
+        );
+    }
+
+    // --- GTK-10: single load for a freshly-created conversation ----------
+
+    /// GTK-10: when `ConversationsLoaded` arrives for an active conversation
+    /// whose detail is NOT yet cached (a just-created conversation), the reducer
+    /// emits a single picker-setting `LoadConversation` — never a redundant
+    /// `ReloadConversation` on top of a separate explicit fetch.
+    #[test]
+    fn conversations_loaded_for_uncached_active_emits_single_fresh_load() {
+        let mut state = WindowState {
+            current_conversation_id: Some("new".to_string()),
+            // No cached detail for "new" — it was just created.
+            current_conversation: None,
+            ..Default::default()
+        };
+        let convs = vec![summary("new", "New Conversation", false)];
+        let effects = state.apply(UiMessage::ConversationsLoaded(convs));
+        let loads = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::LoadConversation(id) if id == "new"))
+            .count();
+        let reloads = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::ReloadConversation(_)))
+            .count();
+        assert_eq!(loads, 1, "a fresh active conversation gets one LoadConversation: {effects:?}");
+        assert_eq!(reloads, 0, "and no picker-preserving ReloadConversation: {effects:?}");
+    }
+
+    /// GTK-10: a reconnect (`ConversationsLoaded` while the active conversation's
+    /// detail IS cached) still refreshes via the picker-preserving
+    /// `ReloadConversation`, never a fresh `LoadConversation` (#72 must hold).
+    #[test]
+    fn conversations_loaded_for_cached_active_reloads_not_fresh_load() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            current_conversation: Some(detail("c1", vec![msg("user", "hi")])),
+            ..Default::default()
+        };
+        let convs = vec![summary("c1", "one", false)];
+        let effects = state.apply(UiMessage::ConversationsLoaded(convs));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ReloadConversation(id) if id == "c1")),
+            "reconnect refresh must use ReloadConversation (preserves picker): {effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::LoadConversation(_))),
+            "reconnect must not re-apply the picker via LoadConversation: {effects:?}"
         );
     }
 
