@@ -1514,19 +1514,10 @@ impl AdelieWindow {
             client,
             #[strong]
             bridge,
-            #[strong]
-            state,
-            move |idx| {
-                let id = {
-                    let s = state.borrow();
-                    match s.conversations.get(idx) {
-                        Some(conv) => conv.id.clone(),
-                        None => return,
-                    }
-                };
+            move |id: &str| {
                 if let Some(connector) = client.borrow().clone() {
                     let tx = bridge.ui_sender();
-                    let id = id.clone();
+                    let id = id.to_string();
                     bridge.spawn(async move {
                         match connector.client().delete_conversation(&id).await {
                             Ok(()) => {
@@ -1552,10 +1543,10 @@ impl AdelieWindow {
             state,
             #[weak]
             window,
-            move |idx| {
+            move |id: &str| {
                 let (id, current_title) = {
                     let s = state.borrow();
-                    match s.conversations.get(idx) {
+                    match s.conversations.iter().find(|c| c.id == id) {
                         Some(conv) => (conv.id.clone(), conv.title.clone()),
                         None => return,
                     }
@@ -1656,10 +1647,10 @@ impl AdelieWindow {
             bridge,
             #[strong]
             state,
-            move |idx| {
+            move |id: &str| {
                 let (id, archived) = {
                     let s = state.borrow();
-                    match s.conversations.get(idx) {
+                    match s.conversations.iter().find(|c| c.id == id) {
                         Some(conv) => (conv.id.clone(), conv.archived),
                         None => return,
                     }
@@ -3404,6 +3395,54 @@ mod tests {
             ),
             "deleting the active conversation must clear chat + side pane + re-ensure: {effects:?}"
         );
+    }
+
+    /// GTK-9: deleting a conversation prunes its per-conversation voice maps
+    /// (`You:` input + `Adele:` output level) so a recycled/UUID-reused id can't
+    /// inherit a stale voice setting, and the maps don't grow unbounded.
+    #[test]
+    fn deleting_conversation_prunes_its_voice_maps() {
+        let mut state = WindowState {
+            conversations: vec![summary("c1", "one", false), summary("c2", "two", false)],
+            current_conversation_id: Some("c2".to_string()),
+            current_conversation: Some(detail("c2", vec![])),
+            ..Default::default()
+        };
+        // Both conversations carry voice settings.
+        state.conversation_voice_in.insert("c1".to_string(), true);
+        state
+            .conversation_adele_output
+            .insert("c1".to_string(), AdeleOutput::Always);
+        state.conversation_voice_in.insert("c2".to_string(), true);
+        state
+            .conversation_adele_output
+            .insert("c2".to_string(), AdeleOutput::OnDemand);
+
+        // Delete the inactive one.
+        state.apply(UiMessage::ConversationDeleted {
+            id: "c1".to_string(),
+        });
+        assert!(
+            !state.conversation_voice_in.contains_key("c1"),
+            "deleted conversation's You: setting must be pruned"
+        );
+        assert!(
+            !state.conversation_adele_output.contains_key("c1"),
+            "deleted conversation's Adele: level must be pruned"
+        );
+        // The surviving conversation's settings are untouched.
+        assert_eq!(state.conversation_voice_in.get("c2").copied(), Some(true));
+        assert_eq!(
+            state.conversation_adele_output.get("c2").copied(),
+            Some(AdeleOutput::OnDemand)
+        );
+
+        // Deleting the active one prunes it too.
+        state.apply(UiMessage::ConversationDeleted {
+            id: "c2".to_string(),
+        });
+        assert!(state.conversation_voice_in.is_empty());
+        assert!(state.conversation_adele_output.is_empty());
     }
 
     fn note_view(key: &str) -> api::ScratchpadNoteView {
