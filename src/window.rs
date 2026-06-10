@@ -81,15 +81,32 @@ const ALWAYS_SYSTEM_REFINEMENT: &str = "This reply will be read aloud in full, s
      and write numbers, dates, and times the way you would say them.";
 
 impl WindowState {
+    /// Whether `You:` (voice input) is Enabled for `conversation` (issue #80).
+    /// `false` when it was never set (default Disabled).
+    fn voice_in_for(&self, conversation: &str) -> bool {
+        self.conversation_voice_in
+            .get(conversation)
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// Whether `You:` (voice input) is Enabled for the *currently active*
     /// conversation. `false` when there is no active conversation or it was
     /// never set (default Disabled).
     fn voice_in_for_current(&self) -> bool {
         self.current_conversation_id
             .as_deref()
-            .and_then(|id| self.conversation_voice_in.get(id))
-            .copied()
+            .map(|id| self.voice_in_for(id))
             .unwrap_or(false)
+    }
+
+    /// The `Adele:` (voice output) level for `conversation` (issue #80).
+    /// `Disabled` when it was never set (default).
+    fn adele_output_for(&self, conversation: &str) -> AdeleOutput {
+        self.conversation_adele_output
+            .get(conversation)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// The `Adele:` (voice output) level for the *currently active*
@@ -98,27 +115,68 @@ impl WindowState {
     fn adele_output_for_current(&self) -> AdeleOutput {
         self.current_conversation_id
             .as_deref()
-            .and_then(|id| self.conversation_adele_output.get(id))
-            .copied()
+            .map(|id| self.adele_output_for(id))
             .unwrap_or_default()
     }
 
-    /// Whether a *reply* is spoken for the active conversation (issue #80):
-    /// `Adele == Always` OR (`Adele == OnDemand` AND `You == Enabled`). The gate
-    /// the reply-narration path consults; `Disabled` never narrates.
-    fn narrate_for_current(&self) -> bool {
-        match self.adele_output_for_current() {
+    /// Whether a *reply* is spoken for `conversation` (issue #80): `Adele ==
+    /// Always` OR (`Adele == OnDemand` AND `You == Enabled`). The gate the
+    /// reply-narration path consults — keyed by the *originating*
+    /// conversation (GTK-2); `Disabled` never narrates.
+    fn narrate_for(&self, conversation: &str) -> bool {
+        match self.adele_output_for(conversation) {
             AdeleOutput::Always => true,
-            AdeleOutput::OnDemand => self.voice_in_for_current(),
+            AdeleOutput::OnDemand => self.voice_in_for(conversation),
             AdeleOutput::Disabled => false,
         }
     }
 
-    /// Whether a `say_this` aside is spoken for the active conversation (issue
-    /// #80): spoken iff `Adele ∈ {OnDemand, Always}` (independent of `You`).
-    /// `Disabled` downgrades the aside to inline text.
+    /// Whether a *reply* is spoken for the *currently active* conversation —
+    /// `narrate_for` keyed by the open conversation. `false` with none open.
+    /// Test-only convenience for the gate tests; the production narration path
+    /// keys off the originating conversation (GTK-2) via `narrate_for`.
+    #[cfg(test)]
+    fn narrate_for_current(&self) -> bool {
+        self.current_conversation_id
+            .as_deref()
+            .map(|id| self.narrate_for(id))
+            .unwrap_or(false)
+    }
+
+    /// Whether a `say_this` aside is spoken for `conversation` (issue #80):
+    /// spoken iff `Adele ∈ {OnDemand, Always}` (independent of `You`) — keyed
+    /// by the *call's* conversation (GTK-4). `Disabled` downgrades the aside
+    /// to inline text.
+    fn say_this_spoken_for(&self, conversation: &str) -> bool {
+        !matches!(self.adele_output_for(conversation), AdeleOutput::Disabled)
+    }
+
+    /// Whether a `say_this` aside is spoken for the *currently active*
+    /// conversation — `say_this_spoken_for` keyed by the open conversation.
+    /// Test-only convenience; the production path keys off the call's
+    /// conversation (GTK-4) via `say_this_spoken_for`.
+    #[cfg(test)]
     fn say_this_spoken_for_current(&self) -> bool {
-        !matches!(self.adele_output_for_current(), AdeleOutput::Disabled)
+        self.current_conversation_id
+            .as_deref()
+            .map(|id| self.say_this_spoken_for(id))
+            .unwrap_or(false)
+    }
+
+    /// Whether `conversation` is the one currently open in the chat view.
+    fn is_active_conversation(&self, conversation: &str) -> bool {
+        self.current_conversation_id.as_deref() == Some(conversation)
+    }
+
+    /// Whether the in-flight stream (if any) belongs to the conversation
+    /// currently open in the chat view (GTK-2). With no recorded originating
+    /// conversation (legacy/defensive) the stream is treated as active,
+    /// preserving the pre-GTK-2 behavior.
+    fn pending_stream_is_active(&self) -> bool {
+        match self.pending_conversation_id.as_deref() {
+            Some(pending) => self.is_active_conversation(pending),
+            None => true,
+        }
     }
 }
 
@@ -409,7 +467,7 @@ impl WindowState {
                 let selection = detail.model_selection.clone();
                 self.current_conversation = Some(detail);
                 self.current_conversation_id = Some(id.clone());
-                vec![
+                let mut effects = vec![
                     Effect::SetModelSelection(selection),
                     Effect::LoadConversationIntoChat(filtered),
                     // Rebind the side pane to the new conversation: clear stale
@@ -418,7 +476,26 @@ impl WindowState {
                     Effect::SidePaneSetScratchpad(Vec::new()),
                     Effect::RefreshSidePaneTasks,
                     Effect::FetchScratchpad(id),
-                ]
+                ];
+                // A stream may still be in flight for another (or this)
+                // conversation (GTK-2). Deliberately do NOT clear the pending
+                // stream here — it keeps buffering for its originating
+                // conversation — but reconcile the view:
+                if self.pending_request_id.is_some() {
+                    if self.pending_stream_is_active() {
+                        // Switched (back) to the streaming conversation: the
+                        // fresh load wiped the partial reply from the view, so
+                        // re-seed the buffered prefix.
+                        if !self.streaming_buffer.is_empty() {
+                            effects.push(Effect::ReceiveChunk(self.streaming_buffer.clone()));
+                        }
+                    } else {
+                        // Switched away: the streaming turn's status line
+                        // belongs to the old conversation and must not linger.
+                        effects.push(Effect::ClearChatStatus);
+                    }
+                }
+                effects
             }
             UiMessage::ConversationReloaded(detail) => {
                 // A conversation already open was re-fetched (reconnect / debug /
@@ -492,8 +569,13 @@ impl WindowState {
                 request_id,
                 message,
             } => {
-                if self.pending_request_id.as_deref() == Some(&request_id)
-                    || self.pending_request_id.as_deref() == Some("__pending__")
+                // Show only for the in-flight stream AND only while its
+                // originating conversation is the one in view (GTK-2): a
+                // background turn's status must not paint over another
+                // conversation's chat.
+                if (self.pending_request_id.as_deref() == Some(&request_id)
+                    || self.pending_request_id.as_deref() == Some("__pending__"))
+                    && self.pending_stream_is_active()
                 {
                     vec![Effect::SetChatStatus(message)]
                 } else {
@@ -507,7 +589,15 @@ impl WindowState {
                 }
                 if self.pending_request_id.as_deref() == Some(&request_id) {
                     let first_chunk = self.streaming_buffer.is_empty();
+                    // Always accumulate — the buffer belongs to the stream's
+                    // originating conversation (GTK-2) and is what re-seeds the
+                    // view if the user switches back mid-stream...
                     self.streaming_buffer.push_str(&chunk);
+                    // ...but only render into the chat when that conversation
+                    // is the one in view.
+                    if !self.pending_stream_is_active() {
+                        return vec![];
+                    }
                     let mut effects = Vec::new();
                     if first_chunk {
                         effects.push(Effect::ClearChatStatus);
@@ -526,14 +616,26 @@ impl WindowState {
                     self.pending_request_id = Some(request_id.clone());
                 }
                 if self.pending_request_id.as_deref() == Some(&request_id) {
+                    // The stream belongs to its originating conversation (GTK-2),
+                    // recorded at send time — judge everything below against it,
+                    // not against whichever conversation is open right now.
+                    let origin = self.pending_conversation_id.clone();
+                    let is_active = self.pending_stream_is_active();
                     self.pending_request_id = None;
+                    self.pending_conversation_id = None;
                     self.streaming_buffer.clear();
-                    if let Some(ref mut conv) = self.current_conversation {
-                        conv.messages.push(ChatMessage {
-                            role: "assistant".to_string(),
-                            content: full_response.clone(),
-                        });
+
+                    if !is_active {
+                        // The originating conversation isn't the one in view, so
+                        // we don't hold its detail (`current_conversation`
+                        // caches only the open conversation). Touch NOTHING in
+                        // the open chat: no CompleteStreaming, no chat status, no
+                        // audio. The reply is persisted daemon-side and appears
+                        // when the user switches back and the conversation
+                        // reloads.
+                        return vec![];
                     }
+
                     // Reply narration (issue #80): narrate the finalized reply
                     // via the embedded `Speaker` when the gate holds — `Adele ==
                     // Always` OR (`Adele == OnDemand` AND `You == Enabled`).
@@ -541,8 +643,21 @@ impl WindowState {
                     // false no `Speak` effect exists, so no path plays audio.
                     // (The executor additionally no-ops when there is no embedded
                     // engine, e.g. the daemon path, which narrates its own
-                    // replies.)
-                    let narrate = self.narrate_for_current();
+                    // replies.) Keyed by the *originating* conversation (GTK-2):
+                    // a backgrounded turn never narrates (handled by the early
+                    // return above) — only an in-view streaming conversation can.
+                    let narrate = origin
+                        .as_deref()
+                        .map(|c| self.narrate_for(c))
+                        .unwrap_or(false);
+
+                    // The streaming conversation is the one in view: finalize it.
+                    if let Some(ref mut conv) = self.current_conversation {
+                        conv.messages.push(ChatMessage {
+                            role: "assistant".to_string(),
+                            content: full_response.clone(),
+                        });
+                    }
                     let mut effects = vec![Effect::ClearChatStatus];
                     if narrate {
                         effects.push(Effect::Speak(full_response.clone()));
@@ -565,12 +680,20 @@ impl WindowState {
                     self.pending_request_id = Some(request_id.clone());
                 }
                 if self.pending_request_id.as_deref() == Some(&request_id) {
+                    let is_active = self.pending_stream_is_active();
                     self.pending_request_id = None;
+                    self.pending_conversation_id = None;
                     self.streaming_buffer.clear();
-                    vec![
-                        Effect::ClearChatStatus,
-                        Effect::SetStatusText(format!("Error: {error}")),
-                    ]
+                    // Only clear the chat status line if the failed stream's
+                    // conversation is the one in view (GTK-2); a background
+                    // turn's failure must not blank another conversation's chat.
+                    // The status-text line is the global one, so always surface
+                    // the error there.
+                    let mut effects = vec![Effect::SetStatusText(format!("Error: {error}"))];
+                    if is_active {
+                        effects.insert(0, Effect::ClearChatStatus);
+                    }
+                    effects
                 } else {
                     vec![]
                 }
@@ -718,7 +841,7 @@ impl WindowState {
             }
             UiMessage::ClientToolCall {
                 task_id,
-                conversation_id: _,
+                conversation_id,
                 tool_call_id,
                 tool_name,
                 arguments,
@@ -726,29 +849,36 @@ impl WindowState {
                 // ALWAYS resolve the call (issue #76) so the suspended turn
                 // resumes — the previous code dropped it and wedged the turn.
                 //
-                // We gate/apply against the *active* conversation, not the
-                // call's `conversation_id`: a tool call for some other (e.g. a
-                // concurrent voice session's) conversation must never borrow a
-                // different conversation's state on this client. With #261's
-                // session-scoped registration the daemon already scopes tools
-                // per session; this is the belt-and-braces local guard.
+                // Every effect is keyed off the call's `conversation_id`
+                // (GTK-4), not whichever conversation is open: a tool call for a
+                // backgrounded conversation (e.g. a concurrent voice session, or
+                // a turn the user switched away from) must act on its OWN
+                // conversation's state — never borrow the viewed conversation's
+                // gate, and never play audio for a conversation the user isn't
+                // looking at. The dropdown reflects the *viewed* conversation, so
+                // it is only nudged when the call targets the active one.
+                let is_active = self.is_active_conversation(&conversation_id);
                 match tool_name.as_str() {
                     "say_this" => match say_this_text(&arguments) {
-                        // say_this gate (issue #80): the aside is spoken iff
-                        // `Adele ∈ {OnDemand, Always}` for the active
-                        // conversation — independent of `You`. `Disabled`
-                        // downgrades it to inline text below.
-                        Some(text) if self.say_this_spoken_for_current() => vec![
-                            Effect::Speak(text),
-                            Effect::SubmitClientToolResult {
-                                task_id,
-                                tool_call_id,
-                                result: Ok("spoken".to_string()),
-                            },
-                        ],
+                        // say_this gate (issue #80, GTK-4): the aside is spoken
+                        // iff `Adele ∈ {OnDemand, Always}` for the *call's*
+                        // conversation AND that conversation is the one in view.
+                        // A backgrounded call's aside is never voiced — it
+                        // downgrades to an inline note so it isn't lost.
+                        Some(text) if is_active && self.say_this_spoken_for(&conversation_id) => {
+                            vec![
+                                Effect::Speak(text),
+                                Effect::SubmitClientToolResult {
+                                    task_id,
+                                    tool_call_id,
+                                    result: Ok("spoken".to_string()),
+                                },
+                            ]
+                        }
                         Some(text) => {
-                            // Adele == Disabled → show, don't speak. The turn
-                            // still completes; no audio on any path.
+                            // Either the call's conversation has speech disabled,
+                            // or it isn't the one in view: show, don't speak. The
+                            // turn still completes; no audio on any path.
                             let note = format!("(speech mode disabled) {text}");
                             vec![
                                 Effect::AddInlineNote(note),
@@ -774,42 +904,41 @@ impl WindowState {
                         }
                     },
                     // The model asks to switch this conversation into spoken
-                    // voice mode (issue #80): set `Adele = OnDemand`. Applies to
-                    // the ACTIVE conversation (consistent with say_this's
-                    // active-conversation gating); sticks until left. Reflect it
-                    // on the dropdown so the UI tracks the model's change, and
-                    // always resolve a result. `request_voice` / `stop_voice`
-                    // take no arguments, so a junk payload is simply ignored —
-                    // never a panic.
+                    // voice mode (issue #80, GTK-4): set `Adele = OnDemand` on the
+                    // *call's* conversation; sticks until left. Only nudge the
+                    // dropdown when that conversation is the one in view (the
+                    // dropdown shows the viewed conversation). Always resolve a
+                    // result. `request_voice` / `stop_voice` take no arguments,
+                    // so a junk payload is simply ignored — never a panic.
                     "request_voice" => {
-                        if let Some(id) = self.current_conversation_id.clone() {
-                            self.conversation_adele_output
-                                .insert(id, AdeleOutput::OnDemand);
+                        self.conversation_adele_output
+                            .insert(conversation_id.clone(), AdeleOutput::OnDemand);
+                        let mut effects = Vec::new();
+                        if is_active {
+                            effects.push(Effect::SetAdeleOutputDropdown(AdeleOutput::OnDemand));
                         }
-                        vec![
-                            Effect::SetAdeleOutputDropdown(AdeleOutput::OnDemand),
-                            Effect::SubmitClientToolResult {
-                                task_id,
-                                tool_call_id,
-                                result: Ok("voice mode on; replies will be read aloud and kept \
-                                     conversational"
-                                    .to_string()),
-                            },
-                        ]
+                        effects.push(Effect::SubmitClientToolResult {
+                            task_id,
+                            tool_call_id,
+                            result: Ok("voice mode on; replies will be read aloud and kept \
+                                 conversational"
+                                .to_string()),
+                        });
+                        effects
                     }
                     "stop_voice" => {
-                        if let Some(id) = self.current_conversation_id.clone() {
-                            self.conversation_adele_output
-                                .insert(id, AdeleOutput::Disabled);
+                        self.conversation_adele_output
+                            .insert(conversation_id.clone(), AdeleOutput::Disabled);
+                        let mut effects = Vec::new();
+                        if is_active {
+                            effects.push(Effect::SetAdeleOutputDropdown(AdeleOutput::Disabled));
                         }
-                        vec![
-                            Effect::SetAdeleOutputDropdown(AdeleOutput::Disabled),
-                            Effect::SubmitClientToolResult {
-                                task_id,
-                                tool_call_id,
-                                result: Ok("voice mode off; back to text-only".to_string()),
-                            },
-                        ]
+                        effects.push(Effect::SubmitClientToolResult {
+                            task_id,
+                            tool_call_id,
+                            result: Ok("voice mode off; back to text-only".to_string()),
+                        });
+                        effects
                     }
                     _ => {
                         // Any other client tool: this client has no runtime for
@@ -829,13 +958,19 @@ impl WindowState {
                     Effect::SetStatusText(format!("Disconnected: {reason}")),
                 ];
 
-                // Finalize any in-progress streaming buffer
+                // Finalize any in-progress streaming buffer — but only into the
+                // conversation it actually belongs to (GTK-2). If the streaming
+                // conversation was backgrounded when the link dropped, the
+                // truncated "[Connection lost]" buffer must NOT be appended to
+                // whatever conversation happens to be open; it's simply dropped
+                // (the partial reply was never persisted daemon-side anyway).
                 if self.pending_request_id.is_some() {
+                    let is_active = self.pending_stream_is_active();
                     self.pending_request_id = None;
-                    if !self.streaming_buffer.is_empty() {
-                        self.streaming_buffer.push_str("\n\n[Connection lost]");
-                        let full = self.streaming_buffer.clone();
-                        self.streaming_buffer.clear();
+                    self.pending_conversation_id = None;
+                    let buffer = std::mem::take(&mut self.streaming_buffer);
+                    if is_active && !buffer.is_empty() {
+                        let full = format!("{buffer}\n\n[Connection lost]");
                         if let Some(ref mut conv) = self.current_conversation {
                             conv.messages.push(ChatMessage {
                                 role: "assistant".to_string(),
