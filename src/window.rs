@@ -272,6 +272,13 @@ enum Effect {
     /// flows through `ConversationLoaded` and re-applies the picker selection),
     /// a reload must never clobber the user's pick — see issue #72.
     ReloadConversation(String),
+    /// Fetch a conversation as a *fresh switch*: the reply arrives as
+    /// `UiMessage::ConversationLoaded`, which applies the model picker selection.
+    /// Used when the active conversation has no cached detail yet (e.g. a
+    /// just-created conversation) so a single fetch both loads it and sets the
+    /// picker — replacing the old new-conversation flow's redundant second fetch
+    /// (GTK-10).
+    LoadConversation(String),
     /// Clear the chat view.
     ClearChat,
     /// Set the chat's transient status line.
@@ -370,6 +377,7 @@ impl std::fmt::Debug for Effect {
             Effect::ReloadConversation(id) => {
                 f.debug_tuple("ReloadConversation").field(id).finish()
             }
+            Effect::LoadConversation(id) => f.debug_tuple("LoadConversation").field(id).finish(),
             Effect::ClearChat => f.write_str("ClearChat"),
             Effect::SetChatStatus(m) => f.debug_tuple("SetChatStatus").field(m).finish(),
             Effect::ClearChatStatus => f.write_str("ClearChatStatus"),
@@ -444,20 +452,36 @@ impl WindowState {
                     Effect::SetConversations(convs),
                     Effect::EnsureActiveConversation,
                 ];
-                // On *reconnect* the window still has an active conversation
-                // that is still present. `EnsureActiveConversation` only
-                // re-syncs the sidebar selection in that case (it does not
-                // reload the messages), so re-fetch the conversation to refresh
-                // the cached detail + chat (it may have changed while we were
-                // disconnected) — via `ReloadConversation`, which keeps the
-                // model picker intact. On the first connect there is no active
-                // conversation yet, so the initial load happens through
-                // `EnsureActiveConversation -> ConversationLoaded` (which does
-                // set the picker). See issue #72.
+                // The window already has an active conversation that is still
+                // present (reconnect, or a just-created conversation whose
+                // `ConversationCreated` set the active id). `EnsureActiveConversation`
+                // only re-syncs the sidebar selection in that case — it does not
+                // reload the messages — so fetch the conversation here:
+                //
+                // - detail already cached (a true reconnect refresh): use
+                //   `ReloadConversation`, which keeps the model picker intact
+                //   (issue #72).
+                // - detail NOT cached (a freshly-created conversation): use a
+                //   single `LoadConversation`, which arrives as
+                //   `ConversationLoaded` and sets the picker. This replaces the
+                //   old new-conversation flow that fetched twice — once
+                //   explicitly and once via this reload (GTK-10).
+                //
+                // On the very first connect there is no active conversation yet,
+                // so the initial load still happens through
+                // `EnsureActiveConversation -> ConversationLoaded`.
                 if let Some(id) = self.current_conversation_id.clone()
                     && self.conversations.iter().any(|c| c.id == id)
                 {
-                    effects.push(Effect::ReloadConversation(id));
+                    let detail_cached = self
+                        .current_conversation
+                        .as_ref()
+                        .is_some_and(|c| c.id == id);
+                    if detail_cached {
+                        effects.push(Effect::ReloadConversation(id));
+                    } else {
+                        effects.push(Effect::LoadConversation(id));
+                    }
                 }
                 effects
             }
@@ -524,6 +548,11 @@ impl WindowState {
             }
             UiMessage::ConversationDeleted { id } => {
                 self.conversations.retain(|c| c.id != id);
+                // Prune the deleted conversation's per-conversation voice state
+                // (GTK-9): otherwise the maps grow unbounded and a later id
+                // reuse could inherit a stale `You:`/`Adele:` setting.
+                self.conversation_voice_in.remove(&id);
+                self.conversation_adele_output.remove(&id);
                 let is_active = self.current_conversation_id.as_deref() == Some(&id);
                 if is_active {
                     self.current_conversation_id = None;
@@ -1488,14 +1517,14 @@ impl AdelieWindow {
                         let client = connector.client();
                         match client.create_conversation("New Conversation").await {
                             Ok(id) => {
-                                let _ = tx.send(UiMessage::ConversationCreated { id: id.clone() });
-                                // Refresh conversation list
+                                // Set the new conversation active, then refresh
+                                // the list. The reducer's `ConversationsLoaded`
+                                // handler then issues a SINGLE picker-setting
+                                // `LoadConversation` for it (GTK-10) — no
+                                // separate explicit fetch here.
+                                let _ = tx.send(UiMessage::ConversationCreated { id });
                                 if let Ok(convs) = client.list_conversations().await {
                                     let _ = tx.send(UiMessage::ConversationsLoaded(convs));
-                                }
-                                // Load the new conversation
-                                if let Ok(detail) = client.get_conversation(&id).await {
-                                    let _ = tx.send(UiMessage::ConversationLoaded(detail));
                                 }
                             }
                             Err(e) => {
@@ -1514,19 +1543,10 @@ impl AdelieWindow {
             client,
             #[strong]
             bridge,
-            #[strong]
-            state,
-            move |idx| {
-                let id = {
-                    let s = state.borrow();
-                    match s.conversations.get(idx) {
-                        Some(conv) => conv.id.clone(),
-                        None => return,
-                    }
-                };
+            move |id: &str| {
                 if let Some(connector) = client.borrow().clone() {
                     let tx = bridge.ui_sender();
-                    let id = id.clone();
+                    let id = id.to_string();
                     bridge.spawn(async move {
                         match connector.client().delete_conversation(&id).await {
                             Ok(()) => {
@@ -1552,10 +1572,10 @@ impl AdelieWindow {
             state,
             #[weak]
             window,
-            move |idx| {
+            move |id: &str| {
                 let (id, current_title) = {
                     let s = state.borrow();
-                    match s.conversations.get(idx) {
+                    match s.conversations.iter().find(|c| c.id == id) {
                         Some(conv) => (conv.id.clone(), conv.title.clone()),
                         None => return,
                     }
@@ -1656,10 +1676,10 @@ impl AdelieWindow {
             bridge,
             #[strong]
             state,
-            move |idx| {
+            move |id: &str| {
                 let (id, archived) = {
                     let s = state.borrow();
-                    match s.conversations.get(idx) {
+                    match s.conversations.iter().find(|c| c.id == id) {
                         Some(conv) => (conv.id.clone(), conv.archived),
                         None => return,
                     }
@@ -2657,6 +2677,24 @@ fn handle_ui_message(
                     });
                 }
             }
+            Effect::LoadConversation(id) => {
+                // Fresh switch-style load: the reply is `ConversationLoaded`,
+                // which applies the model picker selection (GTK-10).
+                if let Some(connector) = client.borrow().clone() {
+                    let tx = ui_tx.clone();
+                    crate::async_bridge::spawn_on_runtime(async move {
+                        match connector.client().get_conversation(&id).await {
+                            Ok(detail) => {
+                                let _ = tx.send(UiMessage::ConversationLoaded(detail));
+                            }
+                            Err(e) => {
+                                let _ =
+                                    tx.send(UiMessage::Error(format!("Load conversation: {e}")));
+                            }
+                        }
+                    });
+                }
+            }
             Effect::ClearChat => {
                 chat_view.borrow_mut().clear();
             }
@@ -2851,12 +2889,13 @@ fn ensure_active_conversation(
                 let client = connector.client();
                 match client.create_conversation("New Conversation").await {
                     Ok(id) => {
-                        let _ = tx.send(UiMessage::ConversationCreated { id: id.clone() });
+                        // Same single-load flow as the New button (GTK-10): set
+                        // it active + refresh the list; the reducer's
+                        // `ConversationsLoaded` issues one picker-setting
+                        // `LoadConversation`.
+                        let _ = tx.send(UiMessage::ConversationCreated { id });
                         if let Ok(convs) = client.list_conversations().await {
                             let _ = tx.send(UiMessage::ConversationsLoaded(convs));
-                        }
-                        if let Ok(detail) = client.get_conversation(&id).await {
-                            let _ = tx.send(UiMessage::ConversationLoaded(detail));
                         }
                     }
                     Err(e) => {
@@ -3348,6 +3387,66 @@ mod tests {
         );
     }
 
+    // --- GTK-10: single load for a freshly-created conversation ----------
+
+    /// GTK-10: when `ConversationsLoaded` arrives for an active conversation
+    /// whose detail is NOT yet cached (a just-created conversation), the reducer
+    /// emits a single picker-setting `LoadConversation` — never a redundant
+    /// `ReloadConversation` on top of a separate explicit fetch.
+    #[test]
+    fn conversations_loaded_for_uncached_active_emits_single_fresh_load() {
+        let mut state = WindowState {
+            current_conversation_id: Some("new".to_string()),
+            // No cached detail for "new" — it was just created.
+            current_conversation: None,
+            ..Default::default()
+        };
+        let convs = vec![summary("new", "New Conversation", false)];
+        let effects = state.apply(UiMessage::ConversationsLoaded(convs));
+        let loads = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::LoadConversation(id) if id == "new"))
+            .count();
+        let reloads = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::ReloadConversation(_)))
+            .count();
+        assert_eq!(
+            loads, 1,
+            "a fresh active conversation gets one LoadConversation: {effects:?}"
+        );
+        assert_eq!(
+            reloads, 0,
+            "and no picker-preserving ReloadConversation: {effects:?}"
+        );
+    }
+
+    /// GTK-10: a reconnect (`ConversationsLoaded` while the active conversation's
+    /// detail IS cached) still refreshes via the picker-preserving
+    /// `ReloadConversation`, never a fresh `LoadConversation` (#72 must hold).
+    #[test]
+    fn conversations_loaded_for_cached_active_reloads_not_fresh_load() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            current_conversation: Some(detail("c1", vec![msg("user", "hi")])),
+            ..Default::default()
+        };
+        let convs = vec![summary("c1", "one", false)];
+        let effects = state.apply(UiMessage::ConversationsLoaded(convs));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ReloadConversation(id) if id == "c1")),
+            "reconnect refresh must use ReloadConversation (preserves picker): {effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::LoadConversation(_))),
+            "reconnect must not re-apply the picker via LoadConversation: {effects:?}"
+        );
+    }
+
     // --- Archived-list refresh -------------------------------------------
 
     #[test]
@@ -3404,6 +3503,54 @@ mod tests {
             ),
             "deleting the active conversation must clear chat + side pane + re-ensure: {effects:?}"
         );
+    }
+
+    /// GTK-9: deleting a conversation prunes its per-conversation voice maps
+    /// (`You:` input + `Adele:` output level) so a recycled/UUID-reused id can't
+    /// inherit a stale voice setting, and the maps don't grow unbounded.
+    #[test]
+    fn deleting_conversation_prunes_its_voice_maps() {
+        let mut state = WindowState {
+            conversations: vec![summary("c1", "one", false), summary("c2", "two", false)],
+            current_conversation_id: Some("c2".to_string()),
+            current_conversation: Some(detail("c2", vec![])),
+            ..Default::default()
+        };
+        // Both conversations carry voice settings.
+        state.conversation_voice_in.insert("c1".to_string(), true);
+        state
+            .conversation_adele_output
+            .insert("c1".to_string(), AdeleOutput::Always);
+        state.conversation_voice_in.insert("c2".to_string(), true);
+        state
+            .conversation_adele_output
+            .insert("c2".to_string(), AdeleOutput::OnDemand);
+
+        // Delete the inactive one.
+        state.apply(UiMessage::ConversationDeleted {
+            id: "c1".to_string(),
+        });
+        assert!(
+            !state.conversation_voice_in.contains_key("c1"),
+            "deleted conversation's You: setting must be pruned"
+        );
+        assert!(
+            !state.conversation_adele_output.contains_key("c1"),
+            "deleted conversation's Adele: level must be pruned"
+        );
+        // The surviving conversation's settings are untouched.
+        assert_eq!(state.conversation_voice_in.get("c2").copied(), Some(true));
+        assert_eq!(
+            state.conversation_adele_output.get("c2").copied(),
+            Some(AdeleOutput::OnDemand)
+        );
+
+        // Deleting the active one prunes it too.
+        state.apply(UiMessage::ConversationDeleted {
+            id: "c2".to_string(),
+        });
+        assert!(state.conversation_voice_in.is_empty());
+        assert!(state.conversation_adele_output.is_empty());
     }
 
     fn note_view(key: &str) -> api::ScratchpadNoteView {
@@ -3663,8 +3810,13 @@ mod tests {
         // Issue #72: on reconnect the (still-present) active conversation is
         // re-fetched via ReloadConversation — which refreshes the cache and
         // keeps the picker — instead of ConversationLoaded (which resets it).
+        // A true reconnect has the conversation's detail already cached (it was
+        // open before the link dropped); that cached detail is what selects the
+        // picker-preserving ReloadConversation over a fresh LoadConversation
+        // (GTK-10).
         let mut state = WindowState {
             current_conversation_id: Some("c1".to_string()),
+            current_conversation: Some(detail("c1", vec![msg("user", "earlier")])),
             ..Default::default()
         };
         let effects = state.apply(UiMessage::ConversationsLoaded(vec![summary(

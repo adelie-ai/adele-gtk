@@ -8,7 +8,11 @@ use gtk4::{
     Orientation, Popover, ScrolledWindow, SelectionMode, glib,
 };
 
-type IndexCallback = Box<dyn Fn(usize)>;
+/// Context-menu callback carrying the **conversation id** the menu was opened
+/// on — never a row index. The gesture captures the id at paint time, so a
+/// repaint that reorders or removes rows while the menu is open can't make the
+/// action target the wrong conversation (GTK-7).
+type IdCallback = Box<dyn Fn(&str)>;
 type ToggleCallback = Box<dyn Fn(bool)>;
 
 /// Sidebar widget displaying the conversation list and a "New" button.
@@ -24,9 +28,9 @@ pub struct Sidebar {
     pub show_archived_check: CheckButton,
     #[allow(dead_code)]
     pub scrolled_window: ScrolledWindow,
-    on_rename: Rc<RefCell<Option<IndexCallback>>>,
-    on_delete: Rc<RefCell<Option<IndexCallback>>>,
-    on_archive: Rc<RefCell<Option<IndexCallback>>>,
+    on_rename: Rc<RefCell<Option<IdCallback>>>,
+    on_delete: Rc<RefCell<Option<IdCallback>>>,
+    on_archive: Rc<RefCell<Option<IdCallback>>>,
     on_show_archived_toggled: Rc<RefCell<Option<ToggleCallback>>>,
 }
 
@@ -121,18 +125,21 @@ impl Sidebar {
         }
     }
 
-    /// Register a callback for when the user chooses "Rename" from the context menu.
-    pub fn connect_rename<F: Fn(usize) + 'static>(&self, f: F) {
+    /// Register a callback for when the user chooses "Rename" from the context
+    /// menu. The callback receives the conversation id (GTK-7), not a row index.
+    pub fn connect_rename<F: Fn(&str) + 'static>(&self, f: F) {
         *self.on_rename.borrow_mut() = Some(Box::new(f));
     }
 
-    /// Register a callback for when the user chooses "Delete" from the context menu.
-    pub fn connect_delete<F: Fn(usize) + 'static>(&self, f: F) {
+    /// Register a callback for when the user chooses "Delete" from the context
+    /// menu. The callback receives the conversation id (GTK-7), not a row index.
+    pub fn connect_delete<F: Fn(&str) + 'static>(&self, f: F) {
         *self.on_delete.borrow_mut() = Some(Box::new(f));
     }
 
-    /// Register a callback for when the user chooses "Archive"/"Unarchive" from the context menu.
-    pub fn connect_archive<F: Fn(usize) + 'static>(&self, f: F) {
+    /// Register a callback for when the user chooses "Archive"/"Unarchive" from
+    /// the context menu. The callback receives the conversation id (GTK-7).
+    pub fn connect_archive<F: Fn(&str) + 'static>(&self, f: F) {
         *self.on_archive.borrow_mut() = Some(Box::new(f));
     }
 
@@ -148,7 +155,7 @@ impl Sidebar {
             self.list_box.remove(&child);
         }
 
-        for (idx, conv) in conversations.iter().enumerate() {
+        for conv in conversations.iter() {
             let row = ListBoxRow::new();
             let hbox = GtkBox::new(Orientation::Horizontal, 8);
             hbox.set_margin_start(12);
@@ -175,6 +182,10 @@ impl Sidebar {
             let gesture = GestureClick::new();
             gesture.set_button(3); // secondary (right) click
             let is_archived = conv.archived;
+            // Capture the conversation id at paint time (GTK-7): the menu acts
+            // on THIS conversation regardless of any repaint that reorders or
+            // drops rows while it's open.
+            let conv_id = conv.id.clone();
             gesture.connect_pressed(glib::clone!(
                 #[strong(rename_to = on_rename)]
                 self.on_rename,
@@ -182,6 +193,8 @@ impl Sidebar {
                 self.on_delete,
                 #[strong(rename_to = on_archive)]
                 self.on_archive,
+                #[strong]
+                conv_id,
                 move |gesture, _n_press, x, y| {
                     let Some(widget) = gesture.widget() else {
                         return;
@@ -190,6 +203,11 @@ impl Sidebar {
                     let popover = Popover::new();
                     popover.add_css_class("context-popover");
                     popover.set_parent(&widget);
+                    // Unparent on close so the popover (and its widget tree) is
+                    // released instead of leaking parented to the row, which also
+                    // raised "finalized while parented" warnings on every
+                    // repaint (GTK-5).
+                    popover.connect_closed(|p| p.unparent());
                     popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
                         x as i32, y as i32, 1, 1,
                     )));
@@ -202,12 +220,14 @@ impl Sidebar {
                     rename_btn.connect_clicked(glib::clone!(
                         #[strong(rename_to = on_rename_inner)]
                         on_rename,
+                        #[strong(rename_to = conv_id_inner)]
+                        conv_id,
                         #[weak]
                         popover,
                         move |_| {
                             popover.popdown();
                             if let Some(ref cb) = *on_rename_inner.borrow() {
-                                cb(idx);
+                                cb(&conv_id_inner);
                             }
                         }
                     ));
@@ -219,12 +239,14 @@ impl Sidebar {
                     archive_btn.connect_clicked(glib::clone!(
                         #[strong(rename_to = on_archive_inner)]
                         on_archive,
+                        #[strong(rename_to = conv_id_inner)]
+                        conv_id,
                         #[weak]
                         popover,
                         move |_| {
                             popover.popdown();
                             if let Some(ref cb) = *on_archive_inner.borrow() {
-                                cb(idx);
+                                cb(&conv_id_inner);
                             }
                         }
                     ));
@@ -236,12 +258,14 @@ impl Sidebar {
                     delete_btn.connect_clicked(glib::clone!(
                         #[strong(rename_to = on_delete_inner)]
                         on_delete,
+                        #[strong(rename_to = conv_id_inner)]
+                        conv_id,
                         #[weak]
                         popover,
                         move |_| {
                             popover.popdown();
                             if let Some(ref cb) = *on_delete_inner.borrow() {
-                                cb(idx);
+                                cb(&conv_id_inner);
                             }
                         }
                     ));
