@@ -114,6 +114,12 @@ pub enum UiMessage {
         // change. See the variant doc above and issues #114/#31.
         #[allow(dead_code)]
         task_id: String,
+        /// The conversation the prompt was sent into, captured **at send
+        /// time** (GTK-2, "the stream knows its conversation"). The reducer
+        /// records it so chunks/completion of the in-flight stream stay tied
+        /// to the originating conversation even if the user switches away
+        /// mid-stream.
+        conversation_id: String,
     },
     /// Available (connection, model) pairs, fetched once on connect.
     /// Empty list means the picker should hide (e.g. D-Bus transport).
@@ -289,9 +295,13 @@ impl std::fmt::Debug for UiMessage {
                 .field("conversation_id", conversation_id)
                 .field("warning", warning)
                 .finish(),
-            UiMessage::PromptSent { task_id } => f
+            UiMessage::PromptSent {
+                task_id,
+                conversation_id,
+            } => f
                 .debug_struct("PromptSent")
                 .field("task_id", task_id)
+                .field("conversation_id", conversation_id)
                 .finish(),
             UiMessage::ModelsLoaded(v) => f.debug_tuple("ModelsLoaded").field(v).finish(),
             UiMessage::DefaultModelLoaded(v) => {
