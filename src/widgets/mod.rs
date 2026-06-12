@@ -1,6 +1,7 @@
 pub mod chat_view;
 pub mod connection_config_dialog;
 pub mod connections_tab;
+pub mod context_menu;
 pub mod conversation_side_pane;
 pub mod input_bar;
 pub mod knowledge_browser;

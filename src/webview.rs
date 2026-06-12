@@ -79,22 +79,6 @@ pub fn clear_status(webview: &WebView) {
     );
 }
 
-/// Scroll the webview to the bottom.
-// Companion to the JS `scrollToBottom()` helper (called automatically inside
-// `update_messages`/`append_chunk`). This explicit Rust wrapper is currently
-// unwired but kept as part of the webview helper surface; the per-conversation
-// model-selector work (#1) re-renders the chat and may need an explicit scroll.
-#[allow(dead_code)]
-pub fn scroll_to_bottom(webview: &WebView) {
-    webview.evaluate_javascript(
-        "scrollToBottom();",
-        None,
-        None,
-        None::<&gtk4::gio::Cancellable>,
-        |_| {},
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
