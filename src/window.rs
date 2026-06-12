@@ -1015,6 +1015,28 @@ impl WindowState {
     }
 }
 
+/// The window's widget handles, bundled so the bridge's UI-message executor
+/// takes one `Rc<WindowWidgets>` instead of 13 separate `Rc`s (and the bridge
+/// closure clones one handle instead of a 13-way `clone!` list). Each field is
+/// already individually shareable (`Rc`/`Rc<RefCell<…>>`); bundling them keeps
+/// the executor and `ensure_active_conversation` signatures small without
+/// changing any sharing semantics. Built once in `AdelieWindow::new`.
+struct WindowWidgets {
+    state: Rc<RefCell<WindowState>>,
+    sidebar: Rc<Sidebar>,
+    chat_view: Rc<RefCell<ChatView>>,
+    status_label: Rc<Label>,
+    client: Rc<RefCell<Option<Arc<Connector>>>>,
+    input_bar: Rc<InputBar>,
+    model_picker: Rc<ModelPicker>,
+    tasks_panel: Rc<TasksPanel>,
+    side_pane: Rc<ConversationSidePane>,
+    toast_revealer: Rc<Revealer>,
+    toast_label: Rc<Label>,
+    embedded_voice: Rc<Option<crate::voice_embedded::EmbeddedVoice>>,
+    voice: Rc<RefCell<Option<VoiceController>>>,
+}
+
 pub struct AdelieWindow {
     pub window: ApplicationWindow,
 }
@@ -1335,52 +1357,34 @@ impl AdelieWindow {
         // until then it's `None` (and `Effect::Speak` falls back to embedded).
         let voice: Rc<RefCell<Option<VoiceController>>> = Rc::new(RefCell::new(None));
 
+        // Bundle every widget handle the UI-message executor needs into one
+        // shareable struct, so the bridge closure captures a single
+        // `Rc<WindowWidgets>` instead of a 13-way `clone!` list and
+        // `handle_ui_message` takes one argument instead of 13. The individual
+        // `let` bindings above stay live — other closures (send action, sidebar
+        // signals, side-pane callbacks) still clone them directly.
+        let widgets = Rc::new(WindowWidgets {
+            state: state.clone(),
+            sidebar: sidebar.clone(),
+            chat_view: chat_view.clone(),
+            status_label: status_label.clone(),
+            client: client.clone(),
+            input_bar: input_bar.clone(),
+            model_picker: model_picker.clone(),
+            tasks_panel: tasks_panel.clone(),
+            side_pane: side_pane.clone(),
+            toast_revealer: toast_revealer.clone(),
+            toast_label: toast_label.clone(),
+            embedded_voice: embedded_voice.clone(),
+            voice: voice.clone(),
+        });
+
         // Set up async bridge with UI message handler
         let bridge = AsyncBridge::new(glib::clone!(
             #[strong]
-            state,
-            #[strong]
-            sidebar,
-            #[strong]
-            chat_view,
-            #[strong]
-            status_label,
-            #[strong]
-            client,
-            #[strong]
-            input_bar,
-            #[strong]
-            model_picker,
-            #[strong]
-            tasks_panel,
-            #[strong]
-            side_pane,
-            #[strong]
-            toast_revealer,
-            #[strong]
-            toast_label,
-            #[strong]
-            embedded_voice,
-            #[strong]
-            voice,
+            widgets,
             move |msg, ui_tx| {
-                handle_ui_message(
-                    msg,
-                    &state,
-                    &sidebar,
-                    &chat_view,
-                    &status_label,
-                    &client,
-                    &input_bar,
-                    &model_picker,
-                    &tasks_panel,
-                    &side_pane,
-                    &toast_revealer,
-                    &toast_label,
-                    &embedded_voice,
-                    &voice,
-                    ui_tx,
-                );
+                handle_ui_message(msg, &widgets, ui_tx);
             }
         ));
         let bridge = Rc::new(bridge);
@@ -2586,24 +2590,27 @@ fn now_epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_ui_message(
     msg: UiMessage,
-    state: &Rc<RefCell<WindowState>>,
-    sidebar: &Rc<Sidebar>,
-    chat_view: &Rc<RefCell<ChatView>>,
-    status_label: &Rc<Label>,
-    client: &Rc<RefCell<Option<Arc<Connector>>>>,
-    input_bar: &Rc<InputBar>,
-    model_picker: &Rc<ModelPicker>,
-    tasks_panel: &Rc<TasksPanel>,
-    side_pane: &Rc<ConversationSidePane>,
-    toast_revealer: &Rc<Revealer>,
-    toast_label: &Rc<Label>,
-    embedded_voice: &Rc<Option<crate::voice_embedded::EmbeddedVoice>>,
-    voice: &Rc<RefCell<Option<VoiceController>>>,
+    widgets: &WindowWidgets,
     ui_tx: &mpsc::UnboundedSender<UiMessage>,
 ) {
+    let WindowWidgets {
+        state,
+        sidebar,
+        chat_view,
+        status_label,
+        client,
+        input_bar,
+        model_picker,
+        tasks_panel,
+        side_pane,
+        toast_revealer,
+        toast_label,
+        embedded_voice,
+        voice,
+    } = widgets;
+
     // Pure decision: mutate state + compute the effects to perform.
     let effects = state.borrow_mut().apply(msg);
 
