@@ -47,30 +47,6 @@ pub(super) struct WindowState {
     conversation_adele_output: HashMap<String, AdeleOutput>,
 }
 
-/// System refinement attached on send while `Adele == OnDemand` (issue #80).
-/// Replies are spoken only while conversing by voice, so shape them **for the
-/// ear**: brief, conversational, no markdown, symbols/acronyms spelled out.
-/// Deliberately free of markdown markers so it can't itself leak formatting.
-const ON_DEMAND_SYSTEM_REFINEMENT: &str = "This reply will be read aloud, so write it to be spoken, not read. Keep it brief and \
-     conversational, a few short sentences at most. Use no markdown or formatting of any kind, \
-     and no emoji. Spell out acronyms and abbreviations as full words and avoid symbols that do \
-     not read well aloud (say 'and' not an ampersand, 'percent' not a percent sign, 'dollars' not \
-     a dollar sign). Do not read out URLs, file paths, or email addresses; describe them in words \
-     instead, and write numbers, dates, and times the way you would say them.";
-
-/// System refinement attached on send while `Adele == Always` (issue #80).
-/// Every reply is read aloud for accessibility, so make it **speakable but not
-/// shortened**: keep the full content, just strip formatting and spell out
-/// symbols. Crucially it does NOT ask for brevity (that's the OnDemand job) —
-/// Always reads the whole answer. Free of markdown markers itself.
-const ALWAYS_SYSTEM_REFINEMENT: &str = "This reply will be read aloud in full, so write it to be spoken, not read, without \
-     leaving anything out. Do not shorten or summarize — cover everything you would normally \
-     say, just phrased for the ear. Use no markdown or formatting of any kind, and no emoji. \
-     Spell out acronyms and abbreviations as full words and avoid symbols that do not read well \
-     aloud (say 'and' not an ampersand, 'percent' not a percent sign, 'dollars' not a dollar \
-     sign). Do not read out URLs, file paths, or email addresses; describe them in words instead, \
-     and write numbers, dates, and times the way you would say them.";
-
 impl WindowState {
     /// Whether `You:` (voice input) is Enabled for `conversation` (issue #80).
     /// `false` when it was never set (default Disabled).
@@ -113,13 +89,11 @@ impl WindowState {
     /// Whether a *reply* is spoken for `conversation` (issue #80): `Adele ==
     /// Always` OR (`Adele == OnDemand` AND `You == Enabled`). The gate the
     /// reply-narration path consults — keyed by the *originating*
-    /// conversation (GTK-2); `Disabled` never narrates.
+    /// conversation (GTK-2); `Disabled` never narrates. Delegates to the shared
+    /// gate (desktop-assistant#274).
     fn narrate_for(&self, conversation: &str) -> bool {
-        match self.adele_output_for(conversation) {
-            AdeleOutput::Always => true,
-            AdeleOutput::OnDemand => self.voice_in_for(conversation),
-            AdeleOutput::Disabled => false,
-        }
+        self.adele_output_for(conversation)
+            .narrates_reply(self.voice_in_for(conversation))
     }
 
     /// Whether a *reply* is spoken for the *currently active* conversation —
@@ -137,9 +111,9 @@ impl WindowState {
     /// Whether a `say_this` aside is spoken for `conversation` (issue #80):
     /// spoken iff `Adele ∈ {OnDemand, Always}` (independent of `You`) — keyed
     /// by the *call's* conversation (GTK-4). `Disabled` downgrades the aside
-    /// to inline text.
+    /// to inline text. Delegates to the shared gate (desktop-assistant#274).
     fn say_this_spoken_for(&self, conversation: &str) -> bool {
-        !matches!(self.adele_output_for(conversation), AdeleOutput::Disabled)
+        self.adele_output_for(conversation).speaks_aside()
     }
 
     /// Whether a `say_this` aside is spoken for the *currently active*
@@ -177,13 +151,10 @@ impl WindowState {
 /// shorten); `Disabled` → none. Pure decision the send path consults to choose
 /// `send_prompt_with_system_refinement`. Free function (not a method) so the
 /// send closure can call it through a snapshot without holding a `WindowState`
-/// borrow across the await.
+/// borrow across the await. Delegates to the shared per-level refinement
+/// (desktop-assistant#274).
 pub(super) fn refinement_for_send(state: &WindowState) -> Option<&'static str> {
-    match state.adele_output_for_current() {
-        AdeleOutput::OnDemand => Some(ON_DEMAND_SYSTEM_REFINEMENT),
-        AdeleOutput::Always => Some(ALWAYS_SYSTEM_REFINEMENT),
-        AdeleOutput::Disabled => None,
-    }
+    state.adele_output_for_current().send_refinement()
 }
 
 /// The session-scoped client tools this client advertises so the model can
@@ -2763,7 +2734,7 @@ mod tests {
             let state = state_with(voice_in, AdeleOutput::OnDemand);
             assert_eq!(
                 refinement_for_send(&state),
-                Some(ON_DEMAND_SYSTEM_REFINEMENT),
+                Some(adele_voice_client_common::ON_DEMAND_SYSTEM_REFINEMENT),
                 "Adele=OnDemand must attach the brief refinement (You={voice_in})"
             );
         }
@@ -2772,11 +2743,12 @@ mod tests {
             let state = state_with(voice_in, AdeleOutput::Always);
             assert_eq!(
                 refinement_for_send(&state),
-                Some(ALWAYS_SYSTEM_REFINEMENT),
+                Some(adele_voice_client_common::ALWAYS_SYSTEM_REFINEMENT),
                 "Adele=Always must attach the full refinement (You={voice_in})"
             );
         }
         // The two refinements differ, are non-empty, and carry no markdown.
+        use adele_voice_client_common::{ALWAYS_SYSTEM_REFINEMENT, ON_DEMAND_SYSTEM_REFINEMENT};
         assert_ne!(ON_DEMAND_SYSTEM_REFINEMENT, ALWAYS_SYSTEM_REFINEMENT);
         // OnDemand asks for brevity; Always explicitly does not shorten.
         assert!(ON_DEMAND_SYSTEM_REFINEMENT.to_lowercase().contains("brief"));
