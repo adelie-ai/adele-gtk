@@ -4,13 +4,14 @@ use std::rc::Rc;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, GestureClick, Image, Label,
-    ListBox, ListBoxRow, Orientation, Popover, ScrolledWindow, SelectionMode, gdk, glib,
+    ListBox, ListBoxRow, Orientation, ScrolledWindow, SelectionMode, gdk, glib,
 };
 
 use crate::async_bridge;
 use crate::credential_store::CredentialStore;
 use crate::oauth;
 use crate::profile::{ConnectionProfile, LastConnectionStore, ProfileStore, ProtocolConfig};
+use crate::widgets::context_menu;
 use crate::widgets::setup_dialog;
 use crate::window;
 
@@ -202,106 +203,89 @@ impl LoginScreen {
                                     return;
                                 };
 
-                                let popover = Popover::new();
-                                popover.add_css_class("context-popover");
-                                popover.set_parent(&widget);
-                                // Unparent on close so the popover is released
-                                // instead of leaking parented to the row (GTK-5).
-                                popover.connect_closed(|p| p.unparent());
-                                popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
-                                    x as i32, y as i32, 1, 1,
-                                )));
-                                popover.set_has_arrow(false);
-
-                                let menu_box = GtkBox::new(Orientation::Vertical, 0);
-
-                                // Edit button
-                                let edit_btn = Button::with_label("Edit");
-                                edit_btn.add_css_class("context-button");
-                                edit_btn.connect_clicked(glib::clone!(
-                                    #[strong(rename_to = profiles_inner)]
-                                    profiles,
-                                    #[weak]
-                                    popover,
-                                    #[weak(rename_to = window_edit)]
-                                    window_inner,
-                                    #[strong(rename_to = populate_edit)]
-                                    populate_inner,
-                                    #[strong(rename_to = profile_id_edit)]
-                                    profile_id,
-                                    move |_| {
-                                        popover.popdown();
-                                        let profile = {
-                                            let profs = profiles_inner.borrow();
-                                            profs.iter().find(|p| p.id == profile_id_edit).cloned()
-                                        };
-                                        if let Some(profile) = profile {
-                                            setup_dialog::show_setup_dialog(
-                                                &window_edit,
-                                                Some(&profile),
-                                                glib::clone!(
-                                                    #[strong(rename_to = profiles_save)]
-                                                    profiles_inner,
-                                                    #[strong(rename_to = populate_save)]
-                                                    populate_edit,
-                                                    move |updated| {
-                                                        let store = ProfileStore::new();
-                                                        let _ = store.update(&updated);
-                                                        *profiles_save.borrow_mut() =
-                                                            store.load().unwrap_or_default();
-                                                        if let Some(ref f) = *populate_save.borrow()
-                                                        {
-                                                            f();
-                                                        }
-                                                    }
-                                                ),
-                                            );
-                                        }
-                                    }
-                                ));
-                                menu_box.append(&edit_btn);
-
-                                // Delete button
-                                let delete_btn = Button::with_label("Delete");
-                                delete_btn.add_css_class("context-button");
-                                delete_btn.add_css_class("destructive-action");
-                                delete_btn.connect_clicked(glib::clone!(
-                                    #[strong(rename_to = profiles_inner)]
-                                    profiles,
-                                    #[weak]
-                                    popover,
-                                    #[strong(rename_to = status_inner)]
-                                    status_ref,
-                                    #[strong(rename_to = populate_del)]
-                                    populate_inner,
-                                    #[strong(rename_to = profile_id_del)]
-                                    profile_id,
-                                    move |_| {
-                                        popover.popdown();
-                                        // Delete the captured profile by id only
-                                        // if it still exists (GTK-7).
-                                        let exists = profiles_inner
-                                            .borrow()
-                                            .iter()
-                                            .any(|p| p.id == profile_id_del);
-                                        if exists {
-                                            let id = &profile_id_del;
-                                            let _ = CredentialStore::delete_credentials(id);
-                                            let store = ProfileStore::new();
-                                            let _ = store.delete(id);
-                                            let new_profiles = store.load().unwrap_or_default();
-                                            *profiles_inner.borrow_mut() = new_profiles;
-                                            status_inner.set_text("Connection deleted");
-                                            if let Some(ref f) = *populate_del.borrow() {
-                                                f();
+                                let items = vec![
+                                    context_menu::MenuItem::new(
+                                        "Edit",
+                                        glib::clone!(
+                                            #[strong(rename_to = profiles_inner)]
+                                            profiles,
+                                            #[weak(rename_to = window_edit)]
+                                            window_inner,
+                                            #[strong(rename_to = populate_edit)]
+                                            populate_inner,
+                                            #[strong(rename_to = profile_id_edit)]
+                                            profile_id,
+                                            move || {
+                                                let profile = {
+                                                    let profs = profiles_inner.borrow();
+                                                    profs
+                                                        .iter()
+                                                        .find(|p| p.id == profile_id_edit)
+                                                        .cloned()
+                                                };
+                                                if let Some(profile) = profile {
+                                                    setup_dialog::show_setup_dialog(
+                                                        &window_edit,
+                                                        Some(&profile),
+                                                        glib::clone!(
+                                                            #[strong(rename_to = profiles_save)]
+                                                            profiles_inner,
+                                                            #[strong(rename_to = populate_save)]
+                                                            populate_edit,
+                                                            move |updated| {
+                                                                let store = ProfileStore::new();
+                                                                let _ = store.update(&updated);
+                                                                *profiles_save.borrow_mut() = store
+                                                                    .load()
+                                                                    .unwrap_or_default();
+                                                                if let Some(ref f) =
+                                                                    *populate_save.borrow()
+                                                                {
+                                                                    f();
+                                                                }
+                                                            }
+                                                        ),
+                                                    );
+                                                }
                                             }
-                                        }
-                                    }
-                                ));
-                                menu_box.append(&delete_btn);
-
-                                popover.set_child(Some(&menu_box));
-                                popover.popup();
+                                        ),
+                                    ),
+                                    context_menu::MenuItem::destructive(
+                                        "Delete",
+                                        glib::clone!(
+                                            #[strong(rename_to = profiles_inner)]
+                                            profiles,
+                                            #[strong(rename_to = status_inner)]
+                                            status_ref,
+                                            #[strong(rename_to = populate_del)]
+                                            populate_inner,
+                                            #[strong(rename_to = profile_id_del)]
+                                            profile_id,
+                                            move || {
+                                                // Delete the captured profile by id
+                                                // only if it still exists (GTK-7).
+                                                let exists = profiles_inner
+                                                    .borrow()
+                                                    .iter()
+                                                    .any(|p| p.id == profile_id_del);
+                                                if exists {
+                                                    let id = &profile_id_del;
+                                                    let _ = CredentialStore::delete_credentials(id);
+                                                    let store = ProfileStore::new();
+                                                    let _ = store.delete(id);
+                                                    let new_profiles =
+                                                        store.load().unwrap_or_default();
+                                                    *profiles_inner.borrow_mut() = new_profiles;
+                                                    status_inner.set_text("Connection deleted");
+                                                    if let Some(ref f) = *populate_del.borrow() {
+                                                        f();
+                                                    }
+                                                }
+                                            }
+                                        ),
+                                    ),
+                                ];
+                                context_menu::show(&widget, x, y, items);
                             }
                         ));
                         row.add_controller(gesture);

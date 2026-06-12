@@ -5,8 +5,10 @@ use desktop_assistant_client_common::ConversationSummary;
 use gtk4::prelude::*;
 use gtk4::{
     Box as GtkBox, Button, CheckButton, GestureClick, Image, Label, ListBox, ListBoxRow,
-    Orientation, Popover, ScrolledWindow, SelectionMode, glib,
+    Orientation, ScrolledWindow, SelectionMode, glib,
 };
+
+use crate::widgets::context_menu;
 
 /// Context-menu callback carrying the **conversation id** the menu was opened
 /// on — never a row index. The gesture captures the id at paint time, so a
@@ -190,79 +192,52 @@ impl Sidebar {
                         return;
                     };
 
-                    let popover = Popover::new();
-                    popover.add_css_class("context-popover");
-                    popover.set_parent(&widget);
-                    // Unparent on close so the popover (and its widget tree) is
-                    // released instead of leaking parented to the row, which also
-                    // raised "finalized while parented" warnings on every
-                    // repaint (GTK-5).
-                    popover.connect_closed(|p| p.unparent());
-                    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
-                        x as i32, y as i32, 1, 1,
-                    )));
-                    popover.set_has_arrow(false);
-
-                    let menu_box = GtkBox::new(Orientation::Vertical, 0);
-
-                    let rename_btn = Button::with_label("Rename");
-                    rename_btn.add_css_class("context-button");
-                    rename_btn.connect_clicked(glib::clone!(
-                        #[strong(rename_to = on_rename_inner)]
-                        on_rename,
-                        #[strong(rename_to = conv_id_inner)]
-                        conv_id,
-                        #[weak]
-                        popover,
-                        move |_| {
-                            popover.popdown();
-                            if let Some(ref cb) = *on_rename_inner.borrow() {
-                                cb(&conv_id_inner);
-                            }
-                        }
-                    ));
-                    menu_box.append(&rename_btn);
-
                     let archive_label = if is_archived { "Unarchive" } else { "Archive" };
-                    let archive_btn = Button::with_label(archive_label);
-                    archive_btn.add_css_class("context-button");
-                    archive_btn.connect_clicked(glib::clone!(
-                        #[strong(rename_to = on_archive_inner)]
-                        on_archive,
-                        #[strong(rename_to = conv_id_inner)]
-                        conv_id,
-                        #[weak]
-                        popover,
-                        move |_| {
-                            popover.popdown();
-                            if let Some(ref cb) = *on_archive_inner.borrow() {
-                                cb(&conv_id_inner);
-                            }
-                        }
-                    ));
-                    menu_box.append(&archive_btn);
-
-                    let delete_btn = Button::with_label("Delete");
-                    delete_btn.add_css_class("context-button");
-                    delete_btn.add_css_class("destructive-action");
-                    delete_btn.connect_clicked(glib::clone!(
-                        #[strong(rename_to = on_delete_inner)]
-                        on_delete,
-                        #[strong(rename_to = conv_id_inner)]
-                        conv_id,
-                        #[weak]
-                        popover,
-                        move |_| {
-                            popover.popdown();
-                            if let Some(ref cb) = *on_delete_inner.borrow() {
-                                cb(&conv_id_inner);
-                            }
-                        }
-                    ));
-                    menu_box.append(&delete_btn);
-
-                    popover.set_child(Some(&menu_box));
-                    popover.popup();
+                    let items = vec![
+                        context_menu::MenuItem::new(
+                            "Rename",
+                            glib::clone!(
+                                #[strong]
+                                on_rename,
+                                #[strong]
+                                conv_id,
+                                move || {
+                                    if let Some(ref cb) = *on_rename.borrow() {
+                                        cb(&conv_id);
+                                    }
+                                }
+                            ),
+                        ),
+                        context_menu::MenuItem::new(
+                            archive_label,
+                            glib::clone!(
+                                #[strong]
+                                on_archive,
+                                #[strong]
+                                conv_id,
+                                move || {
+                                    if let Some(ref cb) = *on_archive.borrow() {
+                                        cb(&conv_id);
+                                    }
+                                }
+                            ),
+                        ),
+                        context_menu::MenuItem::destructive(
+                            "Delete",
+                            glib::clone!(
+                                #[strong]
+                                on_delete,
+                                #[strong]
+                                conv_id,
+                                move || {
+                                    if let Some(ref cb) = *on_delete.borrow() {
+                                        cb(&conv_id);
+                                    }
+                                }
+                            ),
+                        ),
+                    ];
+                    context_menu::show(&widget, x, y, items);
                 }
             ));
             row.add_controller(gesture);
