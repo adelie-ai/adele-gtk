@@ -20,14 +20,6 @@ pub struct Sidebar {
     pub container: GtkBox,
     pub list_box: ListBox,
     pub new_button: Button,
-    // Both widgets are fully wired during `new()` (appended to the container,
-    // toggle handler connected); these fields retain handles for external
-    // access that is not yet exercised. Kept as part of the public Sidebar
-    // surface for the connections/control-panel work (#1).
-    #[allow(dead_code)]
-    pub show_archived_check: CheckButton,
-    #[allow(dead_code)]
-    pub scrolled_window: ScrolledWindow,
     on_rename: Rc<RefCell<Option<IdCallback>>>,
     on_delete: Rc<RefCell<Option<IdCallback>>>,
     on_archive: Rc<RefCell<Option<IdCallback>>>,
@@ -116,8 +108,6 @@ impl Sidebar {
             container,
             list_box,
             new_button,
-            show_archived_check,
-            scrolled_window,
             on_rename: Rc::new(RefCell::new(None)),
             on_delete: Rc::new(RefCell::new(None)),
             on_archive: Rc::new(RefCell::new(None)),
@@ -279,16 +269,6 @@ impl Sidebar {
 
             self.list_box.append(&row);
         }
-    }
-
-    /// Get the index of the currently selected row.
-    // Getter counterpart to `select_index` (which is used by `window.rs`).
-    // Part of the public Sidebar API; not yet read but kept for the
-    // connections/control-panel work (#1).
-    #[allow(dead_code)]
-    pub fn selected_index(&self) -> Option<usize> {
-        let row = self.list_box.selected_row()?;
-        Some(row.index() as usize)
     }
 
     /// Select a row by index.
