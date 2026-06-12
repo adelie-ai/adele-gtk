@@ -70,10 +70,12 @@ path = "../voice/crates/vad-silero"
 [dependencies.adele-voice-stt-whisper]
 path = "../voice/crates/stt-whisper"
 
-# The voice pipeline's pure text helpers — only `SentenceBuffer`, reused to chunk
-# a long reply into one-short-sentence-per-synth pieces so neither the daemon's
-# `SayText` nor the embedded `say` hits the per-synth ~20s timeout. Same
-# `../voice` symlink path-dep; already a transitive dep of the module above, so
-# no new crates enter the graph.
-[dependencies.adele-voice-core]
-path = "../voice/crates/core"
+# Shared client-side voice-output plumbing (desktop-assistant#274): the
+# `AdeleOutput` level + narration gate, the byte-identical system-refinement
+# constants, and `into_speakable_sentences` (which chunks a long reply into
+# one-short-sentence-per-synth pieces so neither the daemon's `SayText` nor the
+# embedded `say` hits the per-synth ~20s timeout). Owned once here instead of
+# triplicated across the clients; pulls in `adele-voice-core` transitively for
+# its `SentenceBuffer`. Same `../voice` symlink path-dep as the module above.
+[dependencies.adele-voice-client-common]
+path = "../voice/crates/client-voice"

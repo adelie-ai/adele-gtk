@@ -26,48 +26,18 @@
 //! reply-playback hook.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use adele_voice_core::sentence_buffer::SentenceBuffer;
 use adele_voice_module::config::{AudioConfig, SttConfig, TtsConfig, VadConfig};
 use adele_voice_module::{Dictation, Speaker, TtsBackend, build_dictation, build_speaker};
 use adele_voice_stt_whisper::WhisperStt;
 use adele_voice_vad_silero::SileroVad;
 use tokio::sync::Mutex;
 
-/// Split `text` into the chunks that should be fed to a one-shot synthesizer.
-///
-/// Both the daemon's `SayText` and the embedded [`EmbeddedVoice::say`] are
-/// **one-shot**: they assume a single short sentence and apply a per-synth
-/// timeout (`adele_voice_module`'s `DEFAULT_SYNTH_TIMEOUT`, ~20s). A long reply
-/// fed in one go would blow that timeout, so the *client* must chunk it the same
-/// way the daemon's streaming pipeline does — via [`SentenceBuffer`].
-///
-/// This pushes the whole text through a `SentenceBuffer` (collecting every
-/// complete sentence) and then appends the trailing remainder from `flush()`
-/// (the last sentence has no trailing whitespace, so the buffer holds it back).
-/// If chunking yields nothing — e.g. text with no recognised boundaries that the
-/// buffer somehow drops — it falls back to a single chunk of the original text
-/// when that text is non-blank, and to an empty `Vec` for empty/whitespace
-/// input (nothing to speak).
-///
-/// The timeout passed to the buffer is irrelevant here: this is a synchronous,
-/// one-shot push/flush with no streaming, so the time-based flush never fires.
-pub fn into_speakable_sentences(text: &str) -> Vec<String> {
-    // Timeout is unused on this synchronous push→flush path; any value works.
-    let mut buf = SentenceBuffer::new(Duration::from_millis(500));
-    let mut sentences = buf.push(text);
-    let tail = buf.flush();
-    if !tail.is_empty() {
-        sentences.push(tail);
-    }
-    if sentences.is_empty() && !text.trim().is_empty() {
-        // No boundary produced a chunk but there *is* speakable text — speak it
-        // whole rather than dropping it silently.
-        sentences.push(text.trim().to_string());
-    }
-    sentences
-}
+/// The speakable-sentence chunker now lives in the shared `client-voice` crate
+/// (desktop-assistant#274) so the GTK and TUI clients can't drift. Re-exported
+/// at its original path so the in-process speak path keeps calling
+/// `voice_embedded::into_speakable_sentences`.
+pub use adele_voice_client_common::into_speakable_sentences;
 
 /// The concrete dictation type the config builder wires (Silero VAD + Whisper).
 type EmbeddedDictation = Dictation<SileroVad, WhisperStt>;
@@ -212,53 +182,6 @@ mod tests {
         assert!(clone.stop_speaking().await.is_ok());
     }
 
-    /// A multi-sentence reply splits into one chunk per sentence, in order, so
-    /// no single synth call carries the whole paragraph past its 20s timeout.
-    #[test]
-    fn chunks_multi_sentence_into_sentences() {
-        let chunks = into_speakable_sentences("Hello there. How are you? I am fine.");
-        assert_eq!(chunks, vec!["Hello there.", "How are you?", "I am fine."]);
-    }
-
-    /// A single sentence is one chunk.
-    #[test]
-    fn chunks_single_sentence_into_one() {
-        let chunks = into_speakable_sentences("Just one sentence here.");
-        assert_eq!(chunks, vec!["Just one sentence here."]);
-    }
-
-    /// Text with no trailing punctuation is still spoken — as one chunk (the
-    /// `flush()` tail), not dropped.
-    #[test]
-    fn chunks_text_without_terminal_punctuation_into_one() {
-        let chunks = into_speakable_sentences("no trailing punctuation here");
-        assert_eq!(chunks, vec!["no trailing punctuation here"]);
-    }
-
-    /// Empty / whitespace-only input has nothing to speak → no chunks (so the
-    /// caller makes zero synth calls rather than synthesizing silence).
-    #[test]
-    fn chunks_empty_or_whitespace_into_nothing() {
-        assert!(into_speakable_sentences("").is_empty());
-        assert!(into_speakable_sentences("   \n\t  ").is_empty());
-    }
-
-    /// A long multi-sentence paragraph splits into several chunks (the whole
-    /// point: keep each synth call short enough to beat the per-synth timeout).
-    #[test]
-    fn chunks_long_paragraph_into_multiple() {
-        let paragraph = "The quick brown fox jumps over the lazy dog. \
-             It then trots away to find a quiet spot. \
-             Later, the dog wakes up and stretches lazily. \
-             Neither animal pays the other any further mind. \
-             The afternoon sun warms the empty field.";
-        let chunks = into_speakable_sentences(paragraph);
-        assert!(
-            chunks.len() >= 4,
-            "a five-sentence paragraph should split into several chunks, got {}: {chunks:?}",
-            chunks.len()
-        );
-        // Every chunk must be non-empty (no blank synth calls).
-        assert!(chunks.iter().all(|c| !c.trim().is_empty()));
-    }
+    // The `into_speakable_sentences` chunking tests moved with the function to
+    // the shared `adele-voice-client-common` crate (desktop-assistant#274).
 }

@@ -6,7 +6,7 @@ version = 4
 name = "adele-gtk"
 version = "0.1.0"
 dependencies = [
- "adele-voice-core",
+ "adele-voice-client-common",
  "adele-voice-module",
  "adele-voice-stt-whisper",
  "adele-voice-vad-silero",
@@ -52,10 +52,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "adele-voice-client-common"
+version = "0.1.0"
+dependencies = [
+ "adele-voice-core",
+]
+
+[[package]]
 name = "adele-voice-core"
 version = "0.1.0"
 dependencies = [
  "pulldown-cmark",
+ "rubato",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -95,7 +103,6 @@ version = "0.1.0"
 dependencies = [
  "adele-voice-core",
  "ort",
- "rubato",
  "tokio",
  "tracing",
 ]
@@ -106,7 +113,6 @@ version = "0.1.0"
 dependencies = [
  "adele-voice-core",
  "anyhow",
- "rubato",
  "tokio",
  "tracing",
 ]
@@ -1371,6 +1377,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "desktop-assistant-api-model",
+ "desktop-assistant-frame-codec",
  "futures",
  "reqwest 0.13.3",
  "rustls",
@@ -1398,6 +1405,13 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "desktop-assistant-frame-codec"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

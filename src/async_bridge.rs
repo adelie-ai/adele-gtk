@@ -12,28 +12,12 @@ use tokio::sync::{mpsc, watch};
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 /// The three-way voice-**output** level for a conversation (issue #80), exposed
-/// by the `Adele:` dropdown. A dedicated enum (not two bools) because the level
-/// is genuinely three-valued and the gate logic differs per variant: a bool
-/// pair would admit a nonsensical "both" state and scatter the
-/// Disabled/OnDemand/Always distinction across call sites. Default is
-/// [`AdeleOutput::Disabled`] (never speaks).
-///
-/// Replaces phase-2's two independent toggles, which mapped directly: the
-/// read-aloud toggle was [`AdeleOutput::Always`] and the voice-mode toggle was
-/// [`AdeleOutput::OnDemand`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AdeleOutput {
-    /// Never speaks. A `say_this` aside downgrades to inline text.
-    #[default]
-    Disabled,
-    /// Speaks replies only while `You == Enabled` (conversing by voice), shaped
-    /// for the ear; speaks `say_this` asides regardless of `You`. The model's
-    /// `request_voice` selects this.
-    OnDemand,
-    /// Reads every reply aloud in full (made speakable, not shortened) —
-    /// accessibility. Independent of `You`.
-    Always,
-}
+/// by the `Adele:` dropdown (`Disabled` / `OnDemand` / `Always`; default
+/// `Disabled`). Now owned by the shared `adele-voice-client-common` crate
+/// (desktop-assistant#274) so the GTK and TUI clients share one definition + the
+/// narration gate; re-exported here so existing `crate::async_bridge::AdeleOutput`
+/// paths keep resolving unchanged.
+pub use adele_voice_client_common::AdeleOutput;
 
 fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
