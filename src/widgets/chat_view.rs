@@ -22,6 +22,12 @@ pub struct ChatView {
     scrolled: ScrolledWindow,
     /// Messages stored for re-rendering.
     messages: Vec<(String, String)>,
+    /// Partial streaming reply, used only by the Label-based fallback's
+    /// `render()`. The `linux`/WebView path appends each chunk incrementally
+    /// via JS (`webview::append_chunk`) and never re-renders mid-stream, so it
+    /// keeps no buffer here — the authoritative streaming buffer lives in
+    /// `WindowState`, which re-seeds the WebView on conversation switch-back.
+    #[cfg(not(feature = "linux"))]
     streaming_buffer: String,
     #[cfg(feature = "linux")]
     avatars: markdown::AvatarUrls,
@@ -75,6 +81,7 @@ impl ChatView {
             #[cfg(not(feature = "linux"))]
             scrolled,
             messages: Vec::new(),
+            #[cfg(not(feature = "linux"))]
             streaming_buffer: String::new(),
             #[cfg(feature = "linux")]
             avatars,
@@ -88,25 +95,28 @@ impl ChatView {
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))
             .collect();
+        #[cfg(not(feature = "linux"))]
         self.streaming_buffer.clear();
         self.render();
     }
 
     /// Append a streaming chunk.
     pub fn receive_chunk(&mut self, chunk: &str) {
-        self.streaming_buffer.push_str(chunk);
-
         #[cfg(feature = "linux")]
         crate::webview::append_chunk(&self.webview, chunk);
 
         #[cfg(not(feature = "linux"))]
-        self.render();
+        {
+            self.streaming_buffer.push_str(chunk);
+            self.render();
+        }
     }
 
     /// Finalize streaming: add the full response as an assistant message.
     pub fn complete_streaming(&mut self, full_response: &str) {
         self.messages
             .push(("assistant".to_string(), full_response.to_string()));
+        #[cfg(not(feature = "linux"))]
         self.streaming_buffer.clear();
         self.render();
     }
@@ -146,25 +156,28 @@ impl ChatView {
     /// Clear the view.
     pub fn clear(&mut self) {
         self.messages.clear();
+        #[cfg(not(feature = "linux"))]
         self.streaming_buffer.clear();
         self.render();
     }
 
     fn render(&self) {
-        let streaming = if self.streaming_buffer.is_empty() {
-            None
-        } else {
-            Some(self.streaming_buffer.as_str())
-        };
-
+        // The WebView path re-renders only complete transcripts (load / clear /
+        // complete); the partial reply is appended incrementally via JS, so a
+        // full render never carries a mid-stream prefix.
         #[cfg(feature = "linux")]
         {
-            let html = markdown::render_messages_html(&self.messages, streaming, &self.avatars);
+            let html = markdown::render_messages_html(&self.messages, None, &self.avatars);
             crate::webview::update_messages(&self.webview, &html);
         }
 
         #[cfg(not(feature = "linux"))]
         {
+            let streaming = if self.streaming_buffer.is_empty() {
+                None
+            } else {
+                Some(self.streaming_buffer.as_str())
+            };
             let mut text = String::new();
             for (role, content) in &self.messages {
                 let label = match role.as_str() {
