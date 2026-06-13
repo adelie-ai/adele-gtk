@@ -17,9 +17,13 @@ mod context_usage;
 mod credential_store;
 mod management_client;
 // Markdown→sanitized-HTML rendering + the CSP-pinned WebView template. Only the
-// WebView (`linux`) chat path renders HTML; the Label fallback shows plain text.
+// WebView (`linux`) chat path renders HTML.
 #[cfg(feature = "linux")]
 mod markdown;
+// Markdown→`TextView`-tag rendering for the fallback (non-WebView) chat pane,
+// mirroring `markdown` for the `--no-default-features` build.
+#[cfg(not(feature = "linux"))]
+mod markdown_text;
 mod oauth;
 mod profile;
 mod selected_models;
