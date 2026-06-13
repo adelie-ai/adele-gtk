@@ -39,6 +39,8 @@ struct WindowWidgets {
     sidebar: Rc<Sidebar>,
     chat_view: Rc<RefCell<ChatView>>,
     status_label: Rc<Label>,
+    /// Read-only context-window fill indicator (#341).
+    context_label: Rc<Label>,
     client: Rc<RefCell<Option<Arc<Connector>>>>,
     input_bar: Rc<InputBar>,
     model_picker: Rc<ModelPicker>,
@@ -287,6 +289,18 @@ impl AdelieWindow {
         status_label.add_css_class("status-bar");
         status_bar.append(&status_label);
 
+        // Read-only context-window fill indicator (#341). Right-aligned,
+        // before the Debug check. Hidden until the first reading arrives.
+        let context_label = Label::new(None);
+        context_label.set_halign(gtk4::Align::End);
+        context_label.set_margin_end(8);
+        context_label.add_css_class("context-fill");
+        context_label.set_visible(false);
+        context_label.set_tooltip_text(Some(
+            "Context window used / budget. Amber near the compaction line, red at overflow.",
+        ));
+        status_bar.append(&context_label);
+
         let debug_check = CheckButton::with_label("Debug");
         debug_check.set_halign(gtk4::Align::End);
         debug_check.set_margin_end(12);
@@ -330,6 +344,7 @@ impl AdelieWindow {
         let chat_view = Rc::new(RefCell::new(chat_view));
         let input_bar = Rc::new(input_bar);
         let status_label = Rc::new(status_label);
+        let context_label = Rc::new(context_label);
         let model_picker = Rc::new(model_picker);
         let tasks_panel = Rc::new(tasks_panel);
         let side_pane = Rc::new(side_pane);
@@ -381,6 +396,7 @@ impl AdelieWindow {
             sidebar: sidebar.clone(),
             chat_view: chat_view.clone(),
             status_label: status_label.clone(),
+            context_label: context_label.clone(),
             client: client.clone(),
             input_bar: input_bar.clone(),
             model_picker: model_picker.clone(),
@@ -1318,6 +1334,7 @@ fn handle_ui_message(
         sidebar,
         chat_view,
         status_label,
+        context_label,
         client,
         input_bar,
         model_picker,
@@ -1428,6 +1445,24 @@ fn handle_ui_message(
             }
             Effect::ClearChatStatus => {
                 chat_view.borrow().clear_status();
+            }
+            Effect::SetContextUsage(usage) => {
+                // Read-only fill indicator (#341): set text + colour class, or
+                // hide when there is no reading for the open conversation.
+                for class in crate::context_usage::ContextFillLevel::all_classes() {
+                    context_label.remove_css_class(class);
+                }
+                match usage {
+                    Some(u) => {
+                        context_label.set_text(&u.readout());
+                        context_label.add_css_class(u.level().css_class());
+                        context_label.set_visible(true);
+                    }
+                    None => {
+                        context_label.set_text("");
+                        context_label.set_visible(false);
+                    }
+                }
             }
             Effect::ReceiveChunk(chunk) => {
                 chat_view.borrow_mut().receive_chunk(&chunk);

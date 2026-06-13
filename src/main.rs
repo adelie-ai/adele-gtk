@@ -13,6 +13,7 @@ mod async_bridge;
 // (`--no-default-features`) draws plain text and never references them.
 #[cfg(feature = "linux")]
 mod avatars;
+mod context_usage;
 mod credential_store;
 mod management_client;
 // Markdown→sanitized-HTML rendering + the CSP-pinned WebView template. Only the

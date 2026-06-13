@@ -89,6 +89,17 @@ window {
     color: #5b6473;
 }
 
+/* Context-window fill indicator (#341), darkened for the light theme. */
+.context-fill.context-fill-green {
+    color: #2e7d3a;
+}
+.context-fill.context-fill-amber {
+    color: #b8841f;
+}
+.context-fill.context-fill-red {
+    color: #c0392b;
+}
+
 .toast-row {
     background-color: #eceef4;
     color: #1a1d2e;
