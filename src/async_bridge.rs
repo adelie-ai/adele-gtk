@@ -74,6 +74,17 @@ pub enum UiMessage {
         request_id: String,
         message: String,
     },
+    /// A user message was committed and a turn started (desktop-assistant
+    /// `UserMessageAdded`, #1). Emitted for every turn — including ones this
+    /// client did NOT initiate (a voice turn, or another client on the same
+    /// account). The reducer renders the user bubble live for an external turn
+    /// in the open conversation; for this client's own send it dedupes on the
+    /// in-flight `request_id` (the bubble was already drawn optimistically).
+    UserMessageAdded {
+        conversation_id: String,
+        request_id: String,
+        content: String,
+    },
     /// Per-turn context-window fill report (desktop-assistant#341). Token
     /// COUNTS only — drives the read-only fill indicator in the status bar.
     ContextUsage {
@@ -270,6 +281,16 @@ impl std::fmt::Debug for UiMessage {
                 .debug_struct("AssistantStatus")
                 .field("request_id", request_id)
                 .field("message", message)
+                .finish(),
+            UiMessage::UserMessageAdded {
+                conversation_id,
+                request_id,
+                content,
+            } => f
+                .debug_struct("UserMessageAdded")
+                .field("conversation_id", conversation_id)
+                .field("request_id", request_id)
+                .field("content", content)
                 .finish(),
             UiMessage::ContextUsage {
                 conversation_id,
@@ -704,18 +725,37 @@ pub(crate) fn interactive_default_from_purposes(
 /// `UiMessage` the GTK main thread consumes. Pure mapping; tested below.
 fn signal_to_ui_message(signal: SignalEvent) -> UiMessage {
     match signal {
-        SignalEvent::Chunk { request_id, chunk } => UiMessage::StreamChunk { request_id, chunk },
+        // The streaming events now carry `conversation_id` (#352), but the
+        // reducer routes them by the in-flight `request_id` it adopted from
+        // `UserMessageAdded`/its own send, so the conversation id is redundant
+        // here and deliberately dropped.
+        SignalEvent::UserMessageAdded {
+            conversation_id,
+            request_id,
+            content,
+        } => UiMessage::UserMessageAdded {
+            conversation_id,
+            request_id,
+            content,
+        },
+        SignalEvent::Chunk {
+            request_id, chunk, ..
+        } => UiMessage::StreamChunk { request_id, chunk },
         SignalEvent::Complete {
             request_id,
             full_response,
+            ..
         } => UiMessage::StreamComplete {
             request_id,
             full_response,
         },
-        SignalEvent::Error { request_id, error } => UiMessage::StreamError { request_id, error },
+        SignalEvent::Error {
+            request_id, error, ..
+        } => UiMessage::StreamError { request_id, error },
         SignalEvent::Status {
             request_id,
             message,
+            ..
         } => UiMessage::AssistantStatus {
             request_id,
             message,
@@ -1054,6 +1094,7 @@ mod tests {
     #[test]
     fn signal_chunk_still_routes_to_stream_chunk_regression() {
         let msg = signal_to_ui_message(SignalEvent::Chunk {
+            conversation_id: "c1".to_string(),
             request_id: "r1".to_string(),
             chunk: "hello".to_string(),
         });
@@ -1063,6 +1104,27 @@ mod tests {
                 assert_eq!(chunk, "hello");
             }
             other => panic!("expected StreamChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signal_user_message_added_maps_to_ui_message() {
+        let msg = signal_to_ui_message(SignalEvent::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "r1".to_string(),
+            content: "what's the weather?".to_string(),
+        });
+        match msg {
+            UiMessage::UserMessageAdded {
+                conversation_id,
+                request_id,
+                content,
+            } => {
+                assert_eq!(conversation_id, "c1");
+                assert_eq!(request_id, "r1");
+                assert_eq!(content, "what's the weather?");
+            }
+            other => panic!("expected UserMessageAdded, got {other:?}"),
         }
     }
 
