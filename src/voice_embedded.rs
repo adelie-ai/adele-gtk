@@ -90,9 +90,15 @@ impl EmbeddedVoice {
     pub async fn dictate(&self) -> Result<Option<String>, String> {
         let mut guard = self.dictation.lock().await;
         if guard.is_none() {
-            // First use: load Silero + Whisper and bind the mic.
+            // First use: load Silero + Whisper and bind the mic. Share the
+            // speaker's output sink as an echo guard (half-duplex) so the mic
+            // doesn't capture and transcribe Adele's own TTS. `ensure_speaker`
+            // builds/returns the cached speaker that all playback runs through,
+            // so the guard watches the sink that actually sounds.
+            let sink = self.ensure_speaker().await.sink();
             let d = build_dictation(&self.cfg.audio, &self.cfg.vad, &self.cfg.stt)
-                .map_err(|e| format!("voice init failed: {e}"))?;
+                .map_err(|e| format!("voice init failed: {e}"))?
+                .with_echo_guard(sink);
             *guard = Some(d);
         }
         // Safe: just populated above.
