@@ -810,6 +810,9 @@ impl AdelieWindow {
                         let mut s = state.borrow_mut();
                         if let Some(ref mut conv) = s.current_conversation {
                             conv.messages.push(ChatMessage {
+                                // Optimistic local send: no server id yet (empty
+                                // placeholder); the next reload reconciles it.
+                                id: String::new(),
                                 role: "user".to_string(),
                                 content: text.clone(),
                             });
@@ -1509,6 +1512,26 @@ fn handle_ui_message(
             }
             Effect::TaskCompleted { id } => {
                 tasks_panel.handle_task_completed(id, now_epoch_ms());
+            }
+            Effect::SubscribeConversations(conversation_ids) => {
+                // Tell the daemon which conversations we're viewing so it fans
+                // their turn events to us — including turns started by another
+                // client or the voice daemon (#1). Set-replace, fire-and-forget
+                // (the daemon Acks). Only the command channel (Uds/Ws) carries
+                // this; over D-Bus there's nothing to subscribe to, so skip.
+                if let Some(connector) = client.borrow().clone() {
+                    crate::async_bridge::spawn_on_runtime(async move {
+                        let Some(cmds) = connector.client().as_commands() else {
+                            return;
+                        };
+                        if let Err(e) = cmds
+                            .send_command(api::Command::SubscribeConversations { conversation_ids })
+                            .await
+                        {
+                            tracing::warn!("SubscribeConversations failed: {e}");
+                        }
+                    });
+                }
             }
             Effect::FetchScratchpad(conversation_id) => {
                 if let Some(connector) = client.borrow().clone() {
