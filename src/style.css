@@ -74,6 +74,22 @@ window {
     font-size: 12px;
 }
 
+/* Read-only context-window fill indicator (#341). Colour tracks the
+   proactive-compaction line: green below 0.85, amber up to budget, red over. */
+.context-fill {
+    font-size: 12px;
+    font-weight: bold;
+}
+.context-fill.context-fill-green {
+    color: #7ac884;
+}
+.context-fill.context-fill-amber {
+    color: #e8b860;
+}
+.context-fill.context-fill-red {
+    color: #e86a6a;
+}
+
 /* Advisory toast (e.g. a dangling model selection cleared by the daemon). */
 .toast-row {
     background-color: #2a2e45;

@@ -247,6 +247,9 @@ pub(super) enum Effect {
     SetChatStatus(String),
     /// Clear the chat's transient status line.
     ClearChatStatus,
+    /// Update the read-only context-window fill indicator (#341). `None`
+    /// clears it (no reading for the open conversation).
+    SetContextUsage(Option<crate::context_usage::ContextUsageView>),
     /// Append a streaming chunk to the chat view.
     ReceiveChunk(String),
     /// Finalize a streaming response in the chat view.
@@ -343,6 +346,7 @@ impl std::fmt::Debug for Effect {
             Effect::ClearChat => f.write_str("ClearChat"),
             Effect::SetChatStatus(m) => f.debug_tuple("SetChatStatus").field(m).finish(),
             Effect::ClearChatStatus => f.write_str("ClearChatStatus"),
+            Effect::SetContextUsage(u) => f.debug_tuple("SetContextUsage").field(u).finish(),
             Effect::ReceiveChunk(c) => f.debug_tuple("ReceiveChunk").field(c).finish(),
             Effect::CompleteStreaming(c) => f.debug_tuple("CompleteStreaming").field(c).finish(),
             Effect::SetModelSelection(s) => f.debug_tuple("SetModelSelection").field(s).finish(),
@@ -456,6 +460,9 @@ impl WindowState {
                 let mut effects = vec![
                     Effect::SetModelSelection(selection),
                     Effect::LoadConversationIntoChat(filtered),
+                    // Drop any stale context-fill reading from the previous
+                    // conversation; the next turn re-establishes it (#341).
+                    Effect::SetContextUsage(None),
                     // Rebind the side pane to the new conversation: clear stale
                     // notes until the fetch returns, refresh the filtered task
                     // list, and fetch this conversation's scratchpad.
@@ -569,6 +576,27 @@ impl WindowState {
                     && self.pending_stream_is_active()
                 {
                     vec![Effect::SetChatStatus(message)]
+                } else {
+                    vec![]
+                }
+            }
+            UiMessage::ContextUsage {
+                conversation_id,
+                used_tokens,
+                budget_tokens,
+                compaction_active,
+            } => {
+                // Only paint the fill indicator for the conversation in view
+                // (#341): a background turn's reading must not mislead the user
+                // about the conversation they are looking at.
+                if self.is_active_conversation(&conversation_id) {
+                    vec![Effect::SetContextUsage(Some(
+                        crate::context_usage::ContextUsageView {
+                            used_tokens,
+                            budget_tokens,
+                            compaction_active,
+                        },
+                    ))]
                 } else {
                     vec![]
                 }
@@ -1737,6 +1765,7 @@ mod tests {
             [
                 Effect::SetModelSelection(_),
                 Effect::LoadConversationIntoChat(filtered),
+                Effect::SetContextUsage(None),
                 Effect::SidePaneSetScratchpad(_),
                 Effect::RefreshSidePaneTasks,
                 Effect::FetchScratchpad(_),
@@ -1747,6 +1776,69 @@ mod tests {
             }
             other => panic!("unexpected effects: {other:?}"),
         }
+    }
+
+    // --- Context-usage indicator (#341) ---
+
+    #[test]
+    fn context_usage_for_open_conversation_sets_indicator() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::ContextUsage {
+            conversation_id: "c1".to_string(),
+            used_tokens: 12_000,
+            budget_tokens: 32_000,
+            compaction_active: false,
+        });
+        match effects.as_slice() {
+            [Effect::SetContextUsage(Some(u))] => {
+                assert_eq!(u.used_tokens, 12_000);
+                assert_eq!(u.budget_tokens, 32_000);
+                assert!(!u.compaction_active);
+            }
+            other => panic!("expected SetContextUsage(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_usage_for_background_conversation_is_ignored() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        // A reading for a conversation that is not in view must not paint.
+        let effects = state.apply(UiMessage::ContextUsage {
+            conversation_id: "c2".to_string(),
+            used_tokens: 30_000,
+            budget_tokens: 32_000,
+            compaction_active: true,
+        });
+        assert!(
+            effects.is_empty(),
+            "background-conversation usage must produce no effect"
+        );
+    }
+
+    #[test]
+    fn switching_conversation_clears_context_usage_indicator() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        // Loading a (different) conversation must emit SetContextUsage(None)
+        // so a stale fill never bleeds across conversations.
+        let effects = state.apply(UiMessage::ConversationLoaded(detail(
+            "c2",
+            vec![msg("user", "hi")],
+        )));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetContextUsage(None))),
+            "conversation switch must clear the context-fill indicator"
+        );
     }
 
     #[test]
@@ -1768,6 +1860,7 @@ mod tests {
             [
                 Effect::SetModelSelection(_),
                 Effect::LoadConversationIntoChat(filtered),
+                Effect::SetContextUsage(None),
                 Effect::SidePaneSetScratchpad(_),
                 Effect::RefreshSidePaneTasks,
                 Effect::FetchScratchpad(_),
@@ -1790,6 +1883,7 @@ mod tests {
             [
                 Effect::SetModelSelection(Some(sel)),
                 Effect::LoadConversationIntoChat(_),
+                Effect::SetContextUsage(None),
                 Effect::SidePaneSetScratchpad(_),
                 Effect::RefreshSidePaneTasks,
                 Effect::FetchScratchpad(conv),

@@ -74,6 +74,14 @@ pub enum UiMessage {
         request_id: String,
         message: String,
     },
+    /// Per-turn context-window fill report (desktop-assistant#341). Token
+    /// COUNTS only — drives the read-only fill indicator in the status bar.
+    ContextUsage {
+        conversation_id: String,
+        used_tokens: u64,
+        budget_tokens: u64,
+        compaction_active: bool,
+    },
     TitleChanged {
         conversation_id: String,
         title: String,
@@ -262,6 +270,18 @@ impl std::fmt::Debug for UiMessage {
                 .debug_struct("AssistantStatus")
                 .field("request_id", request_id)
                 .field("message", message)
+                .finish(),
+            UiMessage::ContextUsage {
+                conversation_id,
+                used_tokens,
+                budget_tokens,
+                compaction_active,
+            } => f
+                .debug_struct("ContextUsage")
+                .field("conversation_id", conversation_id)
+                .field("used_tokens", used_tokens)
+                .field("budget_tokens", budget_tokens)
+                .field("compaction_active", compaction_active)
                 .finish(),
             UiMessage::TitleChanged {
                 conversation_id,
@@ -700,6 +720,18 @@ fn signal_to_ui_message(signal: SignalEvent) -> UiMessage {
             request_id,
             message,
         },
+        SignalEvent::ContextUsage {
+            conversation_id,
+            request_id: _,
+            used_tokens,
+            budget_tokens,
+            compaction_active,
+        } => UiMessage::ContextUsage {
+            conversation_id,
+            used_tokens,
+            budget_tokens,
+            compaction_active,
+        },
         SignalEvent::TitleChanged {
             conversation_id,
             title,
@@ -1031,6 +1063,31 @@ mod tests {
                 assert_eq!(chunk, "hello");
             }
             other => panic!("expected StreamChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signal_context_usage_maps_to_ui_message() {
+        let msg = signal_to_ui_message(SignalEvent::ContextUsage {
+            conversation_id: "c1".to_string(),
+            request_id: "r1".to_string(),
+            used_tokens: 12_000,
+            budget_tokens: 32_000,
+            compaction_active: true,
+        });
+        match msg {
+            UiMessage::ContextUsage {
+                conversation_id,
+                used_tokens,
+                budget_tokens,
+                compaction_active,
+            } => {
+                assert_eq!(conversation_id, "c1");
+                assert_eq!(used_tokens, 12_000);
+                assert_eq!(budget_tokens, 32_000);
+                assert!(compaction_active);
+            }
+            other => panic!("expected ContextUsage, got {other:?}"),
         }
     }
 
