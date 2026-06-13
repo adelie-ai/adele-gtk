@@ -31,6 +31,13 @@ pub(super) struct WindowState {
     /// when an event arrives. Cleared with `pending_request_id`.
     pending_conversation_id: Option<String>,
     streaming_buffer: String,
+    /// Set when a `say_this` aside is *spoken* for the in-flight turn's
+    /// conversation; suppresses the duplicate full-reply narration at
+    /// `StreamComplete` so the user doesn't hear the turn twice (the spoken
+    /// aside, then the whole reply read aloud). Reset at each turn's start and
+    /// completion. Only relevant to gtk-initiated turns (the only ones gtk
+    /// narrates).
+    say_this_spoken_this_turn: bool,
     pub(super) debug_enabled: bool,
     /// Per-conversation `You:` (voice input) state (issue #80), keyed by
     /// conversation id. Default (absent key) is **Disabled** (type only). When
@@ -561,6 +568,8 @@ impl WindowState {
                 // not against whatever conversation is open when it arrives.
                 self.pending_conversation_id = Some(conversation_id);
                 self.streaming_buffer.clear();
+                // Fresh turn: no aside spoken yet (dedup of reply narration).
+                self.say_this_spoken_this_turn = false;
                 vec![]
             }
             UiMessage::AssistantStatus {
@@ -640,9 +649,11 @@ impl WindowState {
                     // not against whichever conversation is open right now.
                     let origin = self.pending_conversation_id.clone();
                     let is_active = self.pending_stream_is_active();
+                    let said_via_tool = self.say_this_spoken_this_turn;
                     self.pending_request_id = None;
                     self.pending_conversation_id = None;
                     self.streaming_buffer.clear();
+                    self.say_this_spoken_this_turn = false;
 
                     if !is_active {
                         // The originating conversation isn't the one in view, so
@@ -665,10 +676,14 @@ impl WindowState {
                     // replies.) Keyed by the *originating* conversation (GTK-2):
                     // a backgrounded turn never narrates (handled by the early
                     // return above) — only an in-view streaming conversation can.
-                    let narrate = origin
-                        .as_deref()
-                        .map(|c| self.narrate_for(c))
-                        .unwrap_or(false);
+                    // Suppress the full-reply narration when a `say_this` aside
+                    // already spoke this turn — otherwise the user hears it twice
+                    // (the aside, then the whole reply read aloud).
+                    let narrate = !said_via_tool
+                        && origin
+                            .as_deref()
+                            .map(|c| self.narrate_for(c))
+                            .unwrap_or(false);
 
                     // The streaming conversation is the one in view: finalize it.
                     if let Some(ref mut conv) = self.current_conversation {
@@ -703,6 +718,7 @@ impl WindowState {
                     self.pending_request_id = None;
                     self.pending_conversation_id = None;
                     self.streaming_buffer.clear();
+                    self.say_this_spoken_this_turn = false;
                     // Only clear the chat status line if the failed stream's
                     // conversation is the one in view (GTK-2); a background
                     // turn's failure must not blank another conversation's chat.
@@ -885,6 +901,13 @@ impl WindowState {
                         // A backgrounded call's aside is never voiced — it
                         // downgrades to an inline note so it isn't lost.
                         Some(text) if is_active && self.say_this_spoken_for(&conversation_id) => {
+                            // If this spoken aside belongs to the in-flight turn,
+                            // mark it so StreamComplete doesn't ALSO read the full
+                            // reply aloud — the model already chose its spoken form
+                            // (avoids the double-speak: aside, then whole reply).
+                            if self.pending_conversation_id.as_deref() == Some(&conversation_id) {
+                                self.say_this_spoken_this_turn = true;
+                            }
                             vec![
                                 Effect::Speak(text),
                                 Effect::SubmitClientToolResult {
@@ -2353,6 +2376,43 @@ mod tests {
                 Effect::SubmitClientToolResult { result: Ok(r), .. } if r == "spoken"
             )),
             "result must be \"spoken\": {effects:?}"
+        );
+    }
+
+    /// Double-speak fix: when a `say_this` aside is spoken for the in-flight
+    /// turn, the `StreamComplete` reply narration is suppressed — the user hears
+    /// the aside once, not the aside AND the whole reply read aloud after.
+    #[test]
+    fn say_this_aside_suppresses_duplicate_reply_narration() {
+        // Always (and OnDemand+You) would otherwise narrate every reply.
+        let mut state = state_with(true, AdeleOutput::Always);
+        // Simulate an in-flight turn for the open conversation.
+        state.pending_request_id = Some("req".to_string());
+        state.pending_conversation_id = Some("c1".to_string());
+        state.current_conversation = Some(detail("c1", vec![]));
+
+        // The model speaks an aside mid-turn.
+        let aside = state.apply(say_this_call("c1", "the spoken answer"));
+        assert!(
+            aside
+                .iter()
+                .any(|e| matches!(e, Effect::Speak(t) if t == "the spoken answer")),
+            "the say_this aside should be spoken: {aside:?}"
+        );
+
+        // The turn completes: the full reply must NOT be read aloud again.
+        let done = state.apply(UiMessage::StreamComplete {
+            request_id: "req".to_string(),
+            full_response: "the spoken answer, in more words".to_string(),
+        });
+        assert!(
+            !done.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "no second narration after a spoken aside (double-speak): {done:?}"
+        );
+        assert!(
+            done.iter()
+                .any(|e| matches!(e, Effect::CompleteStreaming(_))),
+            "the reply is still finalized in the chat: {done:?}"
         );
     }
 
