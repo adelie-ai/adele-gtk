@@ -38,6 +38,14 @@ pub(super) struct WindowState {
     /// completion. Only relevant to gtk-initiated turns (the only ones gtk
     /// narrates).
     say_this_spoken_this_turn: bool,
+    /// `true` when the in-flight turn was NOT initiated by this client — adopted
+    /// from a `UserMessageAdded` for a turn started elsewhere (a voice turn, or
+    /// another client on the same account) so its reply streams live into the
+    /// open conversation (#1). Suppresses gtk's own reply narration for it: the
+    /// originator (e.g. the voice daemon) already speaks the reply, so narrating
+    /// again here would double-speak. Set when adopting the turn, reset at each
+    /// turn's start/completion alongside the other pending fields.
+    pending_turn_external: bool,
     pub(super) debug_enabled: bool,
     /// Per-conversation `You:` (voice input) state (issue #80), keyed by
     /// conversation id. Default (absent key) is **Disabled** (type only). When
@@ -257,6 +265,10 @@ pub(super) enum Effect {
     /// Update the read-only context-window fill indicator (#341). `None`
     /// clears it (no reading for the open conversation).
     SetContextUsage(Option<crate::context_usage::ContextUsageView>),
+    /// Append a user-message bubble to the chat view. Used to render the user's
+    /// prompt for a turn this client did not initiate (#1) — the local send path
+    /// draws its own bubble optimistically and does not go through this effect.
+    AddUserMessage(String),
     /// Append a streaming chunk to the chat view.
     ReceiveChunk(String),
     /// Finalize a streaming response in the chat view.
@@ -354,6 +366,7 @@ impl std::fmt::Debug for Effect {
             Effect::SetChatStatus(m) => f.debug_tuple("SetChatStatus").field(m).finish(),
             Effect::ClearChatStatus => f.write_str("ClearChatStatus"),
             Effect::SetContextUsage(u) => f.debug_tuple("SetContextUsage").field(u).finish(),
+            Effect::AddUserMessage(c) => f.debug_tuple("AddUserMessage").field(c).finish(),
             Effect::ReceiveChunk(c) => f.debug_tuple("ReceiveChunk").field(c).finish(),
             Effect::CompleteStreaming(c) => f.debug_tuple("CompleteStreaming").field(c).finish(),
             Effect::SetModelSelection(s) => f.debug_tuple("SetModelSelection").field(s).finish(),
@@ -570,6 +583,53 @@ impl WindowState {
                 self.streaming_buffer.clear();
                 // Fresh turn: no aside spoken yet (dedup of reply narration).
                 self.say_this_spoken_this_turn = false;
+                // This client initiated the turn, so it owns the reply narration
+                // (the external-turn suppression does not apply).
+                self.pending_turn_external = false;
+                vec![]
+            }
+            UiMessage::UserMessageAdded {
+                conversation_id,
+                request_id,
+                content,
+            } => {
+                // Case 1 — this client's own send, echoed back (#1). We drew the
+                // user bubble optimistically at send time and set "__pending__";
+                // claim the real request_id now (it precedes the first chunk) and
+                // render nothing more. This also resolves the stream's request_id
+                // earlier and more reliably than the claim-on-first-chunk fallback.
+                if self.pending_request_id.as_deref() == Some("__pending__")
+                    && self.pending_conversation_id.as_deref() == Some(&conversation_id)
+                {
+                    self.pending_request_id = Some(request_id);
+                    return vec![];
+                }
+                // Case 2 — a turn this client did NOT initiate (a voice turn, or
+                // another client on the same account) for the conversation in
+                // view, with no gtk turn already occupying the single in-flight
+                // slot. Adopt it into the pending slot so the existing
+                // chunk/completion path streams the reply live, and draw the
+                // user's bubble now. Marked external so its reply is NOT narrated
+                // here — the originator (e.g. the voice daemon) already speaks it.
+                // A turn for a background conversation, or one arriving while our
+                // own turn is in flight, is left to the reload-on-switch path (the
+                // daemon persists it).
+                if self.pending_request_id.is_none()
+                    && self.is_active_conversation(&conversation_id)
+                {
+                    self.pending_request_id = Some(request_id);
+                    self.pending_conversation_id = Some(conversation_id);
+                    self.streaming_buffer.clear();
+                    self.say_this_spoken_this_turn = false;
+                    self.pending_turn_external = true;
+                    if let Some(ref mut conv) = self.current_conversation {
+                        conv.messages.push(ChatMessage {
+                            role: "user".to_string(),
+                            content: content.clone(),
+                        });
+                    }
+                    return vec![Effect::AddUserMessage(content)];
+                }
                 vec![]
             }
             UiMessage::AssistantStatus {
@@ -650,10 +710,14 @@ impl WindowState {
                     let origin = self.pending_conversation_id.clone();
                     let is_active = self.pending_stream_is_active();
                     let said_via_tool = self.say_this_spoken_this_turn;
+                    // An adopted external turn (a voice turn, or another client)
+                    // is narrated by its originator — gtk must not also speak it.
+                    let was_external = self.pending_turn_external;
                     self.pending_request_id = None;
                     self.pending_conversation_id = None;
                     self.streaming_buffer.clear();
                     self.say_this_spoken_this_turn = false;
+                    self.pending_turn_external = false;
 
                     if !is_active {
                         // The originating conversation isn't the one in view, so
@@ -680,6 +744,7 @@ impl WindowState {
                     // already spoke this turn — otherwise the user hears it twice
                     // (the aside, then the whole reply read aloud).
                     let narrate = !said_via_tool
+                        && !was_external
                         && origin
                             .as_deref()
                             .map(|c| self.narrate_for(c))
@@ -719,6 +784,7 @@ impl WindowState {
                     self.pending_conversation_id = None;
                     self.streaming_buffer.clear();
                     self.say_this_spoken_this_turn = false;
+                    self.pending_turn_external = false;
                     // Only clear the chat status line if the failed stream's
                     // conversation is the one in view (GTK-2); a background
                     // turn's failure must not blank another conversation's chat.
@@ -2351,6 +2417,169 @@ mod tests {
                 "the reply text must still be finalized: {effects:?}"
             );
         }
+    }
+
+    // --- Live external-turn rendering (#1) --------------------------------
+
+    /// A `UserMessageAdded` for the open conversation, with no gtk turn in
+    /// flight, is a turn this client did not initiate (voice / another client).
+    /// It renders the user bubble and adopts the turn into the pending slot so
+    /// the reply streams live.
+    #[test]
+    fn external_user_message_in_active_conversation_renders_bubble_and_adopts() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            current_conversation: Some(detail("c1", vec![])),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "voice-req".to_string(),
+            content: "what's the weather?".to_string(),
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::AddUserMessage(t) if t == "what's the weather?")),
+            "an external turn in the open conversation must render the user bubble: {effects:?}"
+        );
+        assert_eq!(
+            state.pending_request_id.as_deref(),
+            Some("voice-req"),
+            "the external turn must be adopted into the pending slot so its reply streams live"
+        );
+        assert_eq!(state.pending_conversation_id.as_deref(), Some("c1"));
+        assert!(
+            state.pending_turn_external,
+            "an adopted turn must be flagged external so gtk does not also narrate it"
+        );
+        assert_eq!(
+            state.current_conversation.as_ref().unwrap().messages.len(),
+            1,
+            "the user message must be cached so a reload keeps it"
+        );
+    }
+
+    /// This client's own send is echoed back as `UserMessageAdded`. The bubble
+    /// was already drawn optimistically at send time, so the echo renders
+    /// nothing — it only claims the real `request_id` onto the `__pending__`
+    /// slot (so the stream correlates).
+    #[test]
+    fn own_send_echo_dedupes_and_claims_request_id() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            ..Default::default()
+        };
+        // Simulate the local send: PromptSent pins "__pending__" + the conv.
+        state.apply(UiMessage::PromptSent {
+            task_id: String::new(),
+            conversation_id: "c1".to_string(),
+        });
+        let effects = state.apply(UiMessage::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "real-req".to_string(),
+            content: "typed this".to_string(),
+        });
+        assert!(
+            effects.is_empty(),
+            "our own send's echo must not double-render the bubble: {effects:?}"
+        );
+        assert_eq!(
+            state.pending_request_id.as_deref(),
+            Some("real-req"),
+            "the echo must claim the real request_id off the __pending__ sentinel"
+        );
+        assert!(
+            !state.pending_turn_external,
+            "our own turn must NOT be flagged external (gtk owns its narration)"
+        );
+    }
+
+    /// An adopted external turn streams its reply into the view but is NOT
+    /// narrated by gtk even when the conversation's gate is open — the
+    /// originator (e.g. the voice daemon) already speaks it; narrating again
+    /// would double-speak.
+    #[test]
+    fn adopted_external_turn_streams_reply_without_gtk_narration() {
+        // Adele=Always would normally narrate every reply.
+        let mut state = state_with(false, AdeleOutput::Always);
+        state.current_conversation = Some(detail("c1", vec![]));
+        state.apply(UiMessage::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "voice-req".to_string(),
+            content: "a question".to_string(),
+        });
+        let done = state.apply(UiMessage::StreamComplete {
+            request_id: "voice-req".to_string(),
+            full_response: "the spoken answer".to_string(),
+        });
+        assert!(
+            done.iter()
+                .any(|e| matches!(e, Effect::CompleteStreaming(t) if t == "the spoken answer")),
+            "the reply text must still be finalized in the view: {done:?}"
+        );
+        assert!(
+            !done.iter().any(|e| matches!(e, Effect::Speak(_))),
+            "an external turn must NOT be narrated by gtk (the originator speaks it): {done:?}"
+        );
+        assert!(
+            !state.pending_turn_external,
+            "the external flag must reset at turn completion"
+        );
+    }
+
+    /// A `UserMessageAdded` for a conversation NOT in view is left to the
+    /// reload-on-switch path — it must not touch the open chat or the pending
+    /// slot.
+    #[test]
+    fn external_turn_for_background_conversation_is_ignored() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            current_conversation: Some(detail("c1", vec![])),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::UserMessageAdded {
+            conversation_id: "c2".to_string(),
+            request_id: "bg-req".to_string(),
+            content: "background".to_string(),
+        });
+        assert!(
+            effects.is_empty(),
+            "a background conversation's turn must not render into the open chat: {effects:?}"
+        );
+        assert!(
+            state.pending_request_id.is_none(),
+            "a background turn must not be adopted into the pending slot"
+        );
+    }
+
+    /// While this client's own turn is in flight (request_id already claimed),
+    /// a concurrent external turn for the same conversation is NOT adopted — the
+    /// single in-flight slot stays bound to our turn (the external turn surfaces
+    /// on reload).
+    #[test]
+    fn external_turn_ignored_while_own_turn_in_flight() {
+        let mut state = WindowState {
+            current_conversation_id: Some("c1".to_string()),
+            current_conversation: Some(detail("c1", vec![])),
+            ..Default::default()
+        };
+        state.pending_request_id = Some("mine".to_string());
+        state.pending_conversation_id = Some("c1".to_string());
+        let effects = state.apply(UiMessage::UserMessageAdded {
+            conversation_id: "c1".to_string(),
+            request_id: "other".to_string(),
+            content: "concurrent".to_string(),
+        });
+        assert!(
+            effects.is_empty(),
+            "must not adopt a second turn while one is in flight: {effects:?}"
+        );
+        assert_eq!(
+            state.pending_request_id.as_deref(),
+            Some("mine"),
+            "the in-flight turn's slot must be preserved"
+        );
     }
 
     /// Adele=Always: a `say_this` aside is spoken (Adele ∈ {OnDemand, Always}).

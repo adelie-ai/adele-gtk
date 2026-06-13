@@ -1464,6 +1464,9 @@ fn handle_ui_message(
                     }
                 }
             }
+            Effect::AddUserMessage(content) => {
+                chat_view.borrow_mut().add_user_message(&content);
+            }
             Effect::ReceiveChunk(chunk) => {
                 chat_view.borrow_mut().receive_chunk(&chunk);
             }
