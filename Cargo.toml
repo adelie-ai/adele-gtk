@@ -79,3 +79,9 @@ path = "../voice/crates/stt-whisper"
 # its `SentenceBuffer`. Same `../voice` symlink path-dep as the module above.
 [dependencies.adele-voice-client-common]
 path = "../voice/crates/client-voice"
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = "deny"

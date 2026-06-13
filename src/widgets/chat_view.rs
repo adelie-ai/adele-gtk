@@ -18,8 +18,6 @@ pub struct ChatView {
     webview: webkit6::WebView,
     #[cfg(not(feature = "linux"))]
     content_label: Label,
-    #[cfg(not(feature = "linux"))]
-    scrolled: ScrolledWindow,
     /// Messages stored for re-rendering.
     messages: Vec<(String, String)>,
     /// Partial streaming reply, used only by the Label-based fallback's
@@ -55,7 +53,7 @@ impl ChatView {
         };
 
         #[cfg(not(feature = "linux"))]
-        let (content_label, scrolled) = {
+        let content_label = {
             let scrolled = ScrolledWindow::new();
             scrolled.set_hexpand(true);
             scrolled.set_vexpand(true);
@@ -68,8 +66,10 @@ impl ChatView {
             label.set_margin_end(16);
             label.set_margin_top(16);
             scrolled.set_child(Some(&label));
+            // `scrolled` is parented into `container` (which owns it) and is
+            // never touched again, so only the label is retained for `render()`.
             container.append(&scrolled);
-            (label, scrolled)
+            label
         };
 
         Self {
@@ -78,8 +78,6 @@ impl ChatView {
             webview,
             #[cfg(not(feature = "linux"))]
             content_label,
-            #[cfg(not(feature = "linux"))]
-            scrolled,
             messages: Vec::new(),
             #[cfg(not(feature = "linux"))]
             streaming_buffer: String::new(),
@@ -126,7 +124,9 @@ impl ChatView {
         #[cfg(feature = "linux")]
         crate::webview::set_status(&self.webview, message);
 
-        // Non-linux fallback: no-op (status shown in status bar instead)
+        // Non-linux fallback: no-op (status shown in status bar instead).
+        #[cfg(not(feature = "linux"))]
+        let _ = message;
     }
 
     /// Clear the transient status indicator.

@@ -9,9 +9,15 @@
 
 mod assets;
 mod async_bridge;
+// Avatar data-URI helpers feed the WebView chat renderer; the Label fallback
+// (`--no-default-features`) draws plain text and never references them.
+#[cfg(feature = "linux")]
 mod avatars;
 mod credential_store;
 mod management_client;
+// Markdown→sanitized-HTML rendering + the CSP-pinned WebView template. Only the
+// WebView (`linux`) chat path renders HTML; the Label fallback shows plain text.
+#[cfg(feature = "linux")]
 mod markdown;
 mod oauth;
 mod profile;
