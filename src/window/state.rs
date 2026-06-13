@@ -302,6 +302,17 @@ pub(super) enum Effect {
     /// A task completed (terminal).
     TaskCompleted { id: String },
 
+    // --- Live multi-client conversation sync (issue #1) -------------------
+    /// Tell the daemon which conversations this connection is viewing so it
+    /// fans their turn events (`UserMessageAdded`/`AssistantDelta`/
+    /// `AssistantCompleted`/`AssistantError`/`AssistantStatus`) to us —
+    /// including turns started by another client or the voice daemon. Sends
+    /// `api::Command::SubscribeConversations`, which is set-replace: the WHOLE
+    /// viewed set each time it changes (today just the single active
+    /// conversation; a future tabs feature passes several). Emitted when the
+    /// active conversation is loaded/switched, and re-sent on reconnect.
+    SubscribeConversations(Vec<String>),
+
     // --- Conversation side pane (issue #60) -------------------------------
     /// Fetch the scratchpad for the given conversation (async RPC + ui_tx),
     /// mirroring `EnsureActiveConversation`. The reply arrives as
@@ -391,6 +402,9 @@ impl std::fmt::Debug for Effect {
             Effect::TaskCompleted { id } => {
                 f.debug_struct("TaskCompleted").field("id", id).finish()
             }
+            Effect::SubscribeConversations(ids) => {
+                f.debug_tuple("SubscribeConversations").field(ids).finish()
+            }
             Effect::FetchScratchpad(c) => f.debug_tuple("FetchScratchpad").field(c).finish(),
             Effect::SidePaneSetScratchpad(n) => {
                 f.debug_tuple("SidePaneSetScratchpad").field(n).finish()
@@ -459,6 +473,15 @@ impl WindowState {
                 if let Some(id) = self.current_conversation_id.clone()
                     && self.conversations.iter().any(|c| c.id == id)
                 {
+                    // Re-establish the daemon's turn-event subscription for the
+                    // open conversation on (re)connect (#1). A reconnect's
+                    // refresh flows through `ReloadConversation` →
+                    // `ConversationReloaded` (which keeps the model picker, #72)
+                    // and so does NOT pass through `ConversationLoaded`, where
+                    // the switch-time subscribe lives — so subscribe here too,
+                    // covering both the cached-detail reconnect and the
+                    // not-yet-cached path before its `ConversationLoaded` lands.
+                    effects.push(Effect::SubscribeConversations(vec![id.clone()]));
                     let detail_cached = self
                         .current_conversation
                         .as_ref()
@@ -483,6 +506,12 @@ impl WindowState {
                     // Drop any stale context-fill reading from the previous
                     // conversation; the next turn re-establishes it (#341).
                     Effect::SetContextUsage(None),
+                    // Subscribe the daemon to this (now-active) conversation so
+                    // its turn events — including ones started by another client
+                    // or the voice daemon — fan to us for live render (#1). The
+                    // set is replaced wholesale, so passing just the active
+                    // conversation also drops the previously-viewed one.
+                    Effect::SubscribeConversations(vec![id.clone()]),
                     // Rebind the side pane to the new conversation: clear stale
                     // notes until the fetch returns, refresh the filtered task
                     // list, and fetch this conversation's scratchpad.
@@ -624,6 +653,11 @@ impl WindowState {
                     self.pending_turn_external = true;
                     if let Some(ref mut conv) = self.current_conversation {
                         conv.messages.push(ChatMessage {
+                            // Locally-adopted external turn: no server id yet
+                            // (the event carries none). Empty is the sanctioned
+                            // placeholder for a message the daemon hasn't keyed;
+                            // the next reload swaps in the authoritative copy.
+                            id: String::new(),
                             role: "user".to_string(),
                             content: content.clone(),
                         });
@@ -753,6 +787,9 @@ impl WindowState {
                     // The streaming conversation is the one in view: finalize it.
                     if let Some(ref mut conv) = self.current_conversation {
                         conv.messages.push(ChatMessage {
+                            // Locally-finalized reply: no server id in hand
+                            // (empty placeholder); the next reload reconciles.
+                            id: String::new(),
                             role: "assistant".to_string(),
                             content: full_response.clone(),
                         });
@@ -1081,6 +1118,9 @@ impl WindowState {
                         let full = format!("{buffer}\n\n[Connection lost]");
                         if let Some(ref mut conv) = self.current_conversation {
                             conv.messages.push(ChatMessage {
+                                // Local connection-lost stub: no server id
+                                // (empty placeholder).
+                                id: String::new(),
                                 role: "assistant".to_string(),
                                 content: full.clone(),
                             });
@@ -1140,6 +1180,7 @@ mod tests {
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
+            id: String::new(),
             role: role.to_string(),
             content: content.to_string(),
         }
@@ -1855,6 +1896,7 @@ mod tests {
                 Effect::SetModelSelection(_),
                 Effect::LoadConversationIntoChat(filtered),
                 Effect::SetContextUsage(None),
+                Effect::SubscribeConversations(_),
                 Effect::SidePaneSetScratchpad(_),
                 Effect::RefreshSidePaneTasks,
                 Effect::FetchScratchpad(_),
@@ -1950,6 +1992,7 @@ mod tests {
                 Effect::SetModelSelection(_),
                 Effect::LoadConversationIntoChat(filtered),
                 Effect::SetContextUsage(None),
+                Effect::SubscribeConversations(_),
                 Effect::SidePaneSetScratchpad(_),
                 Effect::RefreshSidePaneTasks,
                 Effect::FetchScratchpad(_),
@@ -1973,6 +2016,7 @@ mod tests {
                 Effect::SetModelSelection(Some(sel)),
                 Effect::LoadConversationIntoChat(_),
                 Effect::SetContextUsage(None),
+                Effect::SubscribeConversations(_),
                 Effect::SidePaneSetScratchpad(_),
                 Effect::RefreshSidePaneTasks,
                 Effect::FetchScratchpad(conv),
@@ -1983,6 +2027,30 @@ mod tests {
             }
             other => panic!("unexpected effects: {other:?}"),
         }
+    }
+
+    // --- Live multi-client conversation subscription (#1) ----------------
+
+    #[test]
+    fn conversation_loaded_subscribes_to_that_conversation() {
+        // Switching/loading a conversation must tell the daemon we're now
+        // viewing it (set-replace, just the active one) so its turn events —
+        // including ones started by another client or the voice daemon — fan to
+        // this connection for live render.
+        let mut state = WindowState::default();
+        let effects = state.apply(UiMessage::ConversationLoaded(detail(
+            "c7",
+            vec![msg("user", "hi")],
+        )));
+        let subscribed = effects.iter().find_map(|e| match e {
+            Effect::SubscribeConversations(ids) => Some(ids),
+            _ => None,
+        });
+        assert_eq!(
+            subscribed.map(Vec::as_slice),
+            Some(["c7".to_string()].as_slice()),
+            "ConversationLoaded must emit SubscribeConversations([active id]); got {effects:?}"
+        );
     }
 
     // --- Model-picker re-application -------------------------------------
@@ -2051,8 +2119,17 @@ mod tests {
             [
                 Effect::SetConversations(_),
                 Effect::EnsureActiveConversation,
+                // Reconnect re-establishes the daemon's turn-event subscription
+                // for the still-open conversation (#1) — the cached-detail path
+                // refreshes via ReloadConversation, which never passes through
+                // ConversationLoaded where the switch-time subscribe lives, so
+                // the subscribe must be re-sent here too.
+                Effect::SubscribeConversations(ids),
                 Effect::ReloadConversation(id),
-            ] => assert_eq!(id, "c1"),
+            ] => {
+                assert_eq!(ids.as_slice(), ["c1".to_string()]);
+                assert_eq!(id, "c1");
+            }
             other => panic!("unexpected effects: {other:?}"),
         }
     }
