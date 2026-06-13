@@ -1440,6 +1440,27 @@ fn handle_ui_message(
                     });
                 }
             }
+            Effect::RefetchConversationList => {
+                // A sibling client or the voice daemon changed the user's list
+                // (#1). Re-fetch it over the live transport and deliver it as
+                // `ConversationListRefetched` — a sidebar-only repaint that
+                // leaves the open conversation + model picker untouched (the
+                // reducer deliberately does not reload the chat here). Same RPC
+                // as the connect-time refresh; only the reply variant differs.
+                if let Some(connector) = client.borrow().clone() {
+                    let tx = ui_tx.clone();
+                    crate::async_bridge::spawn_on_runtime(async move {
+                        match connector.client().list_conversations().await {
+                            Ok(convs) => {
+                                let _ = tx.send(UiMessage::ConversationListRefetched(convs));
+                            }
+                            Err(e) => {
+                                tracing::warn!("refetch conversation list failed: {e}");
+                            }
+                        }
+                    });
+                }
+            }
             Effect::ClearChat => {
                 chat_view.borrow_mut().clear();
             }
