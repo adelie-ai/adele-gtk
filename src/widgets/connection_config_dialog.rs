@@ -66,17 +66,32 @@ impl ConnectorType {
             Self::Anthropic => api::ConnectionConfigView::Anthropic {
                 base_url: None,
                 api_key_env: None,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
             },
             Self::OpenAi => api::ConnectionConfigView::OpenAi {
                 base_url: None,
                 api_key_env: None,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
             },
             Self::Bedrock => api::ConnectionConfigView::Bedrock {
                 aws_profile: None,
                 region: None,
                 base_url: None,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
             },
-            Self::Ollama => api::ConnectionConfigView::Ollama { base_url: None },
+            Self::Ollama => api::ConnectionConfigView::Ollama {
+                base_url: None,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                keep_warm: None,
+                max_context_tokens: None,
+            },
         }
     }
 }
@@ -86,6 +101,65 @@ impl ConnectorType {
 fn text_opt(entry: &Entry) -> Option<String> {
     let t = entry.text().trim().to_string();
     if t.is_empty() { None } else { Some(t) }
+}
+
+/// Config fields the dialog doesn't surface as form inputs (timeouts, the
+/// context ceiling, and Ollama's keep-warm flag). We carry them through an
+/// edit round-trip so saving the dialog preserves whatever the daemon had
+/// stored instead of silently resetting them to `None`. `keep_warm` is
+/// Ollama-only and `None` for every other variant; a `None` config (the
+/// create path) yields all `None`.
+#[derive(Clone, Copy, Default)]
+struct PreservedFields {
+    connect_timeout_secs: Option<u64>,
+    stream_timeout_secs: Option<u64>,
+    max_context_tokens: Option<u64>,
+    keep_warm: Option<bool>,
+}
+
+impl PreservedFields {
+    fn from_config(config: Option<&api::ConnectionConfigView>) -> Self {
+        match config {
+            Some(
+                api::ConnectionConfigView::Anthropic {
+                    connect_timeout_secs,
+                    stream_timeout_secs,
+                    max_context_tokens,
+                    ..
+                }
+                | api::ConnectionConfigView::OpenAi {
+                    connect_timeout_secs,
+                    stream_timeout_secs,
+                    max_context_tokens,
+                    ..
+                }
+                | api::ConnectionConfigView::Bedrock {
+                    connect_timeout_secs,
+                    stream_timeout_secs,
+                    max_context_tokens,
+                    ..
+                },
+            ) => Self {
+                connect_timeout_secs: *connect_timeout_secs,
+                stream_timeout_secs: *stream_timeout_secs,
+                max_context_tokens: *max_context_tokens,
+                keep_warm: None,
+            },
+            Some(api::ConnectionConfigView::Ollama {
+                connect_timeout_secs,
+                stream_timeout_secs,
+                max_context_tokens,
+                keep_warm,
+                ..
+            }) => Self {
+                connect_timeout_secs: *connect_timeout_secs,
+                stream_timeout_secs: *stream_timeout_secs,
+                max_context_tokens: *max_context_tokens,
+                keep_warm: *keep_warm,
+            },
+            None => Self::default(),
+        }
+    }
 }
 
 /// Declarative description of one form field for a connector. `initial` holds
@@ -114,6 +188,7 @@ fn field_specs(
                 Some(api::ConnectionConfigView::Anthropic {
                     base_url,
                     api_key_env,
+                    ..
                 }) => (base_url.clone(), api_key_env.clone()),
                 _ => (None, None),
             };
@@ -139,6 +214,7 @@ fn field_specs(
                 Some(api::ConnectionConfigView::OpenAi {
                     base_url,
                     api_key_env,
+                    ..
                 }) => (base_url.clone(), api_key_env.clone()),
                 _ => (None, None),
             };
@@ -165,6 +241,7 @@ fn field_specs(
                     aws_profile,
                     region,
                     base_url,
+                    ..
                 }) => (aws_profile.clone(), region.clone(), base_url.clone()),
                 _ => (None, None, None),
             };
@@ -194,7 +271,7 @@ fn field_specs(
         }
         ConnectorType::Ollama => {
             let base_url = match config {
-                Some(api::ConnectionConfigView::Ollama { base_url }) => base_url.clone(),
+                Some(api::ConnectionConfigView::Ollama { base_url, .. }) => base_url.clone(),
                 _ => None,
             };
             vec![FieldSpec {
@@ -388,6 +465,12 @@ pub fn show_configure_dialog<FSave, FRefresh>(
     ));
 
     let save_cb = Rc::new(on_save);
+    // Fields the dialog doesn't surface as inputs (timeouts / context ceiling /
+    // keep-warm). Carried through so an edit save preserves the daemon's stored
+    // values; `None` everywhere on the create path. `Copy`, so it moves into the
+    // save closure directly.
+    let preserved = PreservedFields::from_config(existing_config.as_ref());
+
     save_btn.connect_clicked(glib::clone!(
         #[weak(rename_to = dialog_ref)]
         dialog,
@@ -421,18 +504,31 @@ pub fn show_configure_dialog<FSave, FRefresh>(
                 ConnectorType::Anthropic => api::ConnectionConfigView::Anthropic {
                     base_url: by_name("base_url"),
                     api_key_env: by_name("api_key_env"),
+                    connect_timeout_secs: preserved.connect_timeout_secs,
+                    stream_timeout_secs: preserved.stream_timeout_secs,
+                    max_context_tokens: preserved.max_context_tokens,
                 },
                 ConnectorType::OpenAi => api::ConnectionConfigView::OpenAi {
                     base_url: by_name("base_url"),
                     api_key_env: by_name("api_key_env"),
+                    connect_timeout_secs: preserved.connect_timeout_secs,
+                    stream_timeout_secs: preserved.stream_timeout_secs,
+                    max_context_tokens: preserved.max_context_tokens,
                 },
                 ConnectorType::Bedrock => api::ConnectionConfigView::Bedrock {
                     aws_profile: by_name("aws_profile"),
                     region: by_name("region"),
                     base_url: by_name("base_url"),
+                    connect_timeout_secs: preserved.connect_timeout_secs,
+                    stream_timeout_secs: preserved.stream_timeout_secs,
+                    max_context_tokens: preserved.max_context_tokens,
                 },
                 ConnectorType::Ollama => api::ConnectionConfigView::Ollama {
                     base_url: by_name("base_url"),
+                    connect_timeout_secs: preserved.connect_timeout_secs,
+                    stream_timeout_secs: preserved.stream_timeout_secs,
+                    keep_warm: preserved.keep_warm,
+                    max_context_tokens: preserved.max_context_tokens,
                 },
             };
 
@@ -494,6 +590,9 @@ mod tests {
         let config = api::ConnectionConfigView::Anthropic {
             base_url: Some("https://proxy.example/v1".to_string()),
             api_key_env: Some("MY_ANTHROPIC_KEY".to_string()),
+            connect_timeout_secs: None,
+            stream_timeout_secs: None,
+            max_context_tokens: None,
         };
         let specs = field_specs(ConnectorType::Anthropic, Some(&config));
         assert_eq!(
@@ -512,6 +611,9 @@ mod tests {
             aws_profile: Some("prod".to_string()),
             region: Some("eu-central-1".to_string()),
             base_url: None,
+            connect_timeout_secs: None,
+            stream_timeout_secs: None,
+            max_context_tokens: None,
         };
         let specs = field_specs(ConnectorType::Bedrock, Some(&config));
         assert_eq!(initial_of(&specs, "aws_profile"), Some("prod"));
@@ -545,8 +647,49 @@ mod tests {
             aws_profile: Some("prod".to_string()),
             region: Some("us-east-1".to_string()),
             base_url: None,
+            connect_timeout_secs: None,
+            stream_timeout_secs: None,
+            max_context_tokens: None,
         };
         let specs = field_specs(ConnectorType::Anthropic, Some(&bedrock));
         assert!(specs.iter().all(|f| f.initial.is_none()));
+    }
+
+    #[test]
+    fn preserved_fields_round_trip_unsurfaced_values() {
+        // The dialog has no inputs for timeouts / context ceiling / keep-warm,
+        // so an edit must carry the daemon's stored values through unchanged.
+        let ollama = api::ConnectionConfigView::Ollama {
+            base_url: Some("http://localhost:11434".to_string()),
+            connect_timeout_secs: Some(5),
+            stream_timeout_secs: Some(120),
+            keep_warm: Some(true),
+            max_context_tokens: Some(8192),
+        };
+        let p = PreservedFields::from_config(Some(&ollama));
+        assert_eq!(p.connect_timeout_secs, Some(5));
+        assert_eq!(p.stream_timeout_secs, Some(120));
+        assert_eq!(p.keep_warm, Some(true));
+        assert_eq!(p.max_context_tokens, Some(8192));
+
+        // Non-Ollama variants have no keep_warm; the rest still round-trip.
+        let bedrock = api::ConnectionConfigView::Bedrock {
+            aws_profile: None,
+            region: Some("us-west-2".to_string()),
+            base_url: None,
+            connect_timeout_secs: Some(3),
+            stream_timeout_secs: None,
+            max_context_tokens: Some(200_000),
+        };
+        let p = PreservedFields::from_config(Some(&bedrock));
+        assert_eq!(p.connect_timeout_secs, Some(3));
+        assert_eq!(p.max_context_tokens, Some(200_000));
+        assert_eq!(p.keep_warm, None);
+
+        // Create path: nothing stored.
+        let p = PreservedFields::from_config(None);
+        assert_eq!(p.connect_timeout_secs, None);
+        assert_eq!(p.max_context_tokens, None);
+        assert_eq!(p.keep_warm, None);
     }
 }
