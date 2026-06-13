@@ -41,6 +41,14 @@ pub enum UiMessage {
     /// `Arc<TransportClient>`.
     ClientReady(Arc<Connector>),
     ConversationsLoaded(Vec<desktop_assistant_client_common::ConversationSummary>),
+    /// A *list-only* re-fetch of the conversation list, triggered by
+    /// [`UiMessage::ConversationListChanged`] (a conversation was
+    /// created/renamed/deleted/(un)archived elsewhere — #1). Unlike
+    /// [`UiMessage::ConversationsLoaded`], the reducer repaints ONLY the sidebar
+    /// (and re-syncs the selection); it deliberately does NOT reload the open
+    /// conversation's chat or touch the model picker, so a sibling-client change
+    /// never disturbs what the user is reading/typing.
+    ConversationListRefetched(Vec<desktop_assistant_client_common::ConversationSummary>),
     ConversationLoaded(desktop_assistant_client_common::ConversationDetail),
     /// A conversation that is *already open* was re-fetched (on reconnect, or
     /// after a debug/personality refresh). The window refreshes the cached
@@ -96,6 +104,18 @@ pub enum UiMessage {
     TitleChanged {
         conversation_id: String,
         title: String,
+    },
+    /// The user's conversation list changed on another connection — a
+    /// conversation was created, renamed, deleted, or (un)archived by another
+    /// client or the voice daemon (desktop-assistant#1). Carried from
+    /// [`SignalEvent::ConversationListChanged`]; carries only the affected
+    /// `conversation_id`. The reducer responds with a full list re-fetch
+    /// ([`Effect::RefetchConversationList`]) — simplest and correct for every
+    /// change kind — rather than a surgical per-row edit. The refetch result
+    /// arrives as [`UiMessage::ConversationListRefetched`], which repaints only
+    /// the sidebar.
+    ConversationListChanged {
+        conversation_id: String,
     },
     /// A one-time advisory for a conversation emitted as a live signal
     /// (today only `DanglingModelSelection`: the stored model selection no
@@ -237,6 +257,9 @@ impl std::fmt::Debug for UiMessage {
             UiMessage::ConversationsLoaded(v) => {
                 f.debug_tuple("ConversationsLoaded").field(v).finish()
             }
+            UiMessage::ConversationListRefetched(v) => {
+                f.debug_tuple("ConversationListRefetched").field(v).finish()
+            }
             UiMessage::ConversationLoaded(v) => {
                 f.debug_tuple("ConversationLoaded").field(v).finish()
             }
@@ -311,6 +334,10 @@ impl std::fmt::Debug for UiMessage {
                 .debug_struct("TitleChanged")
                 .field("conversation_id", conversation_id)
                 .field("title", title)
+                .finish(),
+            UiMessage::ConversationListChanged { conversation_id } => f
+                .debug_struct("ConversationListChanged")
+                .field("conversation_id", conversation_id)
                 .finish(),
             UiMessage::ConversationWarning {
                 conversation_id,
@@ -779,6 +806,12 @@ fn signal_to_ui_message(signal: SignalEvent) -> UiMessage {
             conversation_id,
             title,
         },
+        // The user's conversation list changed on another connection (#1).
+        // Carry it through to the reducer, which responds with a full list
+        // re-fetch that repaints only the sidebar.
+        SignalEvent::ConversationListChanged { conversation_id } => {
+            UiMessage::ConversationListChanged { conversation_id }
+        }
         SignalEvent::ConversationWarning {
             conversation_id,
             warning,
@@ -1182,6 +1215,23 @@ mod tests {
                 assert_eq!(got, warning);
             }
             other => panic!("expected ConversationWarning, got {other:?}"),
+        }
+    }
+
+    /// Issue #1: a `ConversationListChanged` signal (a sibling client or the
+    /// voice daemon mutated the user's conversation list) must map to the typed
+    /// `UiMessage::ConversationListChanged`, carrying the affected id, so the
+    /// reducer can trigger a sidebar-only re-fetch.
+    #[test]
+    fn signal_conversation_list_changed_maps_to_ui_message() {
+        let msg = signal_to_ui_message(SignalEvent::ConversationListChanged {
+            conversation_id: "conv-42".to_string(),
+        });
+        match msg {
+            UiMessage::ConversationListChanged { conversation_id } => {
+                assert_eq!(conversation_id, "conv-42");
+            }
+            other => panic!("expected ConversationListChanged, got {other:?}"),
         }
     }
 

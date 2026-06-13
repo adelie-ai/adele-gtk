@@ -256,6 +256,14 @@ pub(super) enum Effect {
     /// picker — replacing the old new-conversation flow's redundant second fetch
     /// (GTK-10).
     LoadConversation(String),
+    /// Re-fetch the conversation list from the daemon, then deliver it as
+    /// [`UiMessage::ConversationListRefetched`] — a *list-only* refresh used when
+    /// the list changed on another connection (#1). Kept as an effect because it
+    /// needs the live client + ui_tx and spawns an async RPC; the decision to run
+    /// it lives in `apply`. The result repaints only the sidebar (it does NOT
+    /// reload the open conversation or touch the model picker), distinguishing it
+    /// from the connect-time `list_conversations -> ConversationsLoaded` path.
+    RefetchConversationList,
     /// Clear the chat view.
     ClearChat,
     /// Set the chat's transient status line.
@@ -373,6 +381,7 @@ impl std::fmt::Debug for Effect {
                 f.debug_tuple("ReloadConversation").field(id).finish()
             }
             Effect::LoadConversation(id) => f.debug_tuple("LoadConversation").field(id).finish(),
+            Effect::RefetchConversationList => f.write_str("RefetchConversationList"),
             Effect::ClearChat => f.write_str("ClearChat"),
             Effect::SetChatStatus(m) => f.debug_tuple("SetChatStatus").field(m).finish(),
             Effect::ClearChatStatus => f.write_str("ClearChatStatus"),
@@ -593,6 +602,34 @@ impl WindowState {
                     }
                 }
                 vec![Effect::SetConversations(self.conversations.clone())]
+            }
+            UiMessage::ConversationListChanged { conversation_id: _ } => {
+                // The user's list changed on another connection — a conversation
+                // was created/renamed/deleted/(un)archived by another client or
+                // the voice daemon (#1). The signal carries only the affected id;
+                // rather than patch a single row, re-fetch the whole list (correct
+                // for every change kind). The reply lands as
+                // `ConversationListRefetched`, which repaints ONLY the sidebar —
+                // so this never disturbs the open conversation or the model picker.
+                vec![Effect::RefetchConversationList]
+            }
+            UiMessage::ConversationListRefetched(convs) => {
+                // The list-only refresh requested by `ConversationListChanged`.
+                // Store the fresh list and repaint the sidebar; re-sync the
+                // selection via `EnsureActiveConversation` (a no-op beyond
+                // re-selecting the active row when it is still present — see
+                // `ensure_active_conversation`). Deliberately NO
+                // `ReloadConversation`/`LoadConversation`: the open conversation's
+                // chat and the model picker must stay exactly as the user left
+                // them. If the open conversation was the one deleted elsewhere,
+                // it is now absent from the list and `EnsureActiveConversation`
+                // falls back to the first conversation (or creates one), which is
+                // the right thing to show.
+                self.conversations = convs.clone();
+                vec![
+                    Effect::SetConversations(convs),
+                    Effect::EnsureActiveConversation,
+                ]
             }
             UiMessage::PromptSent {
                 task_id: _,
@@ -1673,6 +1710,89 @@ mod tests {
             }
             other => panic!("unexpected effects: {other:?}"),
         }
+    }
+
+    /// Issue #1: a `ConversationListChanged` signal (the list changed on
+    /// another connection) must trigger a full list re-fetch — and nothing else.
+    /// It carries only the affected id; the reducer responds with a single
+    /// `RefetchConversationList` effect rather than patching a row.
+    #[test]
+    fn conversation_list_changed_triggers_a_list_refetch_only() {
+        let mut state = WindowState {
+            conversations: vec![summary("c1", "one", false)],
+            current_conversation_id: Some("c1".to_string()),
+            current_conversation: Some(detail("c1", vec![])),
+            ..Default::default()
+        };
+        let effects = state.apply(UiMessage::ConversationListChanged {
+            conversation_id: "c2".to_string(),
+        });
+        assert!(
+            matches!(effects.as_slice(), [Effect::RefetchConversationList]),
+            "ConversationListChanged must request exactly one list re-fetch: {effects:?}"
+        );
+        // The decision step must not yet mutate the cached list or touch the
+        // open conversation — that waits for the refetch result.
+        assert_eq!(state.conversations.len(), 1);
+        assert_eq!(state.current_conversation_id.as_deref(), Some("c1"));
+        assert!(state.current_conversation.is_some());
+    }
+
+    /// Issue #1: the refetch result repaints ONLY the sidebar (and re-syncs the
+    /// selection via `EnsureActiveConversation`). It must NOT reload the open
+    /// conversation's chat or re-apply the model picker — so a sibling-client
+    /// change never disturbs what the user is reading/typing. Concretely, no
+    /// `ReloadConversation`/`LoadConversation` is emitted even though an open
+    /// conversation is present and cached.
+    #[test]
+    fn conversation_list_refetched_repaints_sidebar_without_disturbing_open_chat() {
+        let mut state = WindowState {
+            conversations: vec![summary("c1", "one", false)],
+            current_conversation_id: Some("c1".to_string()),
+            current_conversation: Some(detail("c1", vec![msg("user", "hi")])),
+            ..Default::default()
+        };
+        // A sibling client added "c2" and renamed "c1".
+        let fresh = vec![
+            summary("c1", "one renamed", false),
+            summary("c2", "two", false),
+        ];
+        let effects = state.apply(UiMessage::ConversationListRefetched(fresh.clone()));
+
+        // The fresh list is stored and the sidebar repainted + re-synced.
+        assert_eq!(state.conversations.len(), 2);
+        assert_eq!(state.conversations[0].title, "one renamed");
+        assert_eq!(state.conversations[1].id, "c2");
+        match effects.as_slice() {
+            [
+                Effect::SetConversations(got),
+                Effect::EnsureActiveConversation,
+            ] => {
+                assert_eq!(got.len(), 2);
+                assert_eq!(got[1].id, "c2");
+            }
+            other => panic!("unexpected effects: {other:?}"),
+        }
+        // The open conversation must be left exactly as the user had it: no
+        // chat reload, no picker re-apply, and the cached detail is untouched.
+        assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                Effect::ReloadConversation(_)
+                    | Effect::LoadConversation(_)
+                    | Effect::LoadConversationIntoChat(_)
+                    | Effect::SetModelSelection(_)
+            )),
+            "a list-only refetch must not disturb the open chat or picker: {effects:?}"
+        );
+        assert_eq!(state.current_conversation_id.as_deref(), Some("c1"));
+        assert!(
+            state
+                .current_conversation
+                .as_ref()
+                .is_some_and(|c| c.messages.len() == 1),
+            "the open conversation's cached detail must be preserved verbatim"
+        );
     }
 
     #[test]
