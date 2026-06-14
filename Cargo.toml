@@ -51,6 +51,13 @@ path = "../desktop-assistant/crates/client-common"
 [dependencies.desktop-assistant-api-model]
 path = "../desktop-assistant/crates/api-model"
 
+# The shared view-agnostic model+controller (CC-1, desktop-assistant#359). Its
+# own path-deps to ../desktop-assistant and ../voice resolve through the SAME
+# `.worktrees/adele-gtk/` symlinks this crate uses, so client-common / api-model /
+# adele-voice-client-common unify to one source each (no [patch] needed — Option D).
+[dependencies.client-ui-common]
+path = "../client-ui-common"
+
 # The embeddable voice module (adelie-ai/voice phase 1). Path-dep, mirroring the
 # desktop-assistant deps above: a `../voice` symlink under `.worktrees/adele-gtk/`
 # points at the voice checkout, and Cargo resolves the module's transitive

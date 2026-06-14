@@ -22,10 +22,9 @@ use crate::widgets::model_picker::ModelPicker;
 use crate::widgets::sidebar::Sidebar;
 use crate::widgets::tasks_panel::TasksPanel;
 
-mod state;
 mod voice;
 
-use state::{Effect, WindowState, refinement_for_send, voice_mode_client_tools};
+use client_ui_common::{Effect, WindowState, refinement_for_send, voice_mode_client_tools};
 use voice::{speak_text, wire_embedded_mic, wire_voice_controls};
 
 /// The window's widget handles, bundled so the bridge's UI-message executor
