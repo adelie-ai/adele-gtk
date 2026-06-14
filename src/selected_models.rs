@@ -6,11 +6,7 @@ use std::path::PathBuf;
 /// in the model picker dropdown. The set is filtered client-side so the
 /// dropdown stays manageable even when a connector exposes hundreds of
 /// models (e.g. Bedrock).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SelectedModel {
-    pub connection_id: String,
-    pub model_id: String,
-}
+pub use client_ui_common::SelectedModel;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SelectedModelsFile {

@@ -22,10 +22,9 @@ use crate::widgets::model_picker::ModelPicker;
 use crate::widgets::sidebar::Sidebar;
 use crate::widgets::tasks_panel::TasksPanel;
 
-mod state;
 mod voice;
 
-use state::{Effect, WindowState, refinement_for_send, voice_mode_client_tools};
+use client_ui_common::{Effect, WindowState, refinement_for_send, voice_mode_client_tools};
 use voice::{speak_text, wire_embedded_mic, wire_voice_controls};
 
 /// The window's widget handles, bundled so the bridge's UI-message executor
@@ -1633,6 +1632,18 @@ fn handle_ui_message(
                 } else {
                     tracing::warn!("no connector to submit client-tool result for task {task_id}");
                 }
+            }
+            Effect::SendPrompt { .. } => {
+                // adele-tui routes its send through the core
+                // (`UiMessage::SubmitPrompt` → this effect, Phase-2); adele-gtk
+                // still sends via its own path and never emits `SubmitPrompt`, so
+                // this effect is not produced here. Routing gtk's send through the
+                // core too (to share the gate + optimistic append) is a follow-up;
+                // until then this arm is unreachable — log rather than panic if it
+                // ever fires, so a future wiring mistake is visible, not silent.
+                tracing::warn!(
+                    "unexpected Effect::SendPrompt in adele-gtk (gtk sends via its own path)"
+                );
             }
         }
     }
