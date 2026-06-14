@@ -829,7 +829,7 @@ impl AdelieWindow {
                     // Track in local conversation copy
                     {
                         let mut s = state.borrow_mut();
-                        if let Some(ref mut conv) = s.current_conversation {
+                        if let Some(conv) = s.current_conversation_mut() {
                             conv.messages.push(ChatMessage {
                                 // Optimistic local send: no server id yet (empty
                                 // placeholder); the next reload reconciles it.
@@ -1160,8 +1160,7 @@ impl AdelieWindow {
                     let s = state.borrow();
                     let id = s.current_conversation_id.clone();
                     let prefill = s
-                        .current_conversation
-                        .as_ref()
+                        .current_conversation()
                         .and_then(|c| c.conversation_personality);
                     (id, prefill)
                 };
