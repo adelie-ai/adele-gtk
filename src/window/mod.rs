@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use desktop_assistant_api_model as api;
 use desktop_assistant_client_common::{AssistantClient, ChatMessage, ConnectionConfig, Connector};
@@ -41,6 +41,14 @@ struct WindowWidgets {
     /// Read-only context-window fill indicator (#341).
     context_label: Rc<Label>,
     client: Rc<RefCell<Option<Arc<Connector>>>>,
+    /// Connector handed from the (tokio) connect task to the GTK main thread
+    /// (#106). The connect task stores it here just before `UiMessage::Connected`;
+    /// the `Connected` handler drains it, registers the voice-mode client tools,
+    /// and moves it into `client`. Replaces the removed `UiMessage::ClientReady`
+    /// / `Effect::SetClient` round-trip — the core no longer names `Connector`
+    /// (wasm) — while keeping the connector's arrival ordered before
+    /// `ConversationsLoaded` (the `Connected` trigger rides the same FIFO channel).
+    pending_connector: Arc<Mutex<Option<Arc<Connector>>>>,
     input_bar: Rc<InputBar>,
     model_picker: Rc<ModelPicker>,
     tasks_panel: Rc<TasksPanel>,
@@ -376,6 +384,13 @@ impl AdelieWindow {
         // `&TransportClient` surface (`as_commands()`, `AssistantClient` RPCs).
         let client: Rc<RefCell<Option<Arc<Connector>>>> = Rc::new(RefCell::new(None));
 
+        // Cross-thread connector hand-off (#106): the tokio connect task stores
+        // the freshly connected `Arc<Connector>` here just before it sends
+        // `UiMessage::Connected`; the `Connected` handler (main thread) drains it.
+        // `Arc<Connector>` is `Send`, so this `Arc<Mutex<…>>` is the seam that
+        // carries the handle across the thread boundary now that the core can't.
+        let pending_connector: Arc<Mutex<Option<Arc<Connector>>>> = Arc::new(Mutex::new(None));
+
         // Handle to the standalone voice daemon (`org.desktopAssistant.Voice`),
         // declared here — *before* the bridge — so the `handle_ui_message`
         // executor can also reach it (issue #80): narration prefers the daemon's
@@ -397,6 +412,7 @@ impl AdelieWindow {
             status_label: status_label.clone(),
             context_label: context_label.clone(),
             client: client.clone(),
+            pending_connector: pending_connector.clone(),
             input_bar: input_bar.clone(),
             model_picker: model_picker.clone(),
             tasks_panel: tasks_panel.clone(),
@@ -493,14 +509,20 @@ impl AdelieWindow {
         ));
 
         // Spawn persistent connection manager (connect → forward → reconnect).
-        // It now delivers the freshly connected `Connector` to the main thread
-        // via `UiMessage::ClientReady` on the same channel as every other UI
-        // message (handled in `handle_ui_message`). It exits when the window's
-        // `close-request` signals `shutdown_rx` (GTK-1), dropping its connector
-        // and sender clones.
+        // It delivers the freshly connected `Connector` to the main thread by
+        // stashing it in `pending_connector` and sending `UiMessage::Connected`;
+        // the `Connected` handler drains it, registers voice-mode tools, and moves
+        // it into `client` (#106 — the core no longer carries the handle, for
+        // wasm). It exits when the window's `close-request` signals `shutdown_rx`
+        // (GTK-1), dropping its connector and sender clones.
         {
             let ui_tx = bridge.ui_sender();
-            bridge.spawn(connection_manager(config.clone(), ui_tx, shutdown_rx));
+            bridge.spawn(connection_manager(
+                config.clone(),
+                ui_tx,
+                pending_connector.clone(),
+                shutdown_rx,
+            ));
         }
 
         // Sidebar row activation → load conversation
@@ -1338,6 +1360,7 @@ fn handle_ui_message(
         status_label,
         context_label,
         client,
+        pending_connector,
         input_bar,
         model_picker,
         tasks_panel,
@@ -1348,31 +1371,19 @@ fn handle_ui_message(
         voice,
     } = widgets;
 
+    // Connector hand-off (#106): the connect task stashes the `Arc<Connector>`
+    // in `pending_connector` just before sending `Connected`. Note it before
+    // `apply` consumes `msg`; the actual adopt happens after the effects below,
+    // matching the old ordering (the connector was stored *after* `Connected`'s
+    // own effects ran, since `ClientReady` followed `Connected` on the channel).
+    let connector_arrived = matches!(&msg, UiMessage::Connected { .. });
+
     // Pure decision: mutate state + compute the effects to perform.
     let effects = state.borrow_mut().apply(msg);
 
     // Thin executor: perform each effect against the real widgets, in order.
     for effect in effects {
         match effect {
-            Effect::SetClient(connector) => {
-                // Advertise gtk's session-scoped voice-mode client tools so the
-                // model can drive voice mode (issue #78). Registered once on
-                // connect; the Connector remembers + replays this set after an
-                // auto-reconnect (#246), so a daemon restart won't drop them.
-                // Socket-only (UDS/WS) — on a D-Bus transport this is a logged
-                // no-op (the daemon has no command channel for client tools),
-                // which is fine: voice mode still works as a local UI toggle.
-                let registration_connector = Arc::clone(&connector);
-                crate::async_bridge::spawn_on_runtime(async move {
-                    if let Err(e) = registration_connector
-                        .register_client_tools(voice_mode_client_tools())
-                        .await
-                    {
-                        tracing::debug!("voice-mode client tools not registered: {e}");
-                    }
-                });
-                *client.borrow_mut() = Some(connector);
-            }
             Effect::ClearClient => {
                 *client.borrow_mut() = None;
             }
@@ -1646,6 +1657,26 @@ fn handle_ui_message(
                 );
             }
         }
+    }
+
+    // Adopt the connector the connect task handed off (#106), now that any
+    // `Connected` effects (status, send-enable) have been applied. Lifted from
+    // the old `Effect::SetClient` arm; the only change is the source — the
+    // `pending_connector` cell instead of a reducer effect.
+    if connector_arrived && let Some(connector) = pending_connector.lock().unwrap().take() {
+        // Advertise gtk's session-scoped voice-mode client tools (issue #78);
+        // socket-only (UDS/WS), a logged no-op on D-Bus. The Connector replays
+        // them after an auto-reconnect (#246), so a daemon restart won't drop them.
+        let registration_connector = Arc::clone(&connector);
+        crate::async_bridge::spawn_on_runtime(async move {
+            if let Err(e) = registration_connector
+                .register_client_tools(voice_mode_client_tools())
+                .await
+            {
+                tracing::debug!("voice-mode client tools not registered: {e}");
+            }
+        });
+        *client.borrow_mut() = Some(connector);
     }
 }
 
