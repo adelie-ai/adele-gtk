@@ -1,6 +1,6 @@
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use desktop_assistant_api_model as api;
 #[cfg(test)]
@@ -102,6 +102,10 @@ where
 pub async fn connection_manager(
     config: ConnectionConfig,
     ui_tx: mpsc::UnboundedSender<UiMessage>,
+    // Where each freshly connected `Connector` is handed to the GTK main thread
+    // (#106): `drive_connection` stores it here just before `Connected`. The core
+    // can't carry the handle (wasm), so this gtk-local cell is the seam.
+    pending_connector: Arc<Mutex<Option<Arc<Connector>>>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     const INITIAL_BACKOFF_SECS: u64 = 2;
@@ -125,7 +129,7 @@ pub async fn connection_manager(
                 // future (connector, signal stream) is dropped here, which
                 // closes the transport and ends the daemon session.
                 let flow = tokio::select! {
-                    flow = drive_connection(connector, &ui_tx) => flow,
+                    flow = drive_connection(connector, &ui_tx, &pending_connector) => flow,
                     _ = shutdown_requested(&mut shutdown) => return,
                 };
                 if flow.is_break() {
@@ -185,6 +189,7 @@ async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
 async fn drive_connection(
     connector: Connector,
     ui_tx: &mpsc::UnboundedSender<UiMessage>,
+    pending_connector: &Arc<Mutex<Option<Arc<Connector>>>>,
 ) -> std::ops::ControlFlow<()> {
     use std::ops::ControlFlow::{Break, Continue};
 
@@ -198,18 +203,16 @@ async fn drive_connection(
     // `Arc` clone handed to the GTK thread keeps the pump alive).
     let transport = connector.client();
 
+    // Hand the connector to the GTK main thread (#106): stash it where the
+    // `Connected` handler drains it, THEN send `Connected`. Storing before the
+    // send preserves the ordering the chat relies on — the connector is in place
+    // before `Connected` (and the later `ConversationsLoaded`, which needs it) is
+    // handled — without routing the handle through the core, which can't name
+    // `Connector` on wasm. Replaces the old `UiMessage::ClientReady` round-trip.
+    *pending_connector.lock().unwrap() = Some(Arc::clone(&connector));
+
     let label = connector.label().to_string();
     if ui_tx.send(UiMessage::Connected { label }).is_err() {
-        return Break(());
-    }
-
-    // Hand the connector to the GTK main thread before the
-    // conversation list (which needs it). Same channel, so
-    // delivery stays ordered.
-    if ui_tx
-        .send(UiMessage::ClientReady(Arc::clone(&connector)))
-        .is_err()
-    {
         return Break(());
     }
 
@@ -406,7 +409,12 @@ mod tests {
         let (ui_tx, _ui_rx) = mpsc::unbounded_channel::<UiMessage>();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let manager = tokio::spawn(connection_manager(config, ui_tx, shutdown_rx));
+        let manager = tokio::spawn(connection_manager(
+            config,
+            ui_tx,
+            Arc::new(Mutex::new(None)),
+            shutdown_rx,
+        ));
         // Let it fail its first connect and enter backoff.
         tokio::time::sleep(Duration::from_millis(100)).await;
         shutdown_tx.send(true).expect("manager subscribed");
@@ -431,7 +439,12 @@ mod tests {
         let (ui_tx, _ui_rx) = mpsc::unbounded_channel::<UiMessage>();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let manager = tokio::spawn(connection_manager(config, ui_tx, shutdown_rx));
+        let manager = tokio::spawn(connection_manager(
+            config,
+            ui_tx,
+            Arc::new(Mutex::new(None)),
+            shutdown_rx,
+        ));
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(shutdown_tx);
 
@@ -457,7 +470,12 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         drop(ui_rx); // window's receive loop already gone
-        let manager = tokio::spawn(connection_manager(config, ui_tx, shutdown_rx));
+        let manager = tokio::spawn(connection_manager(
+            config,
+            ui_tx,
+            Arc::new(Mutex::new(None)),
+            shutdown_rx,
+        ));
 
         tokio::time::timeout(Duration::from_secs(1), manager)
             .await
