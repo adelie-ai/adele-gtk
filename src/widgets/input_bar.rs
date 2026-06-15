@@ -409,6 +409,17 @@ impl InputBar {
         text
     }
 
+    /// Get the current text content *without* clearing it — a read-only snapshot
+    /// of the composer (issue #2). Used to save the outgoing conversation's
+    /// unsent draft on a switch, where the box is then restored from the incoming
+    /// conversation's draft rather than consumed (cf. [`take_text`](Self::take_text)).
+    pub fn peek_text(&self) -> String {
+        let buffer = self.text_view.buffer();
+        buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .to_string()
+    }
+
     /// Replace the input's text. Used by the embedded voice path (issue #65) to
     /// drop a dictated transcript into the box before sending it like a typed
     /// message.
