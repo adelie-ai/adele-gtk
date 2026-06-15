@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use desktop_assistant_api_model as api;
-use desktop_assistant_client_common::{AssistantClient, ChatMessage, ConnectionConfig, Connector};
+use desktop_assistant_client_common::{AssistantClient, ConnectionConfig, Connector};
 use gtk4::prelude::*;
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, Entry, Label,
@@ -24,7 +24,7 @@ use crate::widgets::tasks_panel::TasksPanel;
 
 mod voice;
 
-use client_ui_common::{Effect, WindowState, refinement_for_send, voice_mode_client_tools};
+use client_ui_common::{Effect, WindowState, voice_mode_client_tools};
 use voice::{speak_text, wire_embedded_mic, wire_voice_controls};
 
 /// The window's widget handles, bundled so the bridge's UI-message executor
@@ -803,104 +803,34 @@ impl AdelieWindow {
                 #[strong(rename_to = bridge_ref)]
                 bridge,
                 #[strong]
-                state,
-                #[strong]
                 input_bar,
-                #[strong]
-                chat_view,
-                #[strong]
-                model_picker,
                 move || {
-                    let text = input_bar.take_text();
+                    // Peek (not take): if the core rejects the send — a reply is
+                    // still streaming (TUI-7) — or the connection gate below
+                    // blocks it, the text must stay in the live composer. The
+                    // send *decision* lives in the shared core now: emit
+                    // `UiMessage::SubmitPrompt` and let `apply` run the streaming
+                    // gate, draw the optimistic bubble, drop the saved draft, and
+                    // pick the per-turn voice refinement. The editor is cleared
+                    // only once the core accepts, in the `Effect::SendPrompt` arm
+                    // below. Trim + skip-empty stays client-side (no whitespace).
+                    let text = input_bar.peek_text();
                     let text = text.trim().to_string();
                     if text.is_empty() {
                         return;
                     }
-                    let state_borrow = state.borrow();
-                    let conv_id = match &state_borrow.current_conversation_id {
-                        Some(id) => id.clone(),
-                        None => return,
-                    };
-                    drop(state_borrow);
-
-                    // Show user message immediately
-                    chat_view.borrow_mut().add_user_message(&text);
-
-                    // Track in local conversation copy
-                    {
-                        let mut s = state.borrow_mut();
-                        if let Some(conv) = s.current_conversation_mut() {
-                            conv.messages.push(ChatMessage {
-                                // Optimistic local send: no server id yet (empty
-                                // placeholder); the next reload reconciles it.
-                                id: String::new(),
-                                role: "user".to_string(),
-                                content: text.clone(),
-                            });
-                        }
+                    // Connection gate: transport state the core doesn't own (the
+                    // TUI gates the same way before `SubmitPrompt`). Keep the text
+                    // and surface why, not a bubble that can't be sent.
+                    if client.borrow().is_none() {
+                        let _ = bridge_ref.ui_sender().send(UiMessage::Error(
+                            "Not connected — message not sent (your text is preserved)".to_string(),
+                        ));
+                        return;
                     }
-
-                    let override_selection = model_picker.current_override();
-                    // Voice-mode send shaping (issue #78): when the active
-                    // conversation is in voice mode, attach the read-aloud
-                    // system refinement so the reply is shaped for speech. This
-                    // travels in the system prompt for the turn only — never the
-                    // visible chat text. `None` when voice mode is off → an
-                    // empty refinement, i.e. the unchanged phase-1 send.
-                    let refinement = refinement_for_send(&state.borrow())
-                        .unwrap_or_default()
-                        .to_string();
-
-                    if let Some(connector) = client.borrow().clone() {
-                        let tx = bridge_ref.ui_sender();
-                        let text = text.clone();
-                        bridge_ref.spawn(async move {
-                            let client = connector.client();
-                            // Socket transports (UDS/WS) carry the model override
-                            // AND the system refinement together on the command
-                            // channel via `send_prompt_full`. The shared
-                            // AssistantClient trait exposes neither, so on D-Bus
-                            // we fall back to the Connector's
-                            // `send_prompt_with_system_refinement` (which folds
-                            // the refinement into the prompt; the override isn't
-                            // available over D-Bus regardless).
-                            let result = match client.as_commands() {
-                                Some(cmds) => {
-                                    cmds.send_prompt_full(
-                                        &conv_id,
-                                        &text,
-                                        override_selection,
-                                        refinement,
-                                    )
-                                    .await
-                                }
-                                None => {
-                                    connector
-                                        .send_prompt_with_system_refinement(
-                                            &conv_id,
-                                            &text,
-                                            &refinement,
-                                        )
-                                        .await
-                                }
-                            };
-                            match result {
-                                Ok(task_id) => {
-                                    // `conv_id` was captured at send time (GTK-2):
-                                    // even if the user has switched conversations
-                                    // by the time the ack arrives, the stream is
-                                    // tied to the conversation it was sent into.
-                                    let _ = tx.send(UiMessage::PromptSent {
-                                        task_id,
-                                        conversation_id: conv_id,
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(UiMessage::Error(format!("Send error: {e}")));
-                                }
-                            }
-                        });
-                    }
+                    let _ = bridge_ref
+                        .ui_sender()
+                        .send(UiMessage::SubmitPrompt { prompt: text });
                 }
             ));
 
@@ -1402,6 +1332,17 @@ fn handle_ui_message(
         None
     };
 
+    // Failed send (#12): capture the un-sent prompt before `apply` consumes
+    // `msg`, so the post-effect step can refill the live composer with it. The
+    // core's `SendFailed` rolls the optimistic bubble out of the model but,
+    // being view-agnostic, can't put the editor text back — so the client does,
+    // mirroring the TUI's composer refill on a failed send.
+    let failed_prompt = if let UiMessage::SendFailed { prompt, .. } = &msg {
+        Some(prompt.clone())
+    } else {
+        None
+    };
+
     // Pure decision: mutate state + compute the effects to perform.
     let effects = state.borrow_mut().apply(msg);
 
@@ -1668,17 +1609,84 @@ fn handle_ui_message(
                     tracing::warn!("no connector to submit client-tool result for task {task_id}");
                 }
             }
-            Effect::SendPrompt { .. } => {
-                // adele-tui routes its send through the core
-                // (`UiMessage::SubmitPrompt` → this effect, Phase-2); adele-gtk
-                // still sends via its own path and never emits `SubmitPrompt`, so
-                // this effect is not produced here. Routing gtk's send through the
-                // core too (to share the gate + optimistic append) is a follow-up;
-                // until then this arm is unreachable — log rather than panic if it
-                // ever fires, so a future wiring mistake is visible, not silent.
-                tracing::warn!(
-                    "unexpected Effect::SendPrompt in adele-gtk (gtk sends via its own path)"
-                );
+            Effect::SendPrompt {
+                conversation_id,
+                prompt,
+                system_refinement,
+            } => {
+                // The core accepted the send (`UiMessage::SubmitPrompt`): it ran
+                // the streaming gate (TUI-7), pushed the optimistic user message
+                // into the model, and dropped this conversation's saved draft.
+                // Mirror adele-tui's `send_prompt_from_input`: draw the bubble in
+                // the chat widget (the core is view-agnostic so it can't), clear
+                // the live composer, and run the actual RPC off the GTK loop.
+                if let Some(connector) = client.borrow().clone() {
+                    chat_view.borrow_mut().add_user_message(&prompt);
+                    input_bar.set_text("");
+                    let override_selection = model_picker.current_override();
+                    let refinement = system_refinement.unwrap_or_default();
+                    let ui_tx = ui_tx.clone();
+                    crate::async_bridge::spawn_on_runtime(async move {
+                        let client = connector.client();
+                        // Socket transports (UDS/WS) carry the model override AND
+                        // the refinement together via `send_prompt_full`; the
+                        // shared `AssistantClient` exposes neither, so over D-Bus
+                        // we fall back to `send_prompt_with_system_refinement`
+                        // (the override is unavailable there regardless).
+                        let result = match client.as_commands() {
+                            Some(cmds) => {
+                                cmds.send_prompt_full(
+                                    &conversation_id,
+                                    &prompt,
+                                    override_selection,
+                                    refinement,
+                                )
+                                .await
+                            }
+                            None => {
+                                connector
+                                    .send_prompt_with_system_refinement(
+                                        &conversation_id,
+                                        &prompt,
+                                        &refinement,
+                                    )
+                                    .await
+                            }
+                        };
+                        match result {
+                            Ok(task_id) => {
+                                // `conversation_id` was captured at send time
+                                // (GTK-2): the stream stays tied to the
+                                // conversation it was sent into even if the user
+                                // switches away before the ack lands.
+                                let _ = ui_tx.send(UiMessage::PromptSent {
+                                    task_id,
+                                    conversation_id,
+                                });
+                            }
+                            Err(e) => {
+                                // Roll the optimistic bubble back out of the model
+                                // and refill the composer (the `SendFailed`
+                                // post-hook above), then surface the error.
+                                let _ = ui_tx.send(UiMessage::SendFailed {
+                                    conversation_id,
+                                    prompt,
+                                });
+                                let _ = ui_tx.send(UiMessage::Error(format!("Send error: {e}")));
+                            }
+                        }
+                    });
+                } else {
+                    // The connection dropped between the send gate (in the send
+                    // closure) and here — a queued `Disconnected` was applied
+                    // first. The core already echoed the message into the model,
+                    // but leave the live composer intact (don't clear, don't draw)
+                    // so the text isn't lost, and surface why.
+                    tracing::warn!("Effect::SendPrompt with no connector — message not sent");
+                    let _ = ui_tx.send(UiMessage::Error(
+                        "Not connected — message not sent (your text is preserved)".to_string(),
+                    ));
+                }
             }
         }
     }
@@ -1692,6 +1700,15 @@ fn handle_ui_message(
     if let Some(id) = switch_target {
         let draft = state.borrow().composer_draft(&id).to_string();
         input_bar.set_text(&draft);
+    }
+
+    // Composer refill on a failed send (#12; see `failed_prompt` above): put the
+    // un-sent text back into the live editor so a transport error doesn't lose
+    // it. The chat widget still shows the now-model-less optimistic bubble until
+    // the next reload — a pre-existing GTK widget/model reconcile gap (ChatView
+    // has no remove-last), not introduced here.
+    if let Some(prompt) = failed_prompt {
+        input_bar.set_text(&prompt);
     }
 
     // Adopt the connector the connect task handed off (#106), now that any
