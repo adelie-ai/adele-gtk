@@ -1377,6 +1377,31 @@ fn handle_ui_message(
     // own effects ran, since `ClientReady` followed `Connected` on the channel).
     let connector_arrived = matches!(&msg, UiMessage::Connected { .. });
 
+    // Composer draft (#2): a switch to a *different* conversation must save the
+    // outgoing conversation's unsent text and restore the incoming one. Detect
+    // it here — before `apply` repoints `current_conversation_id` — and snapshot
+    // the outgoing draft into the model now (the text view stays the live editor;
+    // the model owns the saved draft). A same-conversation reload
+    // (`ConversationReloaded`, or re-selecting the open conversation) is NOT a
+    // switch, so it leaves the in-progress draft untouched. The matching restore
+    // runs after the effects below, once the new transcript is loaded.
+    let switch_target = if let UiMessage::ConversationLoaded(detail) = &msg {
+        let mut s = state.borrow_mut();
+        match s.current_conversation_id.clone() {
+            // Leaving another conversation: save its draft, then restore ours.
+            Some(outgoing) if outgoing != detail.id => {
+                s.set_composer_draft(&outgoing, input_bar.peek_text());
+                Some(detail.id.clone())
+            }
+            // First load (nothing open yet): nothing to save, still restore ours.
+            None => Some(detail.id.clone()),
+            // Re-selecting the already-open conversation: not a switch.
+            Some(_) => None,
+        }
+    } else {
+        None
+    };
+
     // Pure decision: mutate state + compute the effects to perform.
     let effects = state.borrow_mut().apply(msg);
 
@@ -1656,6 +1681,17 @@ fn handle_ui_message(
                 );
             }
         }
+    }
+
+    // Composer draft (#2): now that the switched-to conversation's transcript is
+    // loaded, restore its saved draft into the live editor (empty if none). Done
+    // here — not in the `LoadConversationIntoChat` effect — because that effect
+    // also fires on a same-conversation reload (reconnect / debug refresh), which
+    // must not overwrite the user's in-progress text. `switch_target` is `Some`
+    // only on a real switch.
+    if let Some(id) = switch_target {
+        let draft = state.borrow().composer_draft(&id).to_string();
+        input_bar.set_text(&draft);
     }
 
     // Adopt the connector the connect task handed off (#106), now that any
