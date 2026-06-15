@@ -428,20 +428,16 @@ pub async fn connect_to_profile(
 ) -> anyhow::Result<desktop_assistant_client_common::ConnectionConfig> {
     use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
 
-    // Local socket: skip auth discovery entirely. The UDS handshake's bearer
-    // token is minted by the local `adelie-mint` minter (#101/#316) — NOT the
-    // deprecated D-Bus `generate_ws_jwt` path, which the cutover (#319) removed —
-    // so point `minter_socket` at it and let `connect_transport` dial
-    // `$XDG_RUNTIME_DIR/adelie/sock` (or the explicit path). The minter is only
-    // wired for UDS: it issues tokens the *local* daemon trusts, whereas the WS
-    // paths below authenticate to a (remote) server via OAuth/password.
+    // Local socket: skip auth discovery entirely. The UDS connection is
+    // authenticated by kernel peer-cred (desktop-assistant#407) — no token is
+    // minted — and `connect_transport` dials `$XDG_RUNTIME_DIR/adelie/sock` (or
+    // the explicit path). The WS paths below still authenticate to a (remote)
+    // server via OAuth/password.
     let (ws_url, ws_subject) = match &profile.protocol {
         ProtocolConfig::Local { path } => {
             return Ok(ConnectionConfig {
                 transport_mode: TransportMode::Uds,
                 socket_path: path.clone(),
-                minter_socket: desktop_assistant_client_common::minter::default_minter_socket_path(
-                ),
                 ..Default::default()
             });
         }
