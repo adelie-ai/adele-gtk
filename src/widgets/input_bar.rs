@@ -399,20 +399,10 @@ impl InputBar {
         self.state.get()
     }
 
-    /// Get the current text content and clear the input.
-    pub fn take_text(&self) -> String {
-        let buffer = self.text_view.buffer();
-        let text = buffer
-            .text(&buffer.start_iter(), &buffer.end_iter(), false)
-            .to_string();
-        buffer.set_text("");
-        text
-    }
-
     /// Get the current text content *without* clearing it — a read-only snapshot
     /// of the composer (issue #2). Used to save the outgoing conversation's
-    /// unsent draft on a switch, where the box is then restored from the incoming
-    /// conversation's draft rather than consumed (cf. [`take_text`](Self::take_text)).
+    /// unsent draft on a switch, and to read the prompt on send (the live editor
+    /// is cleared separately, only once the core accepts the send).
     pub fn peek_text(&self) -> String {
         let buffer = self.text_view.buffer();
         buffer
