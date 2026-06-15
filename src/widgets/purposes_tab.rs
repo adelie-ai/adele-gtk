@@ -27,6 +27,7 @@ fn purpose_label(p: api::PurposeKindApi) -> &'static str {
     match p {
         api::PurposeKindApi::Interactive => "Interactive",
         api::PurposeKindApi::Dreaming => "Dreaming",
+        api::PurposeKindApi::Consolidation => "Consolidation",
         api::PurposeKindApi::Embedding => "Embedding",
         api::PurposeKindApi::Titling => "Titling",
     }
@@ -373,6 +374,7 @@ fn apply_purpose_config(
     let cfg = match purpose {
         api::PurposeKindApi::Interactive => purposes.interactive.as_ref(),
         api::PurposeKindApi::Dreaming => purposes.dreaming.as_ref(),
+        api::PurposeKindApi::Consolidation => purposes.consolidation.as_ref(),
         api::PurposeKindApi::Embedding => purposes.embedding.as_ref(),
         api::PurposeKindApi::Titling => purposes.titling.as_ref(),
     };
