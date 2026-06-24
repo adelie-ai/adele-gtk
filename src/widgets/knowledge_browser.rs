@@ -14,12 +14,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use desktop_assistant_api_model as api;
-use desktop_assistant_client_common::{AssistantClient, Connector};
+use desktop_assistant_client_common::{AssistantClient, Connector, SignalEvent};
 use gtk4::prelude::*;
 use gtk4::{
     Align, ApplicationWindow, Box as GtkBox, Button, Entry, HeaderBar, Label, ListBox, ListBoxRow,
-    Orientation, Paned, ScrolledWindow, SearchEntry, SelectionMode, TextView, Window, WrapMode,
-    glib,
+    MenuButton, Orientation, Paned, Popover, ScrolledWindow, SearchEntry, SelectionMode, TextView,
+    Window, WrapMode, glib,
 };
 use tokio::sync::mpsc;
 
@@ -36,6 +36,9 @@ enum BrowserMsg {
     EntriesLoaded(Vec<api::KnowledgeEntryView>),
     EntrySaved(api::KnowledgeEntryView),
     EntryDeleted { id: String },
+    /// A transient list-status notice (e.g. "Extraction started.") that isn't an
+    /// error and doesn't carry entries.
+    Notice(String),
     Error(String),
 }
 
@@ -85,6 +88,30 @@ impl KnowledgeBrowser {
         let refresh_button = Button::from_icon_name("view-refresh-symbolic");
         refresh_button.set_tooltip_text(Some("Refresh"));
         header.pack_start(&refresh_button);
+
+        // "Maintenance" menu — on-demand "dream cycle" controls. Grouped under a
+        // popover so the header stays uncluttered. Extraction/Consolidation run
+        // the knowledge passes; "Recalculate Embeddings" force-rebuilds every
+        // vector and is gated behind a confirmation (it re-embeds the whole KB).
+        let maint_button = MenuButton::new();
+        maint_button.set_label("Maintenance");
+        maint_button.set_tooltip_text(Some("Run a knowledge-maintenance pass"));
+        let maint_popover = Popover::new();
+        let maint_box = GtkBox::new(Orientation::Vertical, 4);
+        maint_box.set_margin_start(8);
+        maint_box.set_margin_end(8);
+        maint_box.set_margin_top(8);
+        maint_box.set_margin_bottom(8);
+        let extraction_button = Button::with_label("Run Extraction");
+        let consolidation_button = Button::with_label("Run Consolidation");
+        let recalc_button = Button::with_label("Recalculate Embeddings");
+        recalc_button.add_css_class("destructive-action");
+        maint_box.append(&extraction_button);
+        maint_box.append(&consolidation_button);
+        maint_box.append(&recalc_button);
+        maint_popover.set_child(Some(&maint_box));
+        maint_button.set_popover(Some(&maint_popover));
+        header.pack_end(&maint_button);
 
         // Two-pane layout: left = list + search; right = editor.
         let paned = Paned::new(Orientation::Horizontal);
@@ -330,6 +357,9 @@ impl KnowledgeBrowser {
                             editor_status.set_text("Deleted.");
                             refresh();
                         }
+                        BrowserMsg::Notice(text) => {
+                            list_status.set_text(&text);
+                        }
                         BrowserMsg::Error(e) => {
                             editor_status.set_text(&format!("Error: {e}"));
                             list_status.set_text(&format!("Error: {e}"));
@@ -342,11 +372,157 @@ impl KnowledgeBrowser {
         // Initial load.
         refresh();
 
+        // Live refresh: reload whenever the daemon broadcasts a knowledge change
+        // — a maintenance pass writing entries as it runs, or an edit from another
+        // client. The popup owns its own signal subscription (scoped here, like
+        // the rest of its wiring) so no global `UiMessage` plumbing is needed; the
+        // receiver — and thus the loop — drops when the window closes.
+        let mut knowledge_signal_rx = transport.subscribe();
+        glib::spawn_future_local(glib::clone!(
+            #[strong]
+            refresh,
+            async move {
+                while let Some(event) = knowledge_signal_rx.recv().await {
+                    if matches!(event, SignalEvent::KnowledgeChanged) {
+                        refresh();
+                    }
+                }
+            }
+        ));
+
         // Refresh button.
         refresh_button.connect_clicked(glib::clone!(
             #[strong]
             refresh,
             move |_| refresh()
+        ));
+
+        // Maintenance menu: each action spawns the pass and confirms via the
+        // list status; the live-refresh subscription above repaints the list as
+        // entries land. "Recalculate Embeddings" confirms first (full rebuild).
+        extraction_button.connect_clicked(glib::clone!(
+            #[strong]
+            transport,
+            #[strong]
+            bridge,
+            #[strong]
+            msg_tx,
+            #[weak]
+            maint_popover,
+            #[weak]
+            list_status,
+            move |_| {
+                maint_popover.popdown();
+                list_status.set_text("Extraction started…");
+                spawn_maintenance(
+                    &transport,
+                    &bridge,
+                    &msg_tx,
+                    api::MaintenanceOp::Extraction,
+                    "Extraction",
+                );
+            }
+        ));
+        consolidation_button.connect_clicked(glib::clone!(
+            #[strong]
+            transport,
+            #[strong]
+            bridge,
+            #[strong]
+            msg_tx,
+            #[weak]
+            maint_popover,
+            #[weak]
+            list_status,
+            move |_| {
+                maint_popover.popdown();
+                list_status.set_text("Consolidation started…");
+                spawn_maintenance(
+                    &transport,
+                    &bridge,
+                    &msg_tx,
+                    api::MaintenanceOp::Consolidation,
+                    "Consolidation",
+                );
+            }
+        ));
+        recalc_button.connect_clicked(glib::clone!(
+            #[strong]
+            transport,
+            #[strong]
+            bridge,
+            #[strong]
+            msg_tx,
+            #[weak]
+            maint_popover,
+            #[weak]
+            list_status,
+            #[weak(rename_to = parent_window)]
+            window,
+            move |_| {
+                maint_popover.popdown();
+                // Re-embedding the whole KB is expensive — confirm first, reusing
+                // the same tiny-modal pattern as the delete confirmation.
+                let confirm = Window::builder()
+                    .title("Recalculate embeddings?")
+                    .transient_for(&parent_window)
+                    .modal(true)
+                    .resizable(false)
+                    .default_width(380)
+                    .build();
+                let layout = GtkBox::new(Orientation::Vertical, 12);
+                layout.set_margin_start(16);
+                layout.set_margin_end(16);
+                layout.set_margin_top(16);
+                layout.set_margin_bottom(16);
+                let prompt = Label::new(Some(
+                    "Re-embed every knowledge entry from scratch? This can take a \
+                     while on a large knowledge base.",
+                ));
+                prompt.set_wrap(true);
+                prompt.set_xalign(0.0);
+                layout.append(&prompt);
+                let buttons = GtkBox::new(Orientation::Horizontal, 8);
+                buttons.set_halign(Align::End);
+                let cancel = Button::with_label("Cancel");
+                let confirm_btn = Button::with_label("Recalculate");
+                confirm_btn.add_css_class("destructive-action");
+                buttons.append(&cancel);
+                buttons.append(&confirm_btn);
+                layout.append(&buttons);
+                confirm.set_child(Some(&layout));
+
+                cancel.connect_clicked(glib::clone!(
+                    #[weak]
+                    confirm,
+                    move |_| confirm.close()
+                ));
+                confirm_btn.connect_clicked(glib::clone!(
+                    #[strong]
+                    transport,
+                    #[strong]
+                    bridge,
+                    #[strong]
+                    msg_tx,
+                    #[weak]
+                    list_status,
+                    #[weak(rename_to = confirm_window)]
+                    confirm,
+                    move |_| {
+                        confirm_window.close();
+                        list_status.set_text("Recalculating embeddings…");
+                        spawn_maintenance(
+                            &transport,
+                            &bridge,
+                            &msg_tx,
+                            api::MaintenanceOp::RecalculateEmbeddings,
+                            "Embedding recompute",
+                        );
+                    }
+                ));
+
+                confirm.present();
+            }
         ));
 
         // Search entry: debounce keystrokes, then re-run the query.
@@ -630,6 +806,36 @@ impl KnowledgeBrowser {
 }
 
 // --- Local helpers ---------------------------------------------------------
+
+/// Spawn an on-demand knowledge-maintenance pass (the "dream cycle" controls)
+/// and report the trigger outcome back through the browser's message pump. The
+/// pass runs as a tracked background task on the daemon; the list repaints live
+/// via the `KnowledgeChanged` subscription as entries land, so we only surface a
+/// "started" notice (or the error) here.
+fn spawn_maintenance(
+    transport: &Arc<Connector>,
+    bridge: &AsyncBridge,
+    msg_tx: &mpsc::UnboundedSender<BrowserMsg>,
+    op: api::MaintenanceOp,
+    label: &'static str,
+) {
+    let transport = Arc::clone(transport);
+    let msg_tx = msg_tx.clone();
+    bridge.spawn(async move {
+        // `start_knowledge_maintenance` lives on the transport-agnostic
+        // `AssistantCommands` channel (not the high-level `AssistantClient`
+        // facade), reached via `as_commands()` — `Some` for every transport.
+        let client = transport.client();
+        let msg = match client.as_commands() {
+            Some(cmds) => match cmds.start_knowledge_maintenance(op).await {
+                Ok(_task_id) => BrowserMsg::Notice(format!("{label} started.")),
+                Err(e) => BrowserMsg::Error(e.to_string()),
+            },
+            None => BrowserMsg::Error("transport has no command channel".to_string()),
+        };
+        let _ = msg_tx.send(msg);
+    });
+}
 
 fn populate_list(list_box: &ListBox, entries: &[api::KnowledgeEntryView]) {
     while let Some(child) = list_box.first_child() {
