@@ -84,6 +84,7 @@ fn kind_label_for(kind: &api::TaskKind) -> &'static str {
         api::TaskKind::Conversation { .. } => "Chat",
         api::TaskKind::Subagent { .. } => "Subagent",
         api::TaskKind::Standalone { .. } => "Agent",
+        api::TaskKind::Maintenance { .. } => "Maintenance",
     }
 }
 
@@ -96,6 +97,8 @@ fn conversation_id_for(kind: &api::TaskKind) -> Option<String> {
         | api::TaskKind::Standalone {
             conversation_id, ..
         } => Some(conversation_id.clone()),
+        // Maintenance passes are not tied to a conversation.
+        api::TaskKind::Maintenance { .. } => None,
     }
 }
 
