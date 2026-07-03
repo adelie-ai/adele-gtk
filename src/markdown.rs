@@ -1,6 +1,7 @@
 use std::sync::OnceLock;
 
 use base64::Engine as _;
+use desktop_assistant_client_common::MessageKind;
 use pulldown_cmark::{Options, Parser, html};
 use sha2::{Digest, Sha256};
 
@@ -65,25 +66,27 @@ fn avatar_img(url: &str, alt: &str) -> String {
 
 /// Render a full set of chat messages into an HTML document body.
 pub fn render_messages_html(
-    messages: &[(String, String)],
+    messages: &[(String, String, MessageKind)],
     streaming_buffer: Option<&str>,
     avatars: &AvatarUrls,
 ) -> String {
     let mut html = String::new();
 
-    for (role, content) in messages {
+    for (role, content, kind) in messages {
         let (class, label, avatar_html) = match role.as_str() {
             "user" => (
                 "message user-message",
-                "You",
+                "You".to_string(),
                 avatar_img(&avatars.user, "You"),
             ),
             "assistant" => (
                 "message assistant-message",
-                "Adele",
+                // Badge a Spoken / SpeechDisabled say_this line from the explicit
+                // metadata (voice#126) — never by parsing the content.
+                format!("Adele{}", crate::widgets::chat_view::kind_marker(*kind)),
                 avatar_img(&avatars.adele, "Adele"),
             ),
-            _ => ("message", "", String::new()),
+            _ => ("message", String::new(), String::new()),
         };
 
         let content_html = markdown_to_html(content);
@@ -468,8 +471,12 @@ mod tests {
     #[test]
     fn render_messages_produces_html() {
         let messages = vec![
-            ("user".to_string(), "Hello".to_string()),
-            ("assistant".to_string(), "Hi there!".to_string()),
+            ("user".to_string(), "Hello".to_string(), MessageKind::Normal),
+            (
+                "assistant".to_string(),
+                "Hi there!".to_string(),
+                MessageKind::Normal,
+            ),
         ];
         let html = render_messages_html(&messages, None, &test_avatars());
         assert!(html.contains("user-message"));
@@ -490,8 +497,12 @@ mod tests {
     #[test]
     fn render_messages_includes_avatar_images() {
         let messages = vec![
-            ("user".to_string(), "Hi".to_string()),
-            ("assistant".to_string(), "Hello".to_string()),
+            ("user".to_string(), "Hi".to_string(), MessageKind::Normal),
+            (
+                "assistant".to_string(),
+                "Hello".to_string(),
+                MessageKind::Normal,
+            ),
         ];
         let html = render_messages_html(&messages, None, &test_avatars());
         assert!(html.contains(r#"src="file:///tmp/user.png""#));
@@ -504,7 +515,7 @@ mod tests {
             adele: "file:///tmp/adele.png".to_string(),
             user: String::new(),
         };
-        let messages = vec![("user".to_string(), "Hi".to_string())];
+        let messages = vec![("user".to_string(), "Hi".to_string(), MessageKind::Normal)];
         let html = render_messages_html(&messages, None, &avatars);
         assert!(html.contains("avatar-fallback"));
         assert!(html.contains(">Y</div>")); // "Y" from "You"
@@ -734,7 +745,11 @@ mod tests {
         };
         // Role labels in render_messages_html are ASCII ("You" / "Adele"),
         // so to trigger the original bug we exercise avatar_img directly above.
-        let messages = vec![("assistant".to_string(), "hi".to_string())];
+        let messages = vec![(
+            "assistant".to_string(),
+            "hi".to_string(),
+            MessageKind::Normal,
+        )];
         let _ = render_messages_html(&messages, None, &avatars);
     }
 
@@ -749,7 +764,11 @@ mod tests {
                        <iframe src=\"javascript:alert(1)\"></iframe>\n\n\
                        <a href=\"javascript:alert(1)\" onclick=\"alert(2)\">click</a>\n\n\
                        Bye!";
-        let messages = vec![("assistant".to_string(), hostile.to_string())];
+        let messages = vec![(
+            "assistant".to_string(),
+            hostile.to_string(),
+            MessageKind::Normal,
+        )];
         let html = render_messages_html(&messages, None, &test_avatars());
 
         // Legitimate content survives.

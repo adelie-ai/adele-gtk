@@ -1,4 +1,4 @@
-use desktop_assistant_client_common::ConversationDetail;
+use desktop_assistant_client_common::{ConversationDetail, MessageKind};
 use gtk4::prelude::*;
 use gtk4::{Box as GtkBox, Orientation};
 
@@ -24,8 +24,10 @@ pub struct ChatView {
     text_view: TextView,
     #[cfg(not(feature = "linux"))]
     tags: MarkdownTags,
-    /// Messages stored for re-rendering.
-    messages: Vec<(String, String)>,
+    /// Messages stored for re-rendering: `(role, content, kind)`. `kind` carries
+    /// the explicit presentation metadata (voice#126) so a re-render can badge a
+    /// `Spoken` / `SpeechDisabled` `say_this` line without parsing its content.
+    messages: Vec<(String, String, MessageKind)>,
     /// Partial streaming reply, used only by the `TextView` fallback's
     /// `render()`. The `linux`/WebView path appends each chunk incrementally
     /// via JS (`webview::append_chunk`) and never re-renders mid-stream, so it
@@ -35,6 +37,19 @@ pub struct ChatView {
     streaming_buffer: String,
     #[cfg(feature = "linux")]
     avatars: markdown::AvatarUrls,
+}
+
+/// The explicit-metadata marker suffixed onto Adele's role label for a
+/// client-local `say_this` line (voice#126): ` · Spoken` for a voiced aside,
+/// ` · speech off` for the shown-not-spoken downgrade, empty for an ordinary
+/// message. Shared by both render paths (WebView label + TextView header) so
+/// they stay identical.
+pub(crate) fn kind_marker(kind: MessageKind) -> &'static str {
+    match kind {
+        MessageKind::Normal => "",
+        MessageKind::Spoken => " · Spoken",
+        MessageKind::SpeechDisabled => " · speech off",
+    }
 }
 
 impl ChatView {
@@ -105,7 +120,7 @@ impl ChatView {
         self.messages = detail
             .messages
             .iter()
-            .map(|m| (m.role.clone(), m.content.clone()))
+            .map(|m| (m.role.clone(), m.content.clone(), m.kind))
             .collect();
         #[cfg(not(feature = "linux"))]
         self.streaming_buffer.clear();
@@ -126,8 +141,11 @@ impl ChatView {
 
     /// Finalize streaming: add the full response as an assistant message.
     pub fn complete_streaming(&mut self, full_response: &str) {
-        self.messages
-            .push(("assistant".to_string(), full_response.to_string()));
+        self.messages.push((
+            "assistant".to_string(),
+            full_response.to_string(),
+            MessageKind::Normal,
+        ));
         #[cfg(not(feature = "linux"))]
         self.streaming_buffer.clear();
         self.render();
@@ -152,18 +170,17 @@ impl ChatView {
     /// Add a user message to the display.
     pub fn add_user_message(&mut self, content: &str) {
         self.messages
-            .push(("user".to_string(), content.to_string()));
+            .push(("user".to_string(), content.to_string(), MessageKind::Normal));
         self.render();
     }
 
-    /// Render an inline note in the transcript (issue #76). Used for the
-    /// `(speech mode disabled) …` downgrade when a `say_this` aside arrives with
-    /// speech off: the text is shown rather than dropped. Rendered with the
-    /// `assistant` role so it sits in the reply column; the caller pre-formats
-    /// the `(speech mode disabled)` prefix.
-    pub fn add_inline_note(&mut self, content: &str) {
+    /// Append a client-local `say_this` line (issue #76, voice#126). Rendered in
+    /// the `assistant` column, badged from `kind` at render time (`Spoken` for a
+    /// voiced aside, `SpeechDisabled` for the "shown, not spoken" downgrade) —
+    /// the marker is presentation, never baked into `content`.
+    pub fn add_local_message(&mut self, content: &str, kind: MessageKind) {
         self.messages
-            .push(("assistant".to_string(), content.to_string()));
+            .push(("assistant".to_string(), content.to_string(), kind));
         self.render();
     }
 
@@ -201,14 +218,14 @@ impl ChatView {
                 return;
             }
 
-            for (role, content) in &self.messages {
+            for (role, content, kind) in &self.messages {
                 let label = match role.as_str() {
-                    "user" => "You",
-                    "assistant" => "Adele",
-                    _ => "",
+                    "user" => "You".to_string(),
+                    "assistant" => format!("Adele{}", kind_marker(*kind)),
+                    _ => String::new(),
                 };
                 if !label.is_empty() {
-                    self.tags.insert_role(&buffer, label);
+                    self.tags.insert_role(&buffer, &label);
                 }
                 crate::markdown_text::render(&buffer, &self.tags, content);
             }
