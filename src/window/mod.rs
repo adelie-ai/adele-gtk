@@ -1577,8 +1577,8 @@ fn handle_ui_message(
                     speak_text(voice, embedded, ui_tx, text).await;
                 });
             }
-            Effect::AddInlineNote(note) => {
-                chat_view.borrow_mut().add_inline_note(&note);
+            Effect::AddLocalMessage { content, kind } => {
+                chat_view.borrow_mut().add_local_message(&content, kind);
             }
             Effect::SetAdeleOutputDropdown(level) => {
                 // The model drove the output level (request_voice → OnDemand /
