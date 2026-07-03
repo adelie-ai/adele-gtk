@@ -27,14 +27,15 @@ toml = "1"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive", "env"] }
-# Enable the `v4_10` API level. gtk4 0.11.4 moved core types like `Accessible`
-# behind version cfgs, and webkit6 references `gtk::Accessible` unconditionally,
-# so a version feature MUST be enabled or the build breaks under gtk4 >= 0.11.4.
-# `v4_10` is the floor that re-exports `Accessible` without also activating
-# deprecation-as-error for the GTK 4.12/4.20 APIs `theme.rs` still uses
-# (CssProvider::load_from_data, Settings prefer-dark-theme). Raising this to a
-# higher level (v4_22) needs those call sites migrated first — a separate task.
-gtk4 = { version = "0.11", features = ["v4_10"], package = "gtk4" }
+# Enable the `v4_22` API level (matching our GTK 4.22 runtime). gtk4 0.11.4 moved
+# core types like `Accessible` behind version cfgs, and webkit6 references
+# `gtk::Accessible` unconditionally, so a version feature MUST be enabled or the
+# build breaks under gtk4 >= 0.11.4. `v4_22` gives the widest API surface and is
+# robust against future patch releases gating more symbols behind higher version
+# cfgs. It also turns deprecation markers (<= 4.22) into hard errors under
+# `-D warnings`; `theme.rs` was migrated off the deprecated `CssProvider` and
+# GtkSettings prefer-dark-theme APIs (issue #116) to keep the build clean.
+gtk4 = { version = "0.11", features = ["v4_22"], package = "gtk4" }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 ammonia = "4"
 sha2 = "0.10"

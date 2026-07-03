@@ -20,42 +20,42 @@
 //! The app's own CSS only styles widgets that carry an app style class; every
 //! other GTK-drawn control (list-box surfaces, `MenuButton`s, `CheckButton`s,
 //! the task list, the task panel's plain buttons, the sidebar stack-switcher,
-//! …) falls back to the ambient GTK theme. Most third-party system themes do
-//! **not** honour `gtk-application-prefer-dark-theme`, so those controls would
-//! stay in whatever palette the system theme paints (typically dark) regardless
-//! of the desktop's light/dark preference. To make the whole window follow the
-//! preference, [`install_for_display`] pins the base GTK theme to GTK4's
-//! built-in **Adwaita** (`gtk-theme-name = "Adwaita"`), which is the one theme
-//! guaranteed to switch between its light and dark variants from
-//! `gtk-application-prefer-dark-theme`. Accepted trade-off: in dark mode those
-//! unstyled GTK controls render as Adwaita-dark rather than the system theme;
-//! the app's custom accent palette (below) is unaffected either way.
+//! …) falls back to the ambient GTK theme. To make those controls follow the
+//! desktop's light/dark preference, [`install_for_display`] pins the base GTK
+//! theme to GTK4's built-in **Adwaita** (`gtk-theme-name = "Adwaita"`). GTK
+//! 4.20+ switches Adwaita between its light and dark variants automatically from
+//! the `org.freedesktop.appearance color-scheme` portal setting; most
+//! third-party system themes do **not**, which is why we pin Adwaita. Accepted
+//! trade-off: in dark mode those unstyled GTK controls render as Adwaita-dark
+//! rather than the system theme; the app's custom accent palette (below) is
+//! unaffected either way.
 //!
 //! ## Live preference tracking
 //!
-//! We treat `gtk-application-prefer-dark-theme` as the source of truth and
-//! re-apply the provider choice whenever it changes. GTK4 reads that property
-//! from the `org.freedesktop.appearance color-scheme` portal setting only
-//! **once at startup**, though — it does not follow later changes — so on its
-//! own the app would only pick up a new desktop color scheme after a restart.
+//! The system color scheme is the single source of truth, read live from the
+//! XDG **Settings portal** (`org.freedesktop.portal.Settings`, namespace
+//! `org.freedesktop.appearance`, key `color-scheme`: 0 = no preference,
+//! 1 = prefer dark, 2 = prefer light). We read it at startup and listen for the
+//! `SettingChanged` signal, then drive the light-provider swap directly from
+//! each change on the GTK main thread.
 //!
-//! To switch live, we subscribe to the XDG **Settings portal**
-//! (`org.freedesktop.portal.Settings`, namespace `org.freedesktop.appearance`,
-//! key `color-scheme`: 0 = no preference, 1 = prefer dark, 2 = prefer light),
-//! read it at startup and listen for the `SettingChanged` signal, then push
-//! each change into `gtk-application-prefer-dark-theme` on the GTK main thread.
-//! Writing that property drives the existing provider swap **and** WebKit's
-//! `prefers-color-scheme`. If the portal is unavailable (no portal, read
-//! fails, etc.) we log and fall back to the startup-only behaviour above.
+//! We deliberately do **not** route this through GTK's
+//! `gtk-application-prefer-dark-theme` setting: it was deprecated in GTK 4.20
+//! (GTK now follows the portal itself) and only ever reflected the portal value
+//! once at startup anyway. Ambient Adwaita controls and the chat WebView both
+//! follow the same portal `color-scheme` on their own under GTK 4.20+ / modern
+//! WebKitGTK, so all we need to own is the swap between our two custom
+//! providers. If the portal is unavailable (no portal, read fails, etc.) we log
+//! and leave the dark base in place.
 //!
 //! The chat WebView renders its own palette via a `prefers-color-scheme` media
-//! query (see `markdown::html_template`), which WebKitGTK drives from the same
-//! GTK dark preference.
+//! query (see `markdown::html_template`), which WebKitGTK resolves from the
+//! system color scheme.
 
 use std::cell::Cell;
 use std::rc::Rc;
 
-use gtk4::{CssProvider, Settings, gdk, glib};
+use gtk4::{CssProvider, gdk, glib};
 use tokio::sync::mpsc;
 
 use crate::async_bridge::spawn_on_runtime;
@@ -102,6 +102,11 @@ fn color_scheme_prefers_dark(value: u32) -> bool {
     value == 1
 }
 
+/// A per-display provider-swap closure: given "prefer dark?", it adds or removes
+/// the light-override `CssProvider` for its display. Boxed behind `Rc` so the
+/// [`APPLIERS`] registry and the portal listener can share one handle.
+type Applier = Rc<dyn Fn(bool)>;
+
 thread_local! {
     /// Displays this process has already installed the theme on. GTK is
     /// single-threaded and effectively single-display, but tracking the actual
@@ -113,14 +118,14 @@ thread_local! {
 /// Install the app's theme handling for `display`.
 ///
 /// Installs the dark base palette unconditionally and the light overrides only
-/// while the GTK light preference is active, then keeps the choice in sync
-/// with `gtk-application-prefer-dark-theme`.
+/// while the system `color-scheme` is not dark, then keeps the choice in sync
+/// via the portal listener (see [`install_color_scheme_listener`]).
 ///
 /// **Idempotent per display (GTK-6):** the first call for a given display
-/// installs the providers and connects the preference-notify handler; later
+/// installs the providers and registers its swap closure in [`APPLIERS`]; later
 /// calls (e.g. from a second window) return immediately. Without this guard
-/// every window stacked a fresh pair of `CssProvider`s and another
-/// never-disconnected `Settings` notify handler on the shared display.
+/// every window stacked a fresh pair of `CssProvider`s and another applier on
+/// the shared display.
 pub fn install_for_display(display: &gdk::Display) {
     let already = THEMED_DISPLAYS.with(|seen| {
         let mut seen = seen.borrow_mut();
@@ -136,10 +141,10 @@ pub fn install_for_display(display: &gdk::Display) {
     }
 
     let base_provider = CssProvider::new();
-    base_provider.load_from_data(STYLE_CSS);
+    base_provider.load_from_string(STYLE_CSS);
 
     let light_provider = CssProvider::new();
-    light_provider.load_from_data(STYLE_LIGHT_CSS);
+    light_provider.load_from_string(STYLE_LIGHT_CSS);
 
     // The dark base palette is always present.
     gtk4::style_context_add_provider_for_display(
@@ -148,25 +153,23 @@ pub fn install_for_display(display: &gdk::Display) {
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    let settings = gtk4::Settings::for_display(display);
-
-    // Pin the base GTK theme to the built-in Adwaita, which honours
-    // `gtk-application-prefer-dark-theme` by switching between its light and
-    // dark variants. This makes every GTK-drawn control that has no app style
+    // Pin the base GTK theme to the built-in Adwaita, which GTK 4.20+ switches
+    // between its light and dark variants automatically from the portal
+    // `color-scheme`. This makes every GTK-drawn control that has no app style
     // class follow the desktop's light/dark preference instead of staying in
     // the system theme's (typically non-switching) palette. Idempotent across
     // windows: setting the property repeatedly to the same value is harmless.
-    settings.set_gtk_theme_name(Some("Adwaita"));
+    gtk4::Settings::for_display(display).set_gtk_theme_name(Some("Adwaita"));
 
-    let light_applied = Rc::new(Cell::new(false));
-
-    let apply = {
+    // Own the swap between the two custom providers. `want_dark` is supplied by
+    // the portal `color-scheme` (see `install_color_scheme_listener`); while it
+    // is dark the light overrides are removed so the original dark base shows
+    // through unchanged.
+    let light_applied = Cell::new(false);
+    let apply: Applier = Rc::new({
         let display = display.clone();
         let light_provider = light_provider.clone();
-        let settings = settings.clone();
-        let light_applied = Rc::clone(&light_applied);
-        move || {
-            let want_dark = settings.is_gtk_application_prefer_dark_theme();
+        move |want_dark: bool| {
             if !want_dark && !light_applied.get() {
                 gtk4::style_context_add_provider_for_display(
                     &display,
@@ -180,52 +183,66 @@ pub fn install_for_display(display: &gdk::Display) {
                 light_applied.set(false);
             }
         }
-    };
+    });
 
-    apply();
+    // Sync this display to the scheme seen so far (dark until the portal reports
+    // otherwise), then register it so every later portal change re-applies here.
+    apply(CURRENT_DARK.with(|current| current.get()));
+    APPLIERS.with(|appliers| appliers.borrow_mut().push(Rc::clone(&apply)));
 
-    settings.connect_gtk_application_prefer_dark_theme_notify(glib::clone!(
-        #[strong]
-        apply,
-        move |_| apply()
-    ));
-
-    // Track the system color scheme live. `install_for_display` runs once per
-    // window, but the GTK preference is process-global and the notify above
-    // re-applies for every display, so a single portal listener is enough.
-    install_color_scheme_listener(settings);
+    // Start the process-global, idempotent portal listener that feeds every
+    // registered applier. A single subscription keeps all displays in sync.
+    install_color_scheme_listener();
 }
 
 thread_local! {
     /// Whether the portal listener has already been spawned this process.
     static PORTAL_LISTENER_STARTED: Cell<bool> = const { Cell::new(false) };
+
+    /// Latest system preference seen from the portal ("prefer dark?"). Defaults
+    /// to dark so a display registered before the portal's first read shows the
+    /// unchanged dark base; each newly registered display syncs to this value.
+    static CURRENT_DARK: Cell<bool> = const { Cell::new(true) };
+
+    /// One provider-swap closure per themed display. The single portal listener
+    /// calls all of them whenever `color-scheme` changes, so every display stays
+    /// in sync from one subscription. GTK is effectively single-display, but a
+    /// second one is handled correctly if it ever appears.
+    static APPLIERS: std::cell::RefCell<Vec<Applier>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Subscribe to the XDG Settings portal and mirror `color-scheme` changes into
-/// `gtk-application-prefer-dark-theme` on the GTK main thread.
+/// Subscribe to the XDG Settings portal and drive the registered per-display
+/// provider swaps ([`APPLIERS`]) from `color-scheme` changes on the GTK main
+/// thread.
 ///
 /// The zbus connection and signal stream live on the shared Tokio runtime
 /// (where zbus has a reactor); only plain `bool` "prefer dark" values cross
-/// back to the main thread, where the non-`Send` [`Settings`] is mutated.
+/// back to the main thread, where the non-`Send` GTK providers are swapped.
 ///
 /// Idempotent: only the first call per process spawns the listener. If the
-/// portal is unavailable or a read fails, it logs and returns, leaving the
-/// startup-derived GTK preference in place.
-fn install_color_scheme_listener(settings: Settings) {
+/// portal is unavailable or a read fails, it logs and returns, leaving the dark
+/// base in place.
+fn install_color_scheme_listener() {
     if PORTAL_LISTENER_STARTED.with(|started| started.replace(true)) {
         return;
     }
 
-    // Plain `bool`s ride this channel; `Settings` never leaves the main thread.
+    // Plain `bool`s ride this channel; the GTK providers never leave the main
+    // thread.
     let (tx, mut rx) = mpsc::unbounded_channel::<bool>();
 
-    // Apply updates on the GTK main thread. Skip no-op writes so we don't
-    // churn the provider swap when the portal re-announces the current value.
+    // Apply updates on the GTK main thread. Skip no-op changes so we don't churn
+    // the provider swap when the portal re-announces the current value.
     glib::spawn_future_local(async move {
         while let Some(want_dark) = rx.recv().await {
-            if settings.is_gtk_application_prefer_dark_theme() != want_dark {
+            if CURRENT_DARK.with(|current| current.replace(want_dark)) != want_dark {
                 tracing::debug!(want_dark, "applying live color-scheme change");
-                settings.set_gtk_application_prefer_dark_theme(want_dark);
+                // Clone out the Rc handles so no borrow is held across the calls.
+                let appliers = APPLIERS.with(|appliers| appliers.borrow().clone());
+                for apply in &appliers {
+                    apply(want_dark);
+                }
             }
         }
     });
@@ -236,7 +253,7 @@ fn install_color_scheme_listener(settings: Settings) {
             tracing::warn!(
                 %error,
                 "XDG Settings portal unavailable; color scheme will not switch live \
-                 (startup preference kept)"
+                 (dark base kept)"
             );
         }
     });

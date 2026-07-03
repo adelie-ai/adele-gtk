@@ -349,8 +349,9 @@ body {{
     50% {{ opacity: 1; }}
 }}
 
-/* Light theme. WebKitGTK drives `prefers-color-scheme` from the GTK dark
-   preference, so this block applies whenever the app is not in dark mode. The
+/* Light theme. WebKitGTK resolves `prefers-color-scheme` from the system color
+   scheme (the `org.freedesktop.appearance color-scheme` portal), so this block
+   applies whenever the desktop is not in dark mode. The
    dark palette above remains the default; these rules override only the
    colour-bearing properties so chat content stays legible and on-brand in
    light mode. Mirrors the GTK light palette in `style-light.css`:
