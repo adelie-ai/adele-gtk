@@ -3,9 +3,11 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 use desktop_assistant_api_model as api;
-#[cfg(test)]
-use desktop_assistant_client_common::SignalEvent;
-use desktop_assistant_client_common::{AssistantClient, ConnectionConfig, Connector};
+use desktop_assistant_client_common::mcp_host::{
+    ClientMcpConfig, McpHost, default_client_mcp_path, dispatch_client_tool_call,
+    merge_registrations,
+};
+use desktop_assistant_client_common::{AssistantClient, ConnectionConfig, Connector, SignalEvent};
 use gtk4::glib;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
@@ -19,7 +21,9 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 /// narration gate; re-exported here so existing `crate::async_bridge::AdeleOutput`
 /// paths keep resolving unchanged.
 pub use adele_voice_client_common::AdeleOutput;
-pub use client_ui_common::{UiMessage, interactive_default_from_purposes, signal_to_ui_message};
+pub use client_ui_common::{
+    UiMessage, interactive_default_from_purposes, signal_to_ui_message, voice_mode_client_tools,
+};
 
 fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
@@ -99,6 +103,12 @@ where
 /// shutdown handle). Exiting drops this task's `Arc<Connector>` clone and
 /// `ui_tx` clone, which is what lets the daemon session end and the bridge
 /// channel close (issue: GTK-1).
+///
+/// Owns the client-side MCP host for the whole session (desktop-assistant#464):
+/// it is started once, *before* the connect loop, so its local MCP server
+/// processes survive reconnects (their tools are re-advertised on every
+/// (re)connect inside [`drive_connection`]); and it is shut down when the manager
+/// exits — i.e. when the window closes — so no orphaned server processes linger.
 pub async fn connection_manager(
     config: ConnectionConfig,
     ui_tx: mpsc::UnboundedSender<UiMessage>,
@@ -106,7 +116,49 @@ pub async fn connection_manager(
     // (#106): `drive_connection` stores it here just before `Connected`. The core
     // can't carry the handle (wasm), so this gtk-local cell is the seam.
     pending_connector: Arc<Mutex<Option<Arc<Connector>>>>,
+    shutdown: watch::Receiver<bool>,
+) {
+    // Start the client-side MCP host for the `gtk` surface once (mirroring the
+    // TUI, adele-tui#113): the servers named by `[surfaces.gtk]` in
+    // `~/.config/adele/client-mcp.toml` run on this machine and expose their
+    // tools to the daemon as client-side tools. `None` when nothing is configured
+    // (an absent/malformed config resolves to an empty selection).
+    let host = start_mcp_host().await;
+    connection_loop(config, ui_tx, pending_connector, shutdown, host.as_ref()).await;
+    // Session over (window closed): stop every hosted MCP server process. The
+    // servers also kill-on-drop, but shutting down explicitly is deterministic.
+    if let Some(host) = host {
+        host.shutdown().await;
+    }
+}
+
+/// Start the client-side MCP host for the `gtk` surface, or `None` when no
+/// servers are configured for it. A missing/malformed `client-mcp.toml` resolves
+/// to an empty selection (logged), so this never fails the connection.
+async fn start_mcp_host() -> Option<McpHost> {
+    let servers: Vec<_> = ClientMcpConfig::load(&default_client_mcp_path())
+        .resolved_servers("gtk")
+        .into_iter()
+        .cloned()
+        .collect();
+    if servers.is_empty() {
+        None
+    } else {
+        Some(McpHost::start(&servers).await)
+    }
+}
+
+/// The connect → forward → reconnect loop. Split out of [`connection_manager`]
+/// so the MCP host it owns can be shut down at the single exit point *after* this
+/// returns (the loop has several early `return`s on the shutdown/teardown paths).
+/// `host` is borrowed for the per-(re)connect client-tool registration and the
+/// incoming-`ClientToolCall` dispatch inside [`drive_connection`].
+async fn connection_loop(
+    config: ConnectionConfig,
+    ui_tx: mpsc::UnboundedSender<UiMessage>,
+    pending_connector: Arc<Mutex<Option<Arc<Connector>>>>,
     mut shutdown: watch::Receiver<bool>,
+    host: Option<&McpHost>,
 ) {
     const INITIAL_BACKOFF_SECS: u64 = 2;
     const MAX_BACKOFF_SECS: u64 = 30;
@@ -129,7 +181,7 @@ pub async fn connection_manager(
                 // future (connector, signal stream) is dropped here, which
                 // closes the transport and ends the daemon session.
                 let flow = tokio::select! {
-                    flow = drive_connection(connector, &ui_tx, &pending_connector) => flow,
+                    flow = drive_connection(connector, &ui_tx, &pending_connector, host) => flow,
                     _ = shutdown_requested(&mut shutdown) => return,
                 };
                 if flow.is_break() {
@@ -190,6 +242,7 @@ async fn drive_connection(
     connector: Connector,
     ui_tx: &mpsc::UnboundedSender<UiMessage>,
     pending_connector: &Arc<Mutex<Option<Arc<Connector>>>>,
+    host: Option<&McpHost>,
 ) -> std::ops::ControlFlow<()> {
     use std::ops::ControlFlow::{Break, Continue};
 
@@ -214,6 +267,24 @@ async fn drive_connection(
     let label = connector.label().to_string();
     if ui_tx.send(UiMessage::Connected { label }).is_err() {
         return Break(());
+    }
+
+    // Advertise gtk's client tools as the single set the daemon expects: its
+    // built-in voice-mode tools (issue #78) MERGED with any client-hosted MCP
+    // host tools (desktop-assistant#464). The daemon replaces the whole set per
+    // call, so hosted tools must be registered together with the built-ins;
+    // `merge_registrations` lets a built-in win a name clash. Runs on every
+    // (re)connect (the daemon scopes client tools per session, #261/#231), and is
+    // best-effort: socket-only (UDS/WS), a logged no-op on D-Bus, and a failure
+    // never blocks the chat. (Registration was moved here from the GTK thread's
+    // `connector_arrived` branch so the merge with the host's tools happens once,
+    // where the host lives — mirroring the TUI's `finish_connection_init`.)
+    let host_tools = host.map(McpHost::registrations).unwrap_or_default();
+    if let Err(e) = connector
+        .register_client_tools(merge_registrations(voice_mode_client_tools(), host_tools))
+        .await
+    {
+        tracing::debug!("client tool registration skipped: {e}");
     }
 
     // Refresh conversation list on connect
@@ -312,6 +383,35 @@ async fn drive_connection(
     // this receiver when the underlying stream ends, so the normal
     // path already delivers a `UiMessage::Disconnected` here.
     while let Some(signal) = signal_rx.recv().await {
+        // Client-hosted MCP tools take precedence over the core's built-in
+        // client-tool dispatch (desktop-assistant#464): if the local host serves
+        // this tool it runs it and submits the result itself, so the call must
+        // NOT also be forwarded to the core (that would double-dispatch and
+        // double-submit). A `ClientToolCall` for a tool the host does NOT serve
+        // (say_this / the voice-mode tools) falls through to the core exactly as
+        // before, as does every non-tool signal.
+        if let (
+            Some(host),
+            SignalEvent::ClientToolCall {
+                task_id,
+                tool_call_id,
+                tool_name,
+                arguments,
+                ..
+            },
+        ) = (host, &signal)
+            && dispatch_client_tool_call(
+                host,
+                connector.as_ref(),
+                task_id,
+                tool_call_id,
+                tool_name,
+                arguments.clone(),
+            )
+            .await
+        {
+            continue;
+        }
         if ui_tx.send(signal_to_ui_message(signal)).is_err() {
             return Break(());
         }
@@ -332,6 +432,45 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// desktop-assistant#464: gtk advertises its built-in voice-mode client
+    /// tools MERGED with any client-hosted MCP host tools — it must never replace
+    /// one set with the other (the daemon takes the whole set per call, so the
+    /// hosted tools have to be registered together with the built-ins). Mirrors
+    /// the `mcp_host::bridge` merge tests, but with gtk's real built-ins, guarding
+    /// the wiring in `drive_connection`.
+    #[test]
+    fn client_tool_registration_merges_builtins_with_hosted_tools() {
+        use desktop_assistant_client_common::mcp_host::merge_registrations;
+
+        let builtins = voice_mode_client_tools();
+        assert!(
+            !builtins.is_empty(),
+            "gtk must advertise its own voice-mode client tools"
+        );
+        let hosted = vec![api::ClientToolRegistration {
+            name: "fs__read_file".to_string(),
+            description: "read a file".to_string(),
+            input_schema: serde_json::json!({ "type": "object" }),
+        }];
+
+        let merged = merge_registrations(builtins.clone(), hosted);
+
+        // Every built-in survives the merge …
+        for tool in &builtins {
+            assert!(
+                merged.iter().any(|t| t.name == tool.name),
+                "built-in '{}' must remain advertised after merging host tools",
+                tool.name
+            );
+        }
+        // … and the hosted tool is advertised alongside them.
+        assert!(
+            merged.iter().any(|t| t.name == "fs__read_file"),
+            "hosted MCP tool must be advertised"
+        );
+        assert_eq!(merged.len(), builtins.len() + 1);
+    }
 
     /// GTK-1 acceptance: the bridge's receive loop must NOT keep its own
     /// channel alive. Once the `AsyncBridge` (and every sender clone) is
