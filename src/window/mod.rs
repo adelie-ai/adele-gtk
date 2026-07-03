@@ -24,7 +24,7 @@ use crate::widgets::tasks_panel::TasksPanel;
 
 mod voice;
 
-use client_ui_common::{Effect, WindowState, voice_mode_client_tools};
+use client_ui_common::{Effect, WindowState};
 use voice::{speak_text, wire_embedded_mic, wire_voice_controls};
 
 /// The window's widget handles, bundled so the bridge's UI-message executor
@@ -1715,19 +1715,14 @@ fn handle_ui_message(
     // `Connected` effects (status, send-enable) have been applied. Lifted from
     // the old `Effect::SetClient` arm; the only change is the source — the
     // `pending_connector` cell instead of a reducer effect.
+    //
+    // Client-tool registration (gtk's built-in voice-mode tools, issue #78,
+    // merged with any client-hosted MCP host tools, desktop-assistant#464) is
+    // done once per (re)connect on the async side — in `connection_manager`'s
+    // `drive_connection`, where the MCP host lives — so the merge happens in one
+    // place. The Connector still replays the registered set after an internal
+    // auto-reconnect (#246), so a daemon restart won't drop it.
     if connector_arrived && let Some(connector) = pending_connector.lock().unwrap().take() {
-        // Advertise gtk's session-scoped voice-mode client tools (issue #78);
-        // socket-only (UDS/WS), a logged no-op on D-Bus. The Connector replays
-        // them after an auto-reconnect (#246), so a daemon restart won't drop them.
-        let registration_connector = Arc::clone(&connector);
-        crate::async_bridge::spawn_on_runtime(async move {
-            if let Err(e) = registration_connector
-                .register_client_tools(voice_mode_client_tools())
-                .await
-            {
-                tracing::debug!("voice-mode client tools not registered: {e}");
-            }
-        });
         *client.borrow_mut() = Some(connector);
     }
 }

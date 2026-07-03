@@ -35,7 +35,9 @@ const SEARCH_DEBOUNCE_MS: u32 = 250;
 enum BrowserMsg {
     EntriesLoaded(Vec<api::KnowledgeEntryView>),
     EntrySaved(api::KnowledgeEntryView),
-    EntryDeleted { id: String },
+    EntryDeleted {
+        id: String,
+    },
     /// A transient list-status notice (e.g. "Extraction started.") that isn't an
     /// error and doesn't carry entries.
     Notice(String),

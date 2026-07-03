@@ -45,8 +45,13 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 version = "0.6"
 optional = true
 
+# `mcp-host` enables the client-side MCP host (desktop-assistant#464): gtk runs
+# local MCP servers on the edge and advertises their tools to the (possibly
+# remote) daemon as client-side tools. Post-#475 this pulls the MCP client
+# WITHOUT its HTTP/reqwest transport (the host only spawns stdio servers).
 [dependencies.desktop-assistant-client-common]
 path = "../desktop-assistant/crates/client-common"
+features = ["mcp-host"]
 
 [dependencies.desktop-assistant-api-model]
 path = "../desktop-assistant/crates/api-model"
