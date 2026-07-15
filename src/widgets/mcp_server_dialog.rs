@@ -144,6 +144,20 @@ pub fn bearer_secret_ref(name: &str) -> String {
     format!("{name}_token")
 }
 
+/// `true` when a freshly-typed create name collides with an already-configured
+/// server. `UpsertMcpServer` is add-or-replace, so creating a server whose name
+/// already exists would silently overwrite that server's config *and* clobber
+/// its `{name}_token` secret - a footgun the create path uses this to refuse
+/// (the user should edit the existing server instead). `name` is trimmed to
+/// match the save-time normalization; the comparison is case-sensitive because
+/// a server name is an exact config-table key (a case-variant is a distinct
+/// server the upsert would not overwrite). Edit is unaffected: it targets its
+/// own already-stored name, which is expected to be present.
+pub fn is_duplicate_new_name(name: &str, existing: &[String]) -> bool {
+    let name = name.trim();
+    existing.iter().any(|e| e == name)
+}
+
 /// Validate a server name on create: non-empty and only letters, digits, `-`,
 /// `_` (mirrors [`super::connection_config_dialog`]'s slug contract - the name
 /// is a config table key and a tool-namespace prefix).
@@ -423,13 +437,17 @@ fn labelled_entry(
 
 /// Show the transport-aware MCP add/edit dialog. `initial` is a blank form
 /// (create) or an [`McpForm::from_view`] (edit); `service_accounts` populates
-/// the OAuth account picker. `on_save` receives the validated [`BuiltMcpServer`]
-/// when the user clicks Save; the dialog closes itself on success and keeps
-/// itself open (showing the error) on a validation failure.
+/// the OAuth account picker. `existing_names` is the currently-configured
+/// server names: on the create path a typed name that collides with one is
+/// refused inline (see [`is_duplicate_new_name`]) rather than silently
+/// overwriting it; it is ignored when editing. `on_save` receives the validated
+/// [`BuiltMcpServer`] when the user clicks Save; the dialog closes itself on
+/// success and keeps itself open (showing the error) on a validation failure.
 pub fn show_mcp_server_dialog<FSave>(
     parent: &impl IsA<Window>,
     initial: McpForm,
     service_accounts: Vec<ServiceAccountView>,
+    existing_names: Vec<String>,
     on_save: FSave,
 ) where
     FSave: Fn(BuiltMcpServer) + 'static,
@@ -737,6 +755,16 @@ pub fn show_mcp_server_dialog<FSave>(
             };
             match form.build() {
                 Ok(built) => {
+                    // Create-path uniqueness guard: refuse a new name that already
+                    // exists rather than issuing an add-or-replace upsert that
+                    // would silently overwrite the server and clobber its secret.
+                    if !built.editing && is_duplicate_new_name(&built.name, &existing_names) {
+                        error_label.set_text(&format!(
+                            "A server named \"{}\" already exists - edit it instead.",
+                            built.name
+                        ));
+                        return;
+                    }
                     on_save(built);
                     dialog.close();
                 }

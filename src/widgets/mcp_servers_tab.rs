@@ -161,6 +161,17 @@ impl McpServersTab {
             .cloned()
     }
 
+    /// The names of the currently-loaded servers. The create flow checks a
+    /// typed name against these to refuse a silent overwrite (see
+    /// [`super::mcp_server_dialog::is_duplicate_new_name`]).
+    pub fn server_names(&self) -> Vec<String> {
+        self.servers
+            .borrow()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
     /// Replace the list contents.
     pub fn set_servers(&self, servers: &[api::McpServerView]) {
         while let Some(child) = self.list_box.first_child() {

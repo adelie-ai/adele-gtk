@@ -544,10 +544,15 @@ pub fn show_settings_dialog(
         refresh_mcp,
         #[strong]
         service_accounts,
+        #[strong(rename_to = mcp_tab_add)]
+        mcp_tab,
         #[weak]
         dialog,
         move || {
             let accounts = service_accounts.borrow().clone();
+            // The create-path uniqueness guard checks the typed name against the
+            // currently-loaded servers so an add can't silently overwrite one.
+            let existing_names = mcp_tab_add.server_names();
             let transport = Arc::clone(&transport);
             let bridge = Rc::clone(&bridge);
             let refresh = Rc::clone(&refresh_mcp);
@@ -555,6 +560,7 @@ pub fn show_settings_dialog(
                 &dialog,
                 McpForm::blank(McpTransport::Stdio),
                 accounts,
+                existing_names,
                 move |built| {
                     do_upsert_mcp(
                         Arc::clone(&transport),
@@ -590,14 +596,22 @@ pub fn show_settings_dialog(
             let transport = Arc::clone(&transport);
             let bridge = Rc::clone(&bridge);
             let refresh = Rc::clone(&refresh_mcp);
-            show_mcp_server_dialog(&dialog, McpForm::from_view(&view), accounts, move |built| {
-                do_upsert_mcp(
-                    Arc::clone(&transport),
-                    Rc::clone(&bridge),
-                    Rc::clone(&refresh),
-                    built,
-                );
-            });
+            // Edit targets an existing name by design; the dup-name guard is
+            // create-only, so no existing-names list is needed here.
+            show_mcp_server_dialog(
+                &dialog,
+                McpForm::from_view(&view),
+                accounts,
+                Vec::new(),
+                move |built| {
+                    do_upsert_mcp(
+                        Arc::clone(&transport),
+                        Rc::clone(&bridge),
+                        Rc::clone(&refresh),
+                        built,
+                    );
+                },
+            );
         }
     ));
 
