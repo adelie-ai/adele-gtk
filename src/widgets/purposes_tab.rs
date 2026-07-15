@@ -30,6 +30,7 @@ fn purpose_label(p: api::PurposeKindApi) -> &'static str {
         api::PurposeKindApi::Consolidation => "Consolidation",
         api::PurposeKindApi::Embedding => "Embedding",
         api::PurposeKindApi::Titling => "Titling",
+        api::PurposeKindApi::Voice => "Voice",
     }
 }
 
@@ -377,6 +378,7 @@ fn apply_purpose_config(
         api::PurposeKindApi::Consolidation => purposes.consolidation.as_ref(),
         api::PurposeKindApi::Embedding => purposes.embedding.as_ref(),
         api::PurposeKindApi::Titling => purposes.titling.as_ref(),
+        api::PurposeKindApi::Voice => purposes.voice.as_ref(),
     };
     let Some(cfg) = cfg else {
         return;

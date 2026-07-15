@@ -102,7 +102,7 @@ pub async fn get_purposes(transport: &TransportClient) -> Result<api::PurposesVi
         .send_command(api::Command::GetPurposes)
         .await?;
     match result {
-        api::CommandResult::Purposes(p) => Ok(p),
+        api::CommandResult::Purposes(p) => Ok(*p),
         other => Err(anyhow!("unexpected response for GetPurposes: {other:?}")),
     }
 }
