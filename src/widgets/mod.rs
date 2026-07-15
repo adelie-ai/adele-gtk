@@ -6,6 +6,8 @@ pub mod conversation_side_pane;
 pub mod input_bar;
 pub mod knowledge_browser;
 pub mod login_screen;
+pub mod mcp_server_dialog;
+pub mod mcp_servers_tab;
 pub mod model_picker;
 pub mod personality_dialog;
 pub mod purposes_tab;
