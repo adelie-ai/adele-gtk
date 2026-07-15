@@ -17,6 +17,7 @@
 //! tab sees *all* models — including embedding models, which the header
 //! `ModelPicker` filters out.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -32,6 +33,8 @@ use crate::voice_client::VoiceController;
 
 use super::connection_config_dialog::{ConnectorType, show_configure_dialog};
 use super::connections_tab::ConnectionsTab;
+use super::mcp_server_dialog::{BuiltMcpServer, McpForm, McpTransport, show_mcp_server_dialog};
+use super::mcp_servers_tab::McpServersTab;
 use super::purposes_tab::PurposesTab;
 use super::voice_tab::VoiceTab;
 
@@ -131,13 +134,20 @@ pub fn show_settings_dialog(
 
     let connections_tab = Rc::new(ConnectionsTab::new());
     let purposes_tab = Rc::new(PurposesTab::new());
+    let mcp_tab = Rc::new(McpServersTab::new());
     let voice_tab = Rc::new(VoiceTab::new());
+
+    // Snapshot of the OAuth service accounts (epic #477), refreshed alongside
+    // the MCP server list and handed to the editor's account picker.
+    let service_accounts: Rc<RefCell<Vec<api::ServiceAccountView>>> =
+        Rc::new(RefCell::new(Vec::new()));
 
     notebook.append_page(
         &connections_tab.container,
         Some(&Label::new(Some("Connections"))),
     );
     notebook.append_page(&purposes_tab.container, Some(&Label::new(Some("Purposes"))));
+    notebook.append_page(&mcp_tab.container, Some(&Label::new(Some("MCP Servers"))));
     notebook.append_page(&voice_tab.container, Some(&Label::new(Some("Voice"))));
 
     vbox.append(&notebook);
@@ -513,10 +523,339 @@ pub fn show_settings_dialog(
     // ---------------------------------------------------------------
     wire_voice_tab(&voice_tab, &voice, &bridge);
 
+    // ---------------------------------------------------------------
+    // MCP-servers tab wiring (issue #495).
+    // ---------------------------------------------------------------
+    let refresh_mcp = mcp_refresh_closure(
+        Arc::clone(&transport),
+        Rc::clone(&bridge),
+        Rc::clone(&mcp_tab),
+        Rc::clone(&service_accounts),
+        Rc::clone(&status_label),
+    );
+
+    // Add: open a blank editor; save writes any bearer token then upserts.
+    mcp_tab.connect_add(glib::clone!(
+        #[strong]
+        transport,
+        #[strong]
+        bridge,
+        #[strong]
+        refresh_mcp,
+        #[strong]
+        service_accounts,
+        #[weak]
+        dialog,
+        move || {
+            let accounts = service_accounts.borrow().clone();
+            let transport = Arc::clone(&transport);
+            let bridge = Rc::clone(&bridge);
+            let refresh = Rc::clone(&refresh_mcp);
+            show_mcp_server_dialog(
+                &dialog,
+                McpForm::blank(McpTransport::Stdio),
+                accounts,
+                move |built| {
+                    do_upsert_mcp(
+                        Arc::clone(&transport),
+                        Rc::clone(&bridge),
+                        Rc::clone(&refresh),
+                        built,
+                    );
+                },
+            );
+        }
+    ));
+
+    // Edit: look up the loaded view, pre-fill the editor (write-only fields
+    // stay blank), save through the same upsert path.
+    mcp_tab.connect_edit(glib::clone!(
+        #[strong]
+        transport,
+        #[strong]
+        bridge,
+        #[strong]
+        refresh_mcp,
+        #[strong]
+        service_accounts,
+        #[strong(rename_to = mcp_tab_edit)]
+        mcp_tab,
+        #[weak]
+        dialog,
+        move |name| {
+            let Some(view) = mcp_tab_edit.find(&name) else {
+                return;
+            };
+            let accounts = service_accounts.borrow().clone();
+            let transport = Arc::clone(&transport);
+            let bridge = Rc::clone(&bridge);
+            let refresh = Rc::clone(&refresh_mcp);
+            show_mcp_server_dialog(&dialog, McpForm::from_view(&view), accounts, move |built| {
+                do_upsert_mcp(
+                    Arc::clone(&transport),
+                    Rc::clone(&bridge),
+                    Rc::clone(&refresh),
+                    built,
+                );
+            });
+        }
+    ));
+
+    // Enable/disable toggle.
+    mcp_tab.connect_toggle(glib::clone!(
+        #[strong]
+        transport,
+        #[strong]
+        bridge,
+        #[strong]
+        refresh_mcp,
+        move |name, enabled| {
+            do_toggle_mcp(
+                Arc::clone(&transport),
+                Rc::clone(&bridge),
+                Rc::clone(&refresh_mcp),
+                name,
+                enabled,
+            );
+        }
+    ));
+
+    // Remove (with confirmation).
+    mcp_tab.connect_remove(glib::clone!(
+        #[strong]
+        transport,
+        #[strong]
+        bridge,
+        #[strong]
+        refresh_mcp,
+        #[weak]
+        dialog,
+        move |name| {
+            let transport = Arc::clone(&transport);
+            let bridge = Rc::clone(&bridge);
+            let refresh = Rc::clone(&refresh_mcp);
+            let name_for_confirm = name.clone();
+            confirm(
+                &dialog,
+                &format!("Remove MCP server \"{name}\"?"),
+                "Its tools will no longer be available to the assistant.",
+                "Remove",
+                true,
+                move || {
+                    do_remove_mcp(
+                        Arc::clone(&transport),
+                        Rc::clone(&bridge),
+                        Rc::clone(&refresh),
+                        name_for_confirm.clone(),
+                    );
+                },
+            );
+        }
+    ));
+
+    // Sign in / configure - spawn the daemon's configure command on this host
+    // (the GTK client runs on the daemon host, so it can drive the browser
+    // flow), then refresh when it completes.
+    mcp_tab.connect_signin(glib::clone!(
+        #[strong]
+        bridge,
+        #[strong]
+        refresh_mcp,
+        #[strong]
+        status_label,
+        move |argv| {
+            do_signin_mcp(
+                Rc::clone(&bridge),
+                Rc::clone(&refresh_mcp),
+                Rc::clone(&status_label),
+                argv,
+            );
+        }
+    ));
+
     // First refresh.
     refresh();
+    refresh_mcp();
 
     dialog.present();
+}
+
+/// Build the MCP-tab refresh closure: fetch the server list + the OAuth service
+/// accounts on the runtime and apply them on the GTK main thread. Called on
+/// present and after every MCP mutation.
+fn mcp_refresh_closure(
+    transport: Arc<Connector>,
+    bridge: Rc<AsyncBridge>,
+    mcp_tab: Rc<McpServersTab>,
+    service_accounts: Rc<RefCell<Vec<api::ServiceAccountView>>>,
+    status_label: Rc<Label>,
+) -> Rc<dyn Fn()> {
+    Rc::new(move || {
+        let transport = Arc::clone(&transport);
+        let mcp_tab = Rc::clone(&mcp_tab);
+        let service_accounts = Rc::clone(&service_accounts);
+        let status_label = Rc::clone(&status_label);
+        #[allow(clippy::type_complexity)]
+        let (tx, mut rx) = mpsc::unbounded_channel::<(
+            Result<Vec<api::McpServerView>, String>,
+            Result<Vec<api::ServiceAccountView>, String>,
+        )>();
+        bridge.spawn(async move {
+            let client = transport.client();
+            let servers = management_client::list_mcp_servers(client)
+                .await
+                .map_err(|e| e.to_string());
+            let accounts = management_client::list_service_accounts(client)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send((servers, accounts));
+        });
+        glib::spawn_future_local(async move {
+            if let Some((servers, accounts)) = rx.recv().await {
+                match accounts {
+                    Ok(list) => *service_accounts.borrow_mut() = list,
+                    Err(e) => status_label.set_text(&format!("List service accounts: {e}")),
+                }
+                match servers {
+                    Ok(list) => mcp_tab.set_servers(&list),
+                    Err(e) => status_label.set_text(&format!("List MCP servers: {e}")),
+                }
+            }
+        });
+    })
+}
+
+/// Write any bearer secret (before the upsert), then upsert the server config,
+/// then refresh. A blank bearer field carries no secret and leaves any stored
+/// token untouched.
+fn do_upsert_mcp(
+    transport: Arc<Connector>,
+    bridge: Rc<AsyncBridge>,
+    refresh: Rc<dyn Fn()>,
+    built: BuiltMcpServer,
+) {
+    let ui_tx = bridge.ui_sender();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), String>>();
+    bridge.spawn(async move {
+        let client = transport.client();
+        // Secret first: the daemon reloads its secrets so the upsert that
+        // references the ref resolves it.
+        if let Some((id, value)) = built.secret
+            && let Err(e) = management_client::set_mcp_secret(client, id, api::Secret(value)).await
+        {
+            let _ = tx.send(Err(format!("store token: {e}")));
+            return;
+        }
+        let r = management_client::upsert_mcp_server(client, built.config_json)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(r);
+    });
+    glib::spawn_future_local(async move {
+        if let Some(r) = rx.recv().await {
+            match r {
+                Ok(()) => refresh(),
+                Err(e) => {
+                    let _ = ui_tx.send(UiMessage::Error(format!("Save MCP server: {e}")));
+                }
+            }
+        }
+    });
+}
+
+/// Enable/disable an MCP server, then refresh.
+fn do_toggle_mcp(
+    transport: Arc<Connector>,
+    bridge: Rc<AsyncBridge>,
+    refresh: Rc<dyn Fn()>,
+    name: String,
+    enabled: bool,
+) {
+    let ui_tx = bridge.ui_sender();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), String>>();
+    bridge.spawn(async move {
+        let r = management_client::set_mcp_server_enabled(transport.client(), name, enabled)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(r);
+    });
+    glib::spawn_future_local(async move {
+        if let Some(r) = rx.recv().await {
+            match r {
+                Ok(()) => refresh(),
+                Err(e) => {
+                    let _ = ui_tx.send(UiMessage::Error(format!("Toggle MCP server: {e}")));
+                }
+            }
+        }
+    });
+}
+
+/// Remove an MCP server by name, then refresh.
+fn do_remove_mcp(
+    transport: Arc<Connector>,
+    bridge: Rc<AsyncBridge>,
+    refresh: Rc<dyn Fn()>,
+    name: String,
+) {
+    let ui_tx = bridge.ui_sender();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), String>>();
+    bridge.spawn(async move {
+        let r = management_client::remove_mcp_server(transport.client(), name)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(r);
+    });
+    glib::spawn_future_local(async move {
+        if let Some(r) = rx.recv().await {
+            match r {
+                Ok(()) => refresh(),
+                Err(e) => {
+                    let _ = ui_tx.send(UiMessage::Error(format!("Remove MCP server: {e}")));
+                }
+            }
+        }
+    });
+}
+
+/// Spawn the daemon-provided configure/sign-in command (an argv like
+/// `[daemon_exe, "--mcp-oauth-login", id]`) on this host and refresh when it
+/// finishes. The argv is executed directly (no shell), so there is no shell
+/// interpretation of its parts. Empty argv is a no-op.
+fn do_signin_mcp(
+    bridge: Rc<AsyncBridge>,
+    refresh: Rc<dyn Fn()>,
+    status_label: Rc<Label>,
+    argv: Vec<String>,
+) {
+    if argv.is_empty() {
+        return;
+    }
+    status_label.set_text(
+        "Launched sign-in - finish in the browser; the list refreshes when it completes.",
+    );
+    let ui_tx = bridge.ui_sender();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), String>>();
+    bridge.spawn(async move {
+        let mut cmd = tokio::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        let r = match cmd.status().await {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(format!("sign-in exited with {status}")),
+            Err(e) => Err(format!("failed to launch sign-in: {e}")),
+        };
+        let _ = tx.send(r);
+    });
+    glib::spawn_future_local(async move {
+        if let Some(r) = rx.recv().await {
+            match r {
+                Ok(()) => refresh(),
+                Err(e) => {
+                    let _ = ui_tx.send(UiMessage::Error(format!("MCP sign-in: {e}")));
+                }
+            }
+        }
+    });
 }
 
 /// Snapshot of the voice daemon's state used to hydrate the Voice tab in one

@@ -134,6 +134,85 @@ pub async fn set_conversation_personality(
         .await
 }
 
+// --- MCP server management (issue #495) -------------------------------------
+//
+// Thin wrappers over the typed `Command`/`CommandResult` surface the daemon
+// already exposes (no protocol change). The transport-aware add/edit rides
+// `UpsertMcpServer { config_json }`; bearer tokens go via `SetMcpSecret`
+// *before* the upsert that references them. All reuse the same command channel
+// as the connection/purpose wrappers above.
+
+/// List the daemon's configured MCP servers with their honest per-server state.
+pub async fn list_mcp_servers(transport: &TransportClient) -> Result<Vec<api::McpServerView>> {
+    let result = commands(transport)?
+        .send_command(api::Command::ListMcpServers)
+        .await?;
+    match result {
+        api::CommandResult::McpServers(list) => Ok(list),
+        other => Err(anyhow!("unexpected response for ListMcpServers: {other:?}")),
+    }
+}
+
+/// List reusable outbound OAuth service accounts (epic #477) for the OAuth
+/// account picker. Only refs/state travel — never secret values.
+pub async fn list_service_accounts(
+    transport: &TransportClient,
+) -> Result<Vec<api::ServiceAccountView>> {
+    let result = commands(transport)?
+        .send_command(api::Command::ListServiceAccounts)
+        .await?;
+    match result {
+        api::CommandResult::ServiceAccounts(list) => Ok(list),
+        other => Err(anyhow!(
+            "unexpected response for ListServiceAccounts: {other:?}"
+        )),
+    }
+}
+
+/// Enable or disable an MCP server by name.
+pub async fn set_mcp_server_enabled(
+    transport: &TransportClient,
+    name: String,
+    enabled: bool,
+) -> Result<()> {
+    let result = commands(transport)?
+        .send_command(api::Command::SetMcpServerEnabled { name, enabled })
+        .await?;
+    expect_ack("SetMcpServerEnabled", result)
+}
+
+/// Remove an MCP server by name.
+pub async fn remove_mcp_server(transport: &TransportClient, name: String) -> Result<()> {
+    let result = commands(transport)?
+        .send_command(api::Command::RemoveMcpServer { name })
+        .await?;
+    expect_ack("RemoveMcpServer", result)
+}
+
+/// Add or replace an MCP server from a full JSON `McpServerConfig` descriptor
+/// (transport-aware: stdio, or http with bearer/oauth). Only secret *refs*
+/// travel in the JSON; write a bearer *value* via [`set_mcp_secret`] first.
+pub async fn upsert_mcp_server(transport: &TransportClient, config_json: String) -> Result<()> {
+    let result = commands(transport)?
+        .send_command(api::Command::UpsertMcpServer { config_json })
+        .await?;
+    expect_ack("UpsertMcpServer", result)
+}
+
+/// Store one secret *value* (a bearer token) under `id` in the daemon's
+/// secrets. Call this *before* the [`upsert_mcp_server`] that references the
+/// ref. The value is [`api::Secret`]-wrapped so it can't leak via `Debug`.
+pub async fn set_mcp_secret(
+    transport: &TransportClient,
+    id: String,
+    value: api::Secret,
+) -> Result<()> {
+    let result = commands(transport)?
+        .send_command(api::Command::SetMcpSecret { id, value })
+        .await?;
+    expect_ack("SetMcpSecret", result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
