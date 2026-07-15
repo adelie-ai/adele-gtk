@@ -834,6 +834,43 @@ mod tests {
         assert_eq!(bearer_secret_ref("gmail"), "gmail_token");
     }
 
+    // --- is_duplicate_new_name (create-path uniqueness guard) -----------------
+
+    #[test]
+    fn is_duplicate_new_name_flags_an_existing_name() {
+        // Creating a server whose name already exists would silently overwrite
+        // it (UpsertMcpServer is add-or-replace) and clobber its token secret.
+        let existing = vec!["files".to_string(), "gmail".to_string()];
+        assert!(is_duplicate_new_name("gmail", &existing));
+    }
+
+    #[test]
+    fn is_duplicate_new_name_allows_a_fresh_name() {
+        let existing = vec!["files".to_string(), "gmail".to_string()];
+        assert!(!is_duplicate_new_name("github", &existing));
+    }
+
+    #[test]
+    fn is_duplicate_new_name_trims_before_comparing() {
+        // The name is trimmed on save, so a surrounding-whitespace variant still
+        // targets the same config-table key and must be caught.
+        let existing = vec!["files".to_string()];
+        assert!(is_duplicate_new_name("  files  ", &existing));
+    }
+
+    #[test]
+    fn is_duplicate_new_name_is_case_sensitive() {
+        // Server names are exact config-table keys, so "Files" and "files" are
+        // distinct - upsert wouldn't overwrite, so the guard must not block it.
+        let existing = vec!["files".to_string()];
+        assert!(!is_duplicate_new_name("Files", &existing));
+    }
+
+    #[test]
+    fn is_duplicate_new_name_empty_list_never_duplicates() {
+        assert!(!is_duplicate_new_name("files", &[]));
+    }
+
     // --- build: stdio ---------------------------------------------------------
 
     #[test]
