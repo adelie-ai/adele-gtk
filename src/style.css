@@ -308,3 +308,43 @@ entry:focus {
     color: #6b7a90;
     text-decoration: line-through;
 }
+
+/* MCP servers list (issue #495). The status dot mirrors `.task-dot`: an empty
+   label coloured by CSS. The dot colours read on both light and dark; the chip
+   and error text derive from the ambient text colour so they follow the theme. */
+.mcp-dot {
+    min-width: 10px;
+    min-height: 10px;
+    border-radius: 50%;
+}
+
+.mcp-dot-running {
+    background-color: #4caf6a; /* green */
+}
+
+.mcp-dot-warn {
+    background-color: #b8a838; /* amber */
+}
+
+.mcp-dot-error {
+    background-color: #d9534f; /* red */
+}
+
+.mcp-dot-neutral {
+    background-color: #6b7a90; /* neutral grey */
+}
+
+/* Transport chip: a small outlined pill (local vs remote). */
+.mcp-chip {
+    font-size: 11px;
+    padding: 0 6px;
+    border-radius: 6px;
+    border: 1px solid alpha(currentColor, 0.35);
+    opacity: 0.75;
+}
+
+/* Last-connect error / validation error text. */
+.mcp-error-label {
+    color: #d9534f;
+    font-size: 12px;
+}
