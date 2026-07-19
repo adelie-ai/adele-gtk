@@ -46,9 +46,9 @@ use gtk4::{
 pub fn status_display(status: &str) -> (&'static str, &'static str) {
     match status {
         "running" => ("mcp-dot-running", "Running"),
-        // Client-surface state: the definition is on and gtk hosts it. We have no
-        // live health for client servers yet (tool_count is a follow-up), so this
-        // is "configured on", shown green to distinguish it from disabled.
+        // Client-surface state: the definition is on and gtk hosts it. Shown green
+        // to distinguish it from disabled; the row also carries the host's live
+        // per-server tool count (adele-gtk#125).
         "enabled" => ("mcp-dot-running", "Enabled"),
         "stopped" => ("mcp-dot-neutral", "Stopped"),
         "disabled" => ("mcp-dot-neutral", "Disabled"),
@@ -383,9 +383,11 @@ fn build_row_widget(
     title_row.append(&chip);
     text_col.append(&title_row);
 
-    // Subtitle: status label (+ tool count when running) (+ daemon target).
+    // Subtitle: status label (+ tool count when the server is up) (+ daemon
+    // target). A daemon row reports a count while "running"; a client row while
+    // "enabled" (gtk hosts it), from the live host snapshot (adele-gtk#125).
     let mut subtitle = status_label.to_string();
-    if row.status == "running" && row.tool_count > 0 {
+    if (row.status == "running" || row.status == "enabled") && row.tool_count > 0 {
         let n = row.tool_count;
         subtitle.push_str(&format!(" · {n} tool{}", if n == 1 { "" } else { "s" }));
     }

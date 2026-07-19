@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -391,6 +392,14 @@ impl AdelieWindow {
         // carries the handle across the thread boundary now that the core can't.
         let pending_connector: Arc<Mutex<Option<Arc<Connector>>>> = Arc::new(Mutex::new(None));
 
+        // Live per-server client-tool counts by namespace (adele-gtk#125). The
+        // connection manager refreshes this from the running `McpHost` after the
+        // host starts and after each (re)registration; the Settings MCP panel
+        // reads a snapshot when it builds its client rows, so those rows show a
+        // real tool count instead of a hard-coded 0.
+        let client_tool_counts: Arc<Mutex<HashMap<String, u32>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
         // Handle to the standalone voice daemon (`org.desktopAssistant.Voice`),
         // declared here — *before* the bridge — so the `handle_ui_message`
         // executor can also reach it (issue #80): narration prefers the daemon's
@@ -521,6 +530,7 @@ impl AdelieWindow {
                 config.clone(),
                 ui_tx,
                 pending_connector.clone(),
+                client_tool_counts.clone(),
                 shutdown_rx,
             ));
         }
@@ -959,6 +969,8 @@ impl AdelieWindow {
             daemon_is_remote,
             #[strong]
             daemon_host,
+            #[strong]
+            client_tool_counts,
             move |_| {
                 menu_popover.popdown();
                 let Some(connector) = client.borrow().clone() else {
@@ -987,6 +999,7 @@ impl AdelieWindow {
                     voice_handle,
                     daemon_is_remote,
                     daemon_host.clone(),
+                    Arc::clone(&client_tool_counts),
                 );
                 // The user may have added/removed connections; re-query the
                 // aggregated model list so the header picker reflects the new

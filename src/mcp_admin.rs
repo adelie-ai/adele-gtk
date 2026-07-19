@@ -17,8 +17,13 @@
 //!   the config is written back atomically.
 //!
 //! The gtk surface exposes a client server iff its definition is `enabled` **and**
-//! the `[surfaces.gtk]` list names it; the panel drives both grains together so
-//! "enabled" in the UI means "gtk actually hosts this".
+//! the `[surfaces.gtk]` list names it, so "enabled" in the UI means "gtk actually
+//! hosts this". The disable toggle is deliberately **asymmetric**: enabling sets
+//! both grains, but disabling touches only the `[surfaces.gtk]` membership and
+//! leaves the shared definition enabled, so turning a server off in gtk never
+//! disables it for another surface sharing the same `client-mcp.toml`.
+
+use std::collections::HashMap;
 
 use client_ui_common::{ClientServerDto, Runner};
 use desktop_assistant_client_common::mcp_host::{ClientMcpConfig, McpServerConfig};
@@ -80,20 +85,27 @@ fn hosted_by_gtk(server: &McpServerConfig, gtk_enabled: &[String]) -> bool {
 ///
 /// Transport is taken honestly from the definition (`http` table present ⇒
 /// `"http"`, else `"stdio"`); status is the coarse `"enabled"`/`"disabled"` the
-/// gtk surface sees. `tool_count` is `0` for now — a live client tool count is a
-/// follow-up (the host would have to report per-server tool totals).
-pub fn client_server_dtos(cfg: &ClientMcpConfig) -> Vec<ClientServerDto> {
+/// gtk surface sees. `tool_count` is the live per-server total from the running
+/// [`McpHost`](desktop_assistant_client_common::mcp_host::McpHost), looked up in
+/// `counts` by the server's **namespace** (`namespace`, or the name when unset) —
+/// the same key the host reports against. It is `0` when the host has not
+/// reported yet (e.g. the panel is opened before a connection) or hosts no tools.
+pub fn client_server_dtos(
+    cfg: &ClientMcpConfig,
+    counts: &HashMap<String, u32>,
+) -> Vec<ClientServerDto> {
     let gtk_enabled = cfg.surface_enabled_names(GTK_SURFACE);
     cfg.list_defined_servers()
         .iter()
         .map(|s| {
             let transport = if s.http.is_some() { "http" } else { "stdio" };
             let on = hosted_by_gtk(s, gtk_enabled);
+            let namespace = s.namespace.clone().unwrap_or_else(|| s.name.clone());
             ClientServerDto {
                 name: s.name.clone(),
                 transport: transport.to_string(),
                 status: if on { "enabled" } else { "disabled" }.to_string(),
-                tool_count: 0,
+                tool_count: counts.get(&namespace).copied().unwrap_or(0),
             }
         })
         .collect()
@@ -129,12 +141,31 @@ pub fn apply_client_save(cfg: &mut ClientMcpConfig, mut server: McpServerConfig,
     cfg.set_surface_enabled(GTK_SURFACE, &name, enabled);
 }
 
-/// Enable/disable a client server for the gtk surface: flip both the definition
-/// flag and the surface membership so the two grains stay in lockstep. Errors if
-/// no definition by that name exists (surfaced to the status bar).
+/// Enable/disable a client server **for the gtk surface**, asymmetrically, so one
+/// surface's choice never disturbs another sharing the same `client-mcp.toml`:
+///
+/// - **On:** join the `[surfaces.gtk]` list **and** ensure the definition's own
+///   `enabled` flag is set, so enabling actually results in gtk hosting the
+///   server even if the shared definition had been globally disabled.
+/// - **Off:** drop it from `[surfaces.gtk]` **only**, leaving the definition
+///   enabled so every other surface that lists it keeps hosting it.
+///
+/// Errors (fail-closed) if no definition by that name exists, in either
+/// direction, rather than materializing a gtk surface entry for a phantom server
+/// (the error is surfaced to the status bar).
 pub fn apply_client_toggle(cfg: &mut ClientMcpConfig, name: &str, on: bool) -> Result<(), String> {
-    cfg.set_server_enabled(name, on)?;
-    cfg.set_surface_enabled(GTK_SURFACE, name, on);
+    if on {
+        cfg.set_server_enabled(name, true)?;
+        cfg.set_surface_enabled(GTK_SURFACE, name, true);
+    } else {
+        // Surface-scoped disable: `set_surface_enabled` never errors and would
+        // create a gtk entry for an unknown name, so validate existence first to
+        // preserve the fail-closed contract, then touch only the gtk membership.
+        if !cfg.list_defined_servers().iter().any(|s| s.name == name) {
+            return Err(format!("no such server: {name}"));
+        }
+        cfg.set_surface_enabled(GTK_SURFACE, name, false);
+    }
     Ok(())
 }
 
@@ -234,7 +265,7 @@ url = "https://x.example/mcp"
 [surfaces.gtk]
 enabled = ["files", "remote"]
 "#);
-        let dtos = client_server_dtos(&c);
+        let dtos = client_server_dtos(&c, &HashMap::new());
         let files = dtos.iter().find(|d| d.name == "files").expect("files row");
         let remote = dtos
             .iter()
@@ -265,7 +296,7 @@ command = "c"
 [surfaces.gtk]
 enabled = ["on", "def-off"]
 "#);
-        let dtos = client_server_dtos(&c);
+        let dtos = client_server_dtos(&c, &HashMap::new());
         let status = |name: &str| {
             dtos.iter()
                 .find(|d| d.name == name)
@@ -282,7 +313,47 @@ enabled = ["on", "def-off"]
 
     #[test]
     fn client_dtos_empty_config_is_empty() {
-        assert!(client_server_dtos(&ClientMcpConfig::default()).is_empty());
+        assert!(client_server_dtos(&ClientMcpConfig::default(), &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn client_dto_tool_count_comes_from_counts_by_namespace() {
+        let c = cfg(r#"
+[[servers]]
+name = "files"
+command = "fileio-mcp"
+namespace = "fs"
+
+[[servers]]
+name = "git"
+command = "git-mcp"
+
+[surfaces.gtk]
+enabled = ["files", "git"]
+"#);
+        // The host reports counts keyed by namespace, or by name when a server
+        // declares none.
+        let mut counts = HashMap::new();
+        counts.insert("fs".to_string(), 3u32);
+        counts.insert("git".to_string(), 2u32);
+        let dtos = client_server_dtos(&c, &counts);
+        let files = dtos.iter().find(|d| d.name == "files").expect("files row");
+        let git = dtos.iter().find(|d| d.name == "git").expect("git row");
+        assert_eq!(files.tool_count, 3, "keyed by the namespace 'fs'");
+        assert_eq!(git.tool_count, 2, "keyed by the name when no namespace");
+    }
+
+    #[test]
+    fn client_dto_tool_count_defaults_zero_when_host_has_not_reported() {
+        let c = cfg(r#"
+[[servers]]
+name = "files"
+command = "fileio-mcp"
+[surfaces.gtk]
+enabled = ["files"]
+"#);
+        // Empty map (host not connected / no tools) -> 0 rather than a panic.
+        assert_eq!(client_server_dtos(&c, &HashMap::new())[0].tool_count, 0);
     }
 
     // --- client_row_enabled ---------------------------------------------------
@@ -324,7 +395,7 @@ enabled = ["on", "def-off"]
 
         assert_eq!(c.list_defined_servers().len(), 1);
         assert_eq!(c.surface_enabled_names(GTK_SURFACE), &["files"]);
-        assert_eq!(client_server_dtos(&c)[0].status, "enabled");
+        assert_eq!(client_server_dtos(&c, &HashMap::new())[0].status, "enabled");
     }
 
     #[test]
@@ -345,7 +416,10 @@ enabled = ["files"]
                 .iter()
                 .any(|n| n == "files")
         );
-        assert_eq!(client_server_dtos(&c)[0].status, "disabled");
+        assert_eq!(
+            client_server_dtos(&c, &HashMap::new())[0].status,
+            "disabled"
+        );
     }
 
     #[test]
@@ -383,7 +457,7 @@ enabled = ["files"]
     // --- apply_client_toggle / remove ----------------------------------------
 
     #[test]
-    fn apply_client_toggle_flips_both_grains() {
+    fn apply_client_toggle_off_then_on_round_trips_status() {
         let mut c = cfg(r#"
 [[servers]]
 name = "files"
@@ -391,24 +465,111 @@ command = "fileio-mcp"
 [surfaces.gtk]
 enabled = ["files"]
 "#);
+        // Off: dropped from the gtk surface, but the DEFINITION stays enabled
+        // (surface-scoped disable — see the asymmetric toggle).
         apply_client_toggle(&mut c, "files", false).expect("toggle off");
-        assert_eq!(client_server_dtos(&c)[0].status, "disabled");
+        assert_eq!(
+            client_server_dtos(&c, &HashMap::new())[0].status,
+            "disabled"
+        );
         assert!(
-            !c.list_defined_servers()
+            c.list_defined_servers()
                 .iter()
                 .find(|s| s.name == "files")
                 .unwrap()
-                .enabled
+                .enabled,
+            "a surface-scoped disable must leave the definition enabled"
+        );
+        assert!(
+            !c.surface_enabled_names(GTK_SURFACE)
+                .iter()
+                .any(|n| n == "files")
         );
 
+        // On again: back in the gtk surface (and the definition is on).
         apply_client_toggle(&mut c, "files", true).expect("toggle on");
-        assert_eq!(client_server_dtos(&c)[0].status, "enabled");
+        assert_eq!(client_server_dtos(&c, &HashMap::new())[0].status, "enabled");
+        assert!(
+            c.surface_enabled_names(GTK_SURFACE)
+                .iter()
+                .any(|n| n == "files")
+        );
+    }
+
+    #[test]
+    fn toggle_off_is_surface_scoped_leaving_other_surfaces() {
+        // A server exposed on BOTH gtk and tui: disabling it in gtk must remove
+        // it from the gtk surface ONLY, leaving tui's exposure and the shared
+        // definition intact so the other surface keeps hosting it.
+        let mut c = cfg(r#"
+[[servers]]
+name = "files"
+command = "fileio-mcp"
+[surfaces.gtk]
+enabled = ["files"]
+[surfaces.tui]
+enabled = ["files"]
+"#);
+        apply_client_toggle(&mut c, "files", false).expect("toggle off");
+        // Gone from gtk ...
+        assert!(
+            !c.surface_enabled_names(GTK_SURFACE)
+                .iter()
+                .any(|n| n == "files"),
+            "must be dropped from the gtk surface"
+        );
+        // ... still in tui ...
+        assert!(
+            c.surface_enabled_names("tui").iter().any(|n| n == "files"),
+            "another surface's exposure must be untouched"
+        );
+        // ... and the definition itself is still enabled.
+        assert!(
+            c.list_defined_servers()
+                .iter()
+                .find(|s| s.name == "files")
+                .unwrap()
+                .enabled,
+            "the shared definition must stay enabled for other surfaces"
+        );
+    }
+
+    #[test]
+    fn toggle_on_reenables_globally_disabled_definition() {
+        // Enabling for gtk must also flip a globally-disabled definition back on,
+        // otherwise the surface would list a server the host would never start.
+        let mut c = cfg(r#"
+[[servers]]
+name = "files"
+command = "fileio-mcp"
+enabled = false
+"#);
+        apply_client_toggle(&mut c, "files", true).expect("toggle on");
+        assert!(
+            c.list_defined_servers()
+                .iter()
+                .find(|s| s.name == "files")
+                .unwrap()
+                .enabled,
+            "enabling in gtk must re-enable the definition"
+        );
+        assert!(
+            c.surface_enabled_names(GTK_SURFACE)
+                .iter()
+                .any(|n| n == "files")
+        );
+        assert_eq!(client_server_dtos(&c, &HashMap::new())[0].status, "enabled");
     }
 
     #[test]
     fn apply_client_toggle_unknown_errors() {
+        // Both directions fail closed on an unknown name rather than silently
+        // materializing a gtk surface entry for a server that does not exist.
         let mut c = ClientMcpConfig::default();
         assert!(apply_client_toggle(&mut c, "ghost", true).is_err());
+        assert!(apply_client_toggle(&mut c, "ghost", false).is_err());
+        // The failed off-toggle must not have created a gtk surface entry.
+        assert!(c.surface_enabled_names(GTK_SURFACE).is_empty());
     }
 
     #[test]

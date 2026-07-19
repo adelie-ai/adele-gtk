@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
@@ -116,6 +117,10 @@ pub async fn connection_manager(
     // (#106): `drive_connection` stores it here just before `Connected`. The core
     // can't carry the handle (wasm), so this gtk-local cell is the seam.
     pending_connector: Arc<Mutex<Option<Arc<Connector>>>>,
+    // Live per-server client-tool counts by namespace, refreshed from the running
+    // `McpHost` here and after each (re)registration, and read by the Settings MCP
+    // panel so client rows show a real tool count (adele-gtk#125).
+    client_tool_counts: Arc<Mutex<HashMap<String, u32>>>,
     shutdown: watch::Receiver<bool>,
 ) {
     // Start the client-side MCP host for the `gtk` surface once (mirroring the
@@ -124,12 +129,42 @@ pub async fn connection_manager(
     // tools to the daemon as client-side tools. `None` when nothing is configured
     // (an absent/malformed config resolves to an empty selection).
     let host = start_mcp_host().await;
-    connection_loop(config, ui_tx, pending_connector, shutdown, host.as_ref()).await;
+    // Seed the panel's tool counts as soon as the host is up (before the first
+    // connect); `drive_connection` refreshes them after each (re)registration.
+    snapshot_tool_counts(host.as_ref(), &client_tool_counts);
+    connection_loop(
+        config,
+        ui_tx,
+        pending_connector,
+        client_tool_counts,
+        shutdown,
+        host.as_ref(),
+    )
+    .await;
     // Session over (window closed): stop every hosted MCP server process. The
     // servers also kill-on-drop, but shutting down explicitly is deterministic.
     if let Some(host) = host {
         host.shutdown().await;
     }
+}
+
+/// Overwrite the shared per-server tool-count cell from the running host
+/// (adele-gtk#125). Keyed by namespace, matching
+/// [`crate::mcp_admin::client_server_dtos`]. A quick lock + overwrite; the host's
+/// `usize` totals are clamped into `u32` for the wire-free DTO, and a `None` host
+/// clears the cell. The Settings MCP panel reads a snapshot of this cell when it
+/// builds its client rows.
+fn snapshot_tool_counts(
+    host: Option<&McpHost>,
+    client_tool_counts: &Arc<Mutex<HashMap<String, u32>>>,
+) {
+    let fresh: HashMap<String, u32> = host
+        .map(McpHost::tool_counts)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(namespace, n)| (namespace, u32::try_from(n).unwrap_or(u32::MAX)))
+        .collect();
+    *client_tool_counts.lock().unwrap() = fresh;
 }
 
 /// Start the client-side MCP host for the `gtk` surface, or `None` when no
@@ -157,6 +192,7 @@ async fn connection_loop(
     config: ConnectionConfig,
     ui_tx: mpsc::UnboundedSender<UiMessage>,
     pending_connector: Arc<Mutex<Option<Arc<Connector>>>>,
+    client_tool_counts: Arc<Mutex<HashMap<String, u32>>>,
     mut shutdown: watch::Receiver<bool>,
     host: Option<&McpHost>,
 ) {
@@ -181,7 +217,7 @@ async fn connection_loop(
                 // future (connector, signal stream) is dropped here, which
                 // closes the transport and ends the daemon session.
                 let flow = tokio::select! {
-                    flow = drive_connection(connector, &ui_tx, &pending_connector, host) => flow,
+                    flow = drive_connection(connector, &ui_tx, &pending_connector, &client_tool_counts, host) => flow,
                     _ = shutdown_requested(&mut shutdown) => return,
                 };
                 if flow.is_break() {
@@ -242,6 +278,7 @@ async fn drive_connection(
     connector: Connector,
     ui_tx: &mpsc::UnboundedSender<UiMessage>,
     pending_connector: &Arc<Mutex<Option<Arc<Connector>>>>,
+    client_tool_counts: &Arc<Mutex<HashMap<String, u32>>>,
     host: Option<&McpHost>,
 ) -> std::ops::ControlFlow<()> {
     use std::ops::ControlFlow::{Break, Continue};
@@ -286,6 +323,10 @@ async fn drive_connection(
     {
         tracing::debug!("client tool registration skipped: {e}");
     }
+    // Refresh the panel's per-server tool counts after each (re)registration
+    // (adele-gtk#125). The host's tools are fixed after start, so this is
+    // idempotent; it keeps the shared cell current across reconnects.
+    snapshot_tool_counts(host, client_tool_counts);
 
     // Refresh conversation list on connect
     match transport.list_conversations().await {
@@ -552,6 +593,7 @@ mod tests {
             config,
             ui_tx,
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(HashMap::new())),
             shutdown_rx,
         ));
         // Let it fail its first connect and enter backoff.
@@ -582,6 +624,7 @@ mod tests {
             config,
             ui_tx,
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(HashMap::new())),
             shutdown_rx,
         ));
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -613,6 +656,7 @@ mod tests {
             config,
             ui_tx,
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(HashMap::new())),
             shutdown_rx,
         ));
 
