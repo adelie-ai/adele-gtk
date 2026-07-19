@@ -18,17 +18,21 @@
 //! `ModelPicker` filters out.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use client_ui_common::Runner;
 use desktop_assistant_api_model as api;
 use desktop_assistant_client_common::Connector;
+use desktop_assistant_client_common::mcp_host::{ClientMcpConfig, default_client_mcp_path};
 use gtk4::prelude::*;
 use gtk4::{Align, Box as GtkBox, Button, Label, Notebook, Orientation, Window, glib};
 use tokio::sync::mpsc;
 
 use crate::async_bridge::{AsyncBridge, UiMessage};
 use crate::management_client;
+use crate::mcp_admin::{self, McpBackend};
 use crate::voice_client::VoiceController;
 
 use super::connection_config_dialog::{ConnectorType, show_configure_dialog};
@@ -112,11 +116,19 @@ fn confirm<F>(
 /// service from the connector's orchestrator); it backs the Voice tab's
 /// wake-word toggle and voice picker. The tab degrades gracefully when the
 /// daemon is absent.
+///
+/// `daemon_is_remote` / `daemon_host` describe the client's link to the daemon
+/// (derived from the connection config by [`mcp_admin::daemon_link`], which the
+/// caller owns): they drive the MCP panel's runner chip so a daemon row on a
+/// remote WebSocket link reads `daemon · <host>` and a co-located one reads
+/// `daemon`.
 pub fn show_settings_dialog(
     parent: &impl IsA<Window>,
     transport: Arc<Connector>,
     bridge: Rc<AsyncBridge>,
     voice: VoiceController,
+    daemon_is_remote: bool,
+    daemon_host: Option<String>,
 ) {
     let dialog = Window::builder()
         .title("Settings")
@@ -141,6 +153,14 @@ pub fn show_settings_dialog(
     // the MCP server list and handed to the editor's account picker.
     let service_accounts: Rc<RefCell<Vec<api::ServiceAccountView>>> =
         Rc::new(RefCell::new(Vec::new()));
+
+    // Snapshot of the on-disk client MCP config (`client-mcp.toml`, #122),
+    // refreshed alongside the daemon list. Cached so a client-row edit can
+    // pre-fill from the local definition without another file read on the main
+    // loop; all writes to it happen off the main loop via the async bridge.
+    let client_config: Rc<RefCell<ClientMcpConfig>> =
+        Rc::new(RefCell::new(ClientMcpConfig::default()));
+    let client_mcp_path: Rc<PathBuf> = Rc::new(default_client_mcp_path());
 
     notebook.append_page(
         &connections_tab.container,
@@ -532,9 +552,15 @@ pub fn show_settings_dialog(
         Rc::clone(&mcp_tab),
         Rc::clone(&service_accounts),
         Rc::clone(&status_label),
+        Rc::clone(&client_config),
+        Rc::clone(&client_mcp_path),
+        daemon_is_remote,
+        daemon_host.clone(),
     );
 
-    // Add: open a blank editor; save writes any bearer token then upserts.
+    // Add: open a blank editor (defaulting to a daemon server); the "Runs on"
+    // selector chooses the runner, and save forks to the daemon RPC path or the
+    // local client-mcp.toml on it.
     mcp_tab.connect_add(glib::clone!(
         #[strong]
         transport,
@@ -544,28 +570,43 @@ pub fn show_settings_dialog(
         refresh_mcp,
         #[strong]
         service_accounts,
+        #[strong]
+        client_config,
+        #[strong]
+        client_mcp_path,
         #[strong(rename_to = mcp_tab_add)]
         mcp_tab,
         #[weak]
         dialog,
         move || {
             let accounts = service_accounts.borrow().clone();
-            // The create-path uniqueness guard checks the typed name against the
-            // currently-loaded servers so an add can't silently overwrite one.
-            let existing_names = mcp_tab_add.server_names();
+            // The create-path uniqueness guard checks a typed name against the
+            // currently-loaded servers of the SELECTED runner so an add can't
+            // silently overwrite one (a client "files" and a daemon "files" are
+            // distinct, so the lists are kept per-runner).
+            let daemon_names = mcp_tab_add.daemon_names();
+            let client_names: Vec<String> = client_config
+                .borrow()
+                .list_defined_servers()
+                .iter()
+                .map(|s| s.name.clone())
+                .collect();
             let transport = Arc::clone(&transport);
             let bridge = Rc::clone(&bridge);
             let refresh = Rc::clone(&refresh_mcp);
+            let path = (*client_mcp_path).clone();
             show_mcp_server_dialog(
                 &dialog,
                 McpForm::blank(McpTransport::Stdio),
                 accounts,
-                existing_names,
+                daemon_names,
+                client_names,
                 move |built| {
-                    do_upsert_mcp(
+                    save_mcp_built(
                         Arc::clone(&transport),
                         Rc::clone(&bridge),
                         Rc::clone(&refresh),
+                        path.clone(),
                         built,
                     );
                 },
@@ -573,8 +614,9 @@ pub fn show_settings_dialog(
         }
     ));
 
-    // Edit: look up the loaded view, pre-fill the editor (write-only fields
-    // stay blank), save through the same upsert path.
+    // Edit: pre-fill the editor from the runner's own source (a daemon view, or
+    // the cached client-mcp.toml definition), then save through the runner fork.
+    // The runner is locked in the editor, so a save can't change sides.
     mcp_tab.connect_edit(glib::clone!(
         #[strong]
         transport,
@@ -584,30 +626,51 @@ pub fn show_settings_dialog(
         refresh_mcp,
         #[strong]
         service_accounts,
+        #[strong]
+        client_config,
+        #[strong]
+        client_mcp_path,
         #[strong(rename_to = mcp_tab_edit)]
         mcp_tab,
         #[weak]
         dialog,
-        move |name| {
-            let Some(view) = mcp_tab_edit.find(&name) else {
-                return;
-            };
+        move |name, runner| {
             let accounts = service_accounts.borrow().clone();
+            let form = match runner {
+                Runner::Daemon => {
+                    let Some(view) = mcp_tab_edit.find(&name) else {
+                        return;
+                    };
+                    McpForm::from_view(&view)
+                }
+                Runner::Client => {
+                    let cfg = client_config.borrow();
+                    let Some(server) = cfg.list_defined_servers().iter().find(|s| s.name == name)
+                    else {
+                        return;
+                    };
+                    let enabled = mcp_admin::client_row_enabled(&cfg, &name);
+                    McpForm::from_client_config(server, enabled)
+                }
+            };
             let transport = Arc::clone(&transport);
             let bridge = Rc::clone(&bridge);
             let refresh = Rc::clone(&refresh_mcp);
+            let path = (*client_mcp_path).clone();
             // Edit targets an existing name by design; the dup-name guard is
-            // create-only, so no existing-names list is needed here.
+            // create-only, so no existing-names lists are needed here.
             show_mcp_server_dialog(
                 &dialog,
-                McpForm::from_view(&view),
+                form,
                 accounts,
                 Vec::new(),
+                Vec::new(),
                 move |built| {
-                    do_upsert_mcp(
+                    save_mcp_built(
                         Arc::clone(&transport),
                         Rc::clone(&bridge),
                         Rc::clone(&refresh),
+                        path.clone(),
                         built,
                     );
                 },
@@ -615,7 +678,7 @@ pub fn show_settings_dialog(
         }
     ));
 
-    // Enable/disable toggle.
+    // Enable/disable toggle - forked by runner.
     mcp_tab.connect_toggle(glib::clone!(
         #[strong]
         transport,
@@ -623,18 +686,27 @@ pub fn show_settings_dialog(
         bridge,
         #[strong]
         refresh_mcp,
-        move |name, enabled| {
-            do_toggle_mcp(
+        #[strong]
+        client_mcp_path,
+        move |name, runner, enabled| match mcp_admin::backend_for(runner) {
+            McpBackend::Daemon => do_toggle_mcp(
                 Arc::clone(&transport),
                 Rc::clone(&bridge),
                 Rc::clone(&refresh_mcp),
                 name,
                 enabled,
-            );
+            ),
+            McpBackend::Client => do_client_toggle(
+                Rc::clone(&bridge),
+                Rc::clone(&refresh_mcp),
+                (*client_mcp_path).clone(),
+                name,
+                enabled,
+            ),
         }
     ));
 
-    // Remove (with confirmation).
+    // Remove (with confirmation) - forked by runner.
     mcp_tab.connect_remove(glib::clone!(
         #[strong]
         transport,
@@ -642,26 +714,41 @@ pub fn show_settings_dialog(
         bridge,
         #[strong]
         refresh_mcp,
+        #[strong]
+        client_mcp_path,
         #[weak]
         dialog,
-        move |name| {
+        move |name, runner| {
             let transport = Arc::clone(&transport);
             let bridge = Rc::clone(&bridge);
             let refresh = Rc::clone(&refresh_mcp);
+            let path = (*client_mcp_path).clone();
             let name_for_confirm = name.clone();
+            let detail = match runner {
+                Runner::Daemon => "Its tools will no longer be available to the assistant.",
+                Runner::Client => {
+                    "This removes the local server definition and drops it from every client surface."
+                }
+            };
             confirm(
                 &dialog,
                 &format!("Remove MCP server \"{name}\"?"),
-                "Its tools will no longer be available to the assistant.",
+                detail,
                 "Remove",
                 true,
-                move || {
-                    do_remove_mcp(
+                move || match mcp_admin::backend_for(runner) {
+                    McpBackend::Daemon => do_remove_mcp(
                         Arc::clone(&transport),
                         Rc::clone(&bridge),
                         Rc::clone(&refresh),
                         name_for_confirm.clone(),
-                    );
+                    ),
+                    McpBackend::Client => do_client_remove(
+                        Rc::clone(&bridge),
+                        Rc::clone(&refresh),
+                        path.clone(),
+                        name_for_confirm.clone(),
+                    ),
                 },
             );
         }
@@ -694,25 +781,39 @@ pub fn show_settings_dialog(
     dialog.present();
 }
 
-/// Build the MCP-tab refresh closure: fetch the server list + the OAuth service
-/// accounts on the runtime and apply them on the GTK main thread. Called on
-/// present and after every MCP mutation.
+/// Build the MCP-tab refresh closure: fetch the daemon server list + the OAuth
+/// service accounts over the transport **and** load this client's on-disk MCP
+/// config, all off the GTK main loop, then merge them into the panel on the main
+/// thread. Called on present and after every MCP mutation.
+///
+/// The client config is loaded on the runtime (a file read must not block the
+/// main loop), cached for client-row edits, and projected to the panel's client
+/// rows. `daemon_is_remote`/`daemon_host` drive the daemon rows' runner chip.
+#[allow(clippy::too_many_arguments)]
 fn mcp_refresh_closure(
     transport: Arc<Connector>,
     bridge: Rc<AsyncBridge>,
     mcp_tab: Rc<McpServersTab>,
     service_accounts: Rc<RefCell<Vec<api::ServiceAccountView>>>,
     status_label: Rc<Label>,
+    client_config: Rc<RefCell<ClientMcpConfig>>,
+    client_mcp_path: Rc<PathBuf>,
+    daemon_is_remote: bool,
+    daemon_host: Option<String>,
 ) -> Rc<dyn Fn()> {
     Rc::new(move || {
         let transport = Arc::clone(&transport);
         let mcp_tab = Rc::clone(&mcp_tab);
         let service_accounts = Rc::clone(&service_accounts);
         let status_label = Rc::clone(&status_label);
+        let client_config = Rc::clone(&client_config);
+        let path = (*client_mcp_path).clone();
+        let daemon_host = daemon_host.clone();
         #[allow(clippy::type_complexity)]
         let (tx, mut rx) = mpsc::unbounded_channel::<(
             Result<Vec<api::McpServerView>, String>,
             Result<Vec<api::ServiceAccountView>, String>,
+            ClientMcpConfig,
         )>();
         bridge.spawn(async move {
             let client = transport.client();
@@ -722,18 +823,33 @@ fn mcp_refresh_closure(
             let accounts = management_client::list_service_accounts(client)
                 .await
                 .map_err(|e| e.to_string());
-            let _ = tx.send((servers, accounts));
+            // File read: on the runtime, never the GTK main loop.
+            let cfg = ClientMcpConfig::load(&path);
+            let _ = tx.send((servers, accounts, cfg));
         });
         glib::spawn_future_local(async move {
-            if let Some((servers, accounts)) = rx.recv().await {
+            if let Some((servers, accounts, cfg)) = rx.recv().await {
                 match accounts {
                     Ok(list) => *service_accounts.borrow_mut() = list,
                     Err(e) => status_label.set_text(&format!("List service accounts: {e}")),
                 }
-                match servers {
-                    Ok(list) => mcp_tab.set_servers(&list),
-                    Err(e) => status_label.set_text(&format!("List MCP servers: {e}")),
-                }
+                // Daemon rows: keep the client-side view even if the daemon list
+                // fails, so client-hosted servers still render.
+                let daemon_views = match servers {
+                    Ok(list) => list,
+                    Err(e) => {
+                        status_label.set_text(&format!("List MCP servers: {e}"));
+                        Vec::new()
+                    }
+                };
+                let client_rows = mcp_admin::client_server_dtos(&cfg);
+                mcp_tab.set_data(
+                    &daemon_views,
+                    &client_rows,
+                    daemon_is_remote,
+                    daemon_host.as_deref(),
+                );
+                *client_config.borrow_mut() = cfg;
             }
         });
     })
@@ -771,6 +887,115 @@ fn do_upsert_mcp(
                 Ok(()) => refresh(),
                 Err(e) => {
                     let _ = ui_tx.send(UiMessage::Error(format!("Save MCP server: {e}")));
+                }
+            }
+        }
+    });
+}
+
+/// Fork a built server save on its runner: a daemon server goes through the
+/// daemon RPC path ([`do_upsert_mcp`]); a client server is written to the local
+/// `client-mcp.toml` ([`do_client_save`]).
+fn save_mcp_built(
+    transport: Arc<Connector>,
+    bridge: Rc<AsyncBridge>,
+    refresh: Rc<dyn Fn()>,
+    client_path: PathBuf,
+    built: BuiltMcpServer,
+) {
+    match mcp_admin::backend_for(built.runner) {
+        McpBackend::Daemon => do_upsert_mcp(transport, bridge, refresh, built),
+        McpBackend::Client => do_client_save(bridge, refresh, client_path, built),
+    }
+}
+
+/// Save a client-hosted server to `client-mcp.toml` off the main loop: parse the
+/// built config, load the current file, apply the definition + gtk-surface
+/// change, and write it back atomically. Then refresh. The dialog's config JSON
+/// carries no bearer secret store on the client, so any typed bearer token is
+/// dropped (client servers are stdio in practice; http-bearer on the client is a
+/// follow-up).
+fn do_client_save(
+    bridge: Rc<AsyncBridge>,
+    refresh: Rc<dyn Fn()>,
+    client_path: PathBuf,
+    built: BuiltMcpServer,
+) {
+    let ui_tx = bridge.ui_sender();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), String>>();
+    bridge.spawn(async move {
+        let result = (|| {
+            let server = mcp_admin::parse_server_config(&built.config_json)?;
+            let enabled = server.enabled;
+            let mut cfg = ClientMcpConfig::load(&client_path);
+            mcp_admin::apply_client_save(&mut cfg, server, enabled);
+            cfg.save(&client_path)
+        })();
+        let _ = tx.send(result);
+    });
+    glib::spawn_future_local(async move {
+        if let Some(r) = rx.recv().await {
+            match r {
+                Ok(()) => refresh(),
+                Err(e) => {
+                    let _ = ui_tx.send(UiMessage::Error(format!("Save client MCP server: {e}")));
+                }
+            }
+        }
+    });
+}
+
+/// Enable/disable a client-hosted server (both grains) and write the config back
+/// off the main loop, then refresh.
+fn do_client_toggle(
+    bridge: Rc<AsyncBridge>,
+    refresh: Rc<dyn Fn()>,
+    client_path: PathBuf,
+    name: String,
+    enabled: bool,
+) {
+    let ui_tx = bridge.ui_sender();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), String>>();
+    bridge.spawn(async move {
+        let mut cfg = ClientMcpConfig::load(&client_path);
+        let result = mcp_admin::apply_client_toggle(&mut cfg, &name, enabled)
+            .and_then(|()| cfg.save(&client_path));
+        let _ = tx.send(result);
+    });
+    glib::spawn_future_local(async move {
+        if let Some(r) = rx.recv().await {
+            match r {
+                Ok(()) => refresh(),
+                Err(e) => {
+                    let _ = ui_tx.send(UiMessage::Error(format!("Toggle client MCP server: {e}")));
+                }
+            }
+        }
+    });
+}
+
+/// Remove a client-hosted server definition and write the config back off the
+/// main loop, then refresh.
+fn do_client_remove(
+    bridge: Rc<AsyncBridge>,
+    refresh: Rc<dyn Fn()>,
+    client_path: PathBuf,
+    name: String,
+) {
+    let ui_tx = bridge.ui_sender();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), String>>();
+    bridge.spawn(async move {
+        let mut cfg = ClientMcpConfig::load(&client_path);
+        let result =
+            mcp_admin::apply_client_remove(&mut cfg, &name).and_then(|()| cfg.save(&client_path));
+        let _ = tx.send(result);
+    });
+    glib::spawn_future_local(async move {
+        if let Some(r) = rx.recv().await {
+            match r {
+                Ok(()) => refresh(),
+                Err(e) => {
+                    let _ = ui_tx.send(UiMessage::Error(format!("Remove client MCP server: {e}")));
                 }
             }
         }
