@@ -1238,6 +1238,34 @@ mod tests {
     }
 
     #[test]
+    fn build_client_runner_forces_stdio_never_http() {
+        // A client server has no client-side secret store, so an http/bearer
+        // config can't be honored; the client runner is stdio-only. Even if the
+        // form carries http (a stale selection), build() must emit a stdio config,
+        // never http, and drop any bearer secret (adele-gtk#125).
+        let form = McpForm {
+            runner: Runner::Client,
+            command: "fileio-mcp".into(),
+            auth: McpAuthKind::Bearer,
+            bearer_token: "should-be-ignored".into(),
+            ..http("files")
+        };
+        let built = form.build().expect("client form builds as stdio");
+        assert_eq!(built.runner, Runner::Client);
+        assert!(
+            !built.config_json.contains("http"),
+            "client config must never carry http: {}",
+            built.config_json
+        );
+        assert!(
+            built.config_json.contains(r#""command":"fileio-mcp""#),
+            "client config is the stdio command: {}",
+            built.config_json
+        );
+        assert_eq!(built.secret, None, "no bearer secret for a client server");
+    }
+
+    #[test]
     fn from_view_is_always_daemon_runner() {
         let view = McpServerView {
             name: "files".into(),
