@@ -16,6 +16,7 @@ mod avatars;
 mod context_usage;
 mod credential_store;
 mod management_client;
+mod mcp_admin;
 // Markdown→sanitized-HTML rendering + the CSP-pinned WebView template. Only the
 // WebView (`linux`) chat path renders HTML.
 #[cfg(feature = "linux")]

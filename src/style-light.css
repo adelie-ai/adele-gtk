@@ -287,3 +287,11 @@ entry:focus {
     color: #9aa3b2;
     text-decoration: line-through;
 }
+
+/* Runner chip (#122): darken the accent fill/text so the pill reads on the
+   light list surface. The transport chip derives from currentColor and needs no
+   light override. */
+.mcp-runner-chip {
+    background-color: alpha(#178a6e, 0.12);
+    color: #178a6e; /* brand teal, darkened for light bg */
+}

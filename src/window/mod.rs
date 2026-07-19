@@ -932,6 +932,12 @@ impl AdelieWindow {
             }
         ));
 
+        // The MCP panel's runner chip labels daemon rows by how this client links
+        // to the daemon: a remote WebSocket link shows `daemon · <host>`, a
+        // co-located UDS/D-Bus link shows plain `daemon`. Derived once from the
+        // connection config the window owns (the Connector doesn't re-expose it).
+        let (daemon_is_remote, daemon_host) = crate::mcp_admin::daemon_link(&config);
+
         // Hamburger menu: Settings → Connections / Purposes tabs (#1). The
         // dialog is WS-only (named-connection management isn't exposed over
         // D-Bus); on a D-Bus transport we status-message and no-op — the
@@ -949,6 +955,10 @@ impl AdelieWindow {
             status_label,
             #[strong]
             voice,
+            #[strong]
+            daemon_is_remote,
+            #[strong]
+            daemon_host,
             move |_| {
                 menu_popover.popdown();
                 let Some(connector) = client.borrow().clone() else {
@@ -975,6 +985,8 @@ impl AdelieWindow {
                     Arc::clone(&connector),
                     Rc::clone(&bridge),
                     voice_handle,
+                    daemon_is_remote,
+                    daemon_host.clone(),
                 );
                 // The user may have added/removed connections; re-query the
                 // aggregated model list so the header picker reflects the new

@@ -334,13 +334,23 @@ entry:focus {
     background-color: #6b7a90; /* neutral grey */
 }
 
-/* Transport chip: a small outlined pill (local vs remote). */
+/* Transport chip: a small outlined pill (honest "stdio" / "http"). */
 .mcp-chip {
     font-size: 11px;
     padding: 0 6px;
     border-radius: 6px;
     border: 1px solid alpha(currentColor, 0.35);
     opacity: 0.75;
+}
+
+/* Runner chip (#122): a filled accent pill ("daemon"/"daemon · host"/"client")
+   so the runner reads distinctly from the outlined transport chip beside it. */
+.mcp-runner-chip {
+    font-size: 11px;
+    padding: 0 6px;
+    border-radius: 6px;
+    background-color: alpha(#84dac1, 0.16);
+    color: #84dac1; /* brand teal */
 }
 
 /* Last-connect error / validation error text. */

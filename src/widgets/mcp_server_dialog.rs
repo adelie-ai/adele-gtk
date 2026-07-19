@@ -26,7 +26,9 @@
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use client_ui_common::Runner;
 use desktop_assistant_api_model::{McpServerView, ServiceAccountView};
+use desktop_assistant_client_common::mcp_host::McpServerConfig;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box as GtkBox, Button, CheckButton, DropDown, Entry, Label, Orientation, ScrolledWindow,
@@ -192,6 +194,11 @@ fn opt(s: &str) -> Option<String> {
 pub struct McpForm {
     /// `true` when editing an existing server - the name is immutable.
     pub editing: bool,
+    /// Where the server runs: the daemon fleet or this client's local host. It is
+    /// a separate axis from [`Self::transport`] (a stdio *or* http server can run
+    /// on either side) and is immutable on edit - you cannot move a server between
+    /// runners in place.
+    pub runner: Runner,
     pub transport: McpTransport,
     pub name: String,
     pub enabled: bool,
@@ -214,10 +221,13 @@ pub struct McpForm {
 }
 
 impl McpForm {
-    /// A blank create form for `transport`.
+    /// A blank create form for `transport`, defaulting to a daemon-run server
+    /// (the historical behavior; the create dialog's "Runs on" selector changes
+    /// it).
     pub fn blank(transport: McpTransport) -> Self {
         Self {
             editing: false,
+            runner: Runner::Daemon,
             transport,
             name: String::new(),
             enabled: true,
@@ -257,6 +267,8 @@ impl McpForm {
         };
         Self {
             editing: true,
+            // Daemon-hosted: the view type only ever describes the daemon's fleet.
+            runner: Runner::Daemon,
             transport,
             name: view.name.clone(),
             enabled: view.enabled,
@@ -271,6 +283,61 @@ impl McpForm {
             bearer_token: String::new(),
             oauth_account: view.oauth_account_ref.clone().unwrap_or_default(),
             scopes: view.oauth_scopes.join(" "),
+        }
+    }
+
+    /// Pre-fill an edit form from a **client-hosted** server's on-disk config
+    /// (`client-mcp.toml`). Unlike the daemon path this config lives locally, so
+    /// non-secret fields - including `env` - are echoed. `enabled` is the gtk
+    /// surface's view of the server (definition enabled *and* named by
+    /// `[surfaces.gtk]`); the bearer token stays blank (there is no client secret
+    /// store). Env lines are key-sorted for a deterministic display.
+    pub fn from_client_config(cfg: &McpServerConfig, enabled: bool) -> Self {
+        let transport = if cfg.http.is_some() {
+            McpTransport::Http
+        } else {
+            McpTransport::Stdio
+        };
+        let (url, auth, oauth_account, scopes) = match cfg.http.as_ref() {
+            Some(http) => {
+                let auth = if http.oauth_account.is_some() {
+                    McpAuthKind::OAuth
+                } else if http.auth_bearer_secret.is_some() {
+                    McpAuthKind::Bearer
+                } else {
+                    McpAuthKind::None
+                };
+                (
+                    http.url.clone(),
+                    auth,
+                    http.oauth_account.clone().unwrap_or_default(),
+                    http.scopes.join(" "),
+                )
+            }
+            None => (
+                String::new(),
+                McpAuthKind::None,
+                String::new(),
+                String::new(),
+            ),
+        };
+        let mut env_lines: Vec<String> = cfg.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        env_lines.sort();
+        Self {
+            editing: true,
+            runner: Runner::Client,
+            transport,
+            name: cfg.name.clone(),
+            enabled,
+            command: cfg.command.clone(),
+            args: cfg.args.join(" "),
+            namespace: cfg.namespace.clone().unwrap_or_default(),
+            env: env_lines.join("\n"),
+            url,
+            auth,
+            bearer_token: String::new(),
+            oauth_account,
+            scopes,
         }
     }
 
@@ -291,7 +358,7 @@ impl McpForm {
             McpTransport::Stdio => {
                 let command = self.command.trim().to_string();
                 if command.is_empty() {
-                    return Err("Command is required for a local (stdio) server.".to_string());
+                    return Err("Command is required for a stdio server.".to_string());
                 }
                 let dto = McpConfigDto {
                     name: name.clone(),
@@ -307,7 +374,7 @@ impl McpForm {
             McpTransport::Http => {
                 let url = self.url.trim().to_string();
                 if url.is_empty() {
-                    return Err("URL is required for a remote (HTTP) server.".to_string());
+                    return Err("URL is required for an HTTP server.".to_string());
                 }
                 let (auth_bearer_secret, oauth_account, scopes, secret) = match self.auth {
                     McpAuthKind::None => (None, None, Vec::new(), None),
@@ -357,6 +424,7 @@ impl McpForm {
             .map_err(|e| format!("Failed to encode the server config: {e}"))?;
         Ok(BuiltMcpServer {
             editing: self.editing,
+            runner: self.runner,
             name,
             config_json,
             secret,
@@ -370,6 +438,10 @@ pub struct BuiltMcpServer {
     /// `true` ⇒ the name already existed (edit); `false` ⇒ create. Both go
     /// through `UpsertMcpServer`, which is add-or-replace.
     pub editing: bool,
+    /// Where the server runs. The Settings dialog forks the save on this: a
+    /// [`Runner::Daemon`] server goes through the daemon RPC path; a
+    /// [`Runner::Client`] server is written to the local `client-mcp.toml`.
+    pub runner: Runner,
     /// The target server name (immutable on edit, validated on create).
     pub name: String,
     /// The JSON `McpServerConfig` string for `UpsertMcpServer { config_json }`.
@@ -391,6 +463,23 @@ fn transport_from_index(i: u32) -> McpTransport {
         McpTransport::Http
     } else {
         McpTransport::Stdio
+    }
+}
+
+/// Convert a "Runs on" DropDown index (0 = daemon, 1 = client) to the enum.
+fn runner_from_index(i: u32) -> Runner {
+    if i == 1 {
+        Runner::Client
+    } else {
+        Runner::Daemon
+    }
+}
+
+/// Convert a [`Runner`] to its "Runs on" DropDown index.
+fn runner_to_index(r: Runner) -> u32 {
+    match r {
+        Runner::Daemon => 0,
+        Runner::Client => 1,
     }
 }
 
@@ -435,19 +524,23 @@ fn labelled_entry(
     entry
 }
 
-/// Show the transport-aware MCP add/edit dialog. `initial` is a blank form
-/// (create) or an [`McpForm::from_view`] (edit); `service_accounts` populates
-/// the OAuth account picker. `existing_names` is the currently-configured
-/// server names: on the create path a typed name that collides with one is
-/// refused inline (see [`is_duplicate_new_name`]) rather than silently
-/// overwriting it; it is ignored when editing. `on_save` receives the validated
+/// Show the runner- and transport-aware MCP add/edit dialog. `initial` is a
+/// blank form (create) or a prefilled edit ([`McpForm::from_view`] for a daemon
+/// server, [`McpForm::from_client_config`] for a client one); `service_accounts`
+/// populates the OAuth account picker. `daemon_names` / `client_names` are the
+/// currently-configured server names on each side: on the create path a typed
+/// name that collides with one on the *selected runner's* side is refused inline
+/// (see [`is_duplicate_new_name`]) rather than silently overwriting it - a client
+/// "files" and a daemon "files" are distinct, so the check is per-runner. Both
+/// lists are ignored when editing. `on_save` receives the validated
 /// [`BuiltMcpServer`] when the user clicks Save; the dialog closes itself on
 /// success and keeps itself open (showing the error) on a validation failure.
 pub fn show_mcp_server_dialog<FSave>(
     parent: &impl IsA<Window>,
     initial: McpForm,
     service_accounts: Vec<ServiceAccountView>,
-    existing_names: Vec<String>,
+    daemon_names: Vec<String>,
+    client_names: Vec<String>,
     on_save: FSave,
 ) where
     FSave: Fn(BuiltMcpServer) + 'static,
@@ -474,12 +567,27 @@ pub fn show_mcp_server_dialog<FSave>(
     content.set_margin_bottom(20);
 
     let blurb = Label::new(Some(
-        "Local servers run a stdio command; remote servers connect to an HTTP endpoint with optional bearer or OAuth authentication. Secret values are stored securely and never kept in the server config.",
+        "A server runs on the daemon (the shared fleet) or on this client (local tools on this machine). Its transport is separate: a stdio server spawns a command, an HTTP server connects to an endpoint with optional bearer or OAuth authentication. Secret values are stored securely and never kept in the server config.",
     ));
     blurb.set_wrap(true);
     blurb.set_halign(Align::Start);
     blurb.add_css_class("dim-label");
     content.append(&blurb);
+
+    // Runs on: daemon vs this client. Locked on edit - a server cannot move
+    // between runners in place (they are administered through different backends).
+    let runner_label = Label::new(Some(if editing {
+        "Runs on (locked)"
+    } else {
+        "Runs on"
+    }));
+    runner_label.set_halign(Align::Start);
+    content.append(&runner_label);
+    let runner_list = StringList::new(&["Daemon", "This client"]);
+    let runner_dd = DropDown::new(Some(runner_list), gtk4::Expression::NONE);
+    runner_dd.set_selected(runner_to_index(initial.runner));
+    runner_dd.set_sensitive(!editing);
+    content.append(&runner_dd);
 
     // Name.
     let name_label = Label::new(Some(if editing { "Name (locked)" } else { "Name" }));
@@ -496,11 +604,11 @@ pub fn show_mcp_server_dialog<FSave>(
     enabled_check.set_active(initial.enabled);
     content.append(&enabled_check);
 
-    // Transport.
+    // Transport (stdio vs http) - a separate axis from the runner above.
     let transport_label = Label::new(Some("Transport"));
     transport_label.set_halign(Align::Start);
     content.append(&transport_label);
-    let transport_list = StringList::new(&["Local (stdio)", "Remote (HTTP)"]);
+    let transport_list = StringList::new(&["Stdio (spawns a command)", "HTTP (remote endpoint)"]);
     let transport_dd = DropDown::new(Some(transport_list), gtk4::Expression::NONE);
     transport_dd.set_selected(match initial.transport {
         McpTransport::Stdio => 0,
@@ -740,6 +848,7 @@ pub fn show_mcp_server_dialog<FSave>(
                 .unwrap_or_default();
             let form = McpForm {
                 editing,
+                runner: runner_from_index(runner_dd.selected()),
                 transport: transport_from_index(transport_dd.selected()),
                 name: name_entry.text().to_string(),
                 enabled: enabled_check.is_active(),
@@ -756,11 +865,17 @@ pub fn show_mcp_server_dialog<FSave>(
             match form.build() {
                 Ok(built) => {
                     // Create-path uniqueness guard: refuse a new name that already
-                    // exists rather than issuing an add-or-replace upsert that
-                    // would silently overwrite the server and clobber its secret.
-                    if !built.editing && is_duplicate_new_name(&built.name, &existing_names) {
+                    // exists on the SELECTED runner's side rather than issuing an
+                    // add-or-replace that would silently overwrite the server (and,
+                    // for a daemon bearer server, clobber its secret). The two
+                    // runners have independent name spaces.
+                    let existing = match built.runner {
+                        Runner::Daemon => &daemon_names,
+                        Runner::Client => &client_names,
+                    };
+                    if !built.editing && is_duplicate_new_name(&built.name, existing) {
                         error_label.set_text(&format!(
-                            "A server named \"{}\" already exists - edit it instead.",
+                            "A server named \"{}\" already exists on that runner - edit it instead.",
                             built.name
                         ));
                         return;
@@ -1095,6 +1210,106 @@ mod tests {
         assert_eq!(f.url, "https://gh.example/mcp");
         // Write-only: the token is never echoed / pre-filled.
         assert_eq!(f.bearer_token, "");
+    }
+
+    // --- runner threading (#122) ---------------------------------------------
+
+    #[test]
+    fn blank_defaults_to_daemon_runner() {
+        assert_eq!(McpForm::blank(McpTransport::Stdio).runner, Runner::Daemon);
+    }
+
+    #[test]
+    fn build_carries_daemon_runner_by_default() {
+        let built = stdio("files").build().expect("builds");
+        assert_eq!(built.runner, Runner::Daemon);
+    }
+
+    #[test]
+    fn build_carries_client_runner_when_selected() {
+        let form = McpForm {
+            runner: Runner::Client,
+            ..stdio("files")
+        };
+        let built = form.build().expect("builds");
+        assert_eq!(built.runner, Runner::Client);
+        // The config JSON is runner-agnostic; only the routing changes.
+        assert!(built.config_json.contains(r#""name":"files""#));
+    }
+
+    #[test]
+    fn from_view_is_always_daemon_runner() {
+        let view = McpServerView {
+            name: "files".into(),
+            command: "fileio-mcp".into(),
+            enabled: true,
+            status: "running".into(),
+            transport: "stdio".into(),
+            ..Default::default()
+        };
+        assert_eq!(McpForm::from_view(&view).runner, Runner::Daemon);
+    }
+
+    /// Build an [`McpServerConfig`] from TOML via the client-config parser, so the
+    /// test doesn't hand-construct the cross-crate struct's full field set.
+    fn client_server(toml: &str) -> McpServerConfig {
+        desktop_assistant_client_common::mcp_host::ClientMcpConfig::from_toml(toml)
+            .expect("valid client-mcp toml")
+            .list_defined_servers()
+            .first()
+            .expect("one server")
+            .clone()
+    }
+
+    #[test]
+    fn from_client_config_prefills_stdio_including_env() {
+        let cfg = client_server(
+            r#"
+[[servers]]
+name = "files"
+command = "fileio-mcp"
+args = ["serve", "--root", "/data"]
+namespace = "fs"
+[servers.env]
+TOKEN = "abc"
+DEBUG = "1"
+"#,
+        );
+        let f = McpForm::from_client_config(&cfg, true);
+        assert!(f.editing);
+        assert_eq!(f.runner, Runner::Client);
+        assert_eq!(f.transport, McpTransport::Stdio);
+        assert_eq!(f.name, "files");
+        assert_eq!(f.command, "fileio-mcp");
+        assert_eq!(f.args, "serve --root /data");
+        assert_eq!(f.namespace, "fs");
+        assert!(f.enabled);
+        // Unlike the daemon path, a client server's env is local and IS echoed,
+        // key-sorted for a deterministic display.
+        assert_eq!(f.env, "DEBUG=1\nTOKEN=abc");
+    }
+
+    #[test]
+    fn from_client_config_prefills_http_and_reflects_surface_disabled() {
+        let cfg = client_server(
+            r#"
+[[servers]]
+name = "cal"
+[servers.http]
+url = "https://cal.example/mcp"
+oauth_account = "work-google"
+scopes = ["calendar.read", "calendar.write"]
+"#,
+        );
+        let f = McpForm::from_client_config(&cfg, false);
+        assert_eq!(f.runner, Runner::Client);
+        assert_eq!(f.transport, McpTransport::Http);
+        assert_eq!(f.auth, McpAuthKind::OAuth);
+        assert_eq!(f.url, "https://cal.example/mcp");
+        assert_eq!(f.oauth_account, "work-google");
+        assert_eq!(f.scopes, "calendar.read calendar.write");
+        // The gtk surface does not host it -> the Enabled box is unchecked.
+        assert!(!f.enabled);
     }
 
     #[test]
