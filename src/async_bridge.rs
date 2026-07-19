@@ -22,6 +22,7 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 /// narration gate; re-exported here so existing `crate::async_bridge::AdeleOutput`
 /// paths keep resolving unchanged.
 pub use adele_voice_client_common::AdeleOutput;
+use client_ui_common::BuiltinServerDto;
 pub use client_ui_common::{
     UiMessage, interactive_default_from_purposes, signal_to_ui_message, voice_mode_client_tools,
 };
@@ -121,6 +122,13 @@ pub async fn connection_manager(
     // `McpHost` here and after each (re)registration, and read by the Settings MCP
     // panel so client rows show a real tool count (adele-gtk#125).
     client_tool_counts: Arc<Mutex<HashMap<String, u32>>>,
+    // The client's compiled-in built-in MCP servers, projected to the panel's
+    // view-model DTOs (da#538 Phase D). Snapshotted once from the running
+    // `McpHost::builtin_status()` after the host starts, and read by the Settings
+    // MCP panel so built-in rows (including any shadowed by an external server of
+    // the same name) render alongside the daemon/client rows. Empty when built-ins
+    // are compiled out or no host is running.
+    mcp_builtin_dtos: Arc<Mutex<Vec<BuiltinServerDto>>>,
     shutdown: watch::Receiver<bool>,
 ) {
     // Start the client-side MCP host for the `gtk` surface once (mirroring the
@@ -132,6 +140,10 @@ pub async fn connection_manager(
     // Seed the panel's tool counts as soon as the host is up (before the first
     // connect); `drive_connection` refreshes them after each (re)registration.
     snapshot_tool_counts(host.as_ref(), &client_tool_counts);
+    // The built-in set is fixed once the host starts (the override decision is
+    // made in `start_with`), so a single snapshot here is enough — unlike the
+    // per-server tool counts, it never changes across reconnects (da#538 Phase D).
+    snapshot_builtin_status(host.as_ref(), &mcp_builtin_dtos);
     connection_loop(
         config,
         ui_tx,
@@ -167,6 +179,23 @@ fn snapshot_tool_counts(
     *client_tool_counts.lock().unwrap() = fresh;
 }
 
+/// Overwrite the shared built-in-DTO cell from the running host's
+/// `builtin_status()` (da#538 Phase D), projected via
+/// [`crate::builtins::builtin_dtos`]. A `None` host clears the cell. The Settings
+/// MCP panel reads a snapshot of this cell when it builds its rows so the client's
+/// compiled-in built-ins (and any shadowed by an external server of the same name)
+/// render alongside the daemon/client rows. A quick lock + overwrite; the guard is
+/// never held across an await.
+fn snapshot_builtin_status(
+    host: Option<&McpHost>,
+    mcp_builtin_dtos: &Arc<Mutex<Vec<BuiltinServerDto>>>,
+) {
+    let fresh = host
+        .map(|h| crate::builtins::builtin_dtos(h.builtin_status()))
+        .unwrap_or_default();
+    *mcp_builtin_dtos.lock().unwrap() = fresh;
+}
+
 /// Start the client-side MCP host for the `gtk` surface, or `None` when no
 /// servers are configured for it. A missing/malformed `client-mcp.toml` resolves
 /// to an empty selection (logged), so this never fails the connection.
@@ -176,12 +205,13 @@ async fn start_mcp_host() -> Option<McpHost> {
         .into_iter()
         .cloned()
         .collect();
-    // Compiled-in built-ins (da#538 Phase C): host the core MCP set in-process,
-    // suppressing any built-in whose name a configured client-mcp server already
-    // provides (external overrides built-in). Named `mcp_builtins` to avoid
-    // colliding with the voice-mode client-tool `builtins` used elsewhere.
-    let configured: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
-    let mcp_builtins = crate::builtins::builtin_servers(&configured);
+    // Compiled-in built-ins (da#538 Phase C/D): host the full core MCP set
+    // in-process. `McpHost::start_with` centralizes the override, skipping (and
+    // logging) any built-in whose name a configured client-mcp server already
+    // provides, and reports each built-in's status for the F5 panel. Named
+    // `mcp_builtins` to avoid colliding with the voice-mode client-tool
+    // `builtins` used elsewhere.
+    let mcp_builtins = crate::builtins::builtin_servers();
     // Host if there is anything to host (configured servers OR built-ins).
     if servers.is_empty() && mcp_builtins.is_empty() {
         None
@@ -601,6 +631,7 @@ mod tests {
             ui_tx,
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Vec::new())),
             shutdown_rx,
         ));
         // Let it fail its first connect and enter backoff.
@@ -632,6 +663,7 @@ mod tests {
             ui_tx,
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Vec::new())),
             shutdown_rx,
         ));
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -664,6 +696,7 @@ mod tests {
             ui_tx,
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Vec::new())),
             shutdown_rx,
         ));
 

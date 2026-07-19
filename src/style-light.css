@@ -295,3 +295,16 @@ entry:focus {
     background-color: alpha(#178a6e, 0.12);
     color: #178a6e; /* brand teal, darkened for light bg */
 }
+
+/* Kind chip (da#538): darken the header-blue accent so the "built-in" pill reads
+   on the light list surface, mirroring the runner chip's light treatment. */
+.mcp-kind-chip {
+    background-color: alpha(#1f6f97, 0.12);
+    color: #1f6f97; /* header blue, darkened for light bg */
+}
+
+/* Overridden built-in row (da#538): dimming is opacity-only (theme-neutral), so
+   the light theme re-asserts the same rule for parity with the dark base. */
+.mcp-row-disabled {
+    opacity: 0.55;
+}

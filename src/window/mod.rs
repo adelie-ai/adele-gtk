@@ -25,7 +25,7 @@ use crate::widgets::tasks_panel::TasksPanel;
 
 mod voice;
 
-use client_ui_common::{Effect, WindowState};
+use client_ui_common::{BuiltinServerDto, Effect, WindowState};
 use voice::{speak_text, wire_embedded_mic, wire_voice_controls};
 
 /// The window's widget handles, bundled so the bridge's UI-message executor
@@ -400,6 +400,15 @@ impl AdelieWindow {
         let client_tool_counts: Arc<Mutex<HashMap<String, u32>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
+        // The client's compiled-in built-in MCP servers as panel view-model DTOs
+        // (da#538 Phase D). The connection manager snapshots this once from the
+        // running `McpHost::builtin_status()` after the host starts; the Settings
+        // MCP panel reads a snapshot when it builds its rows so built-in servers
+        // (and any shadowed by an external server of the same name) render
+        // alongside the daemon/client rows. Empty until the host has started, or
+        // when built-ins are compiled out.
+        let mcp_builtin_dtos: Arc<Mutex<Vec<BuiltinServerDto>>> = Arc::new(Mutex::new(Vec::new()));
+
         // Handle to the standalone voice daemon (`org.desktopAssistant.Voice`),
         // declared here — *before* the bridge — so the `handle_ui_message`
         // executor can also reach it (issue #80): narration prefers the daemon's
@@ -531,6 +540,7 @@ impl AdelieWindow {
                 ui_tx,
                 pending_connector.clone(),
                 client_tool_counts.clone(),
+                mcp_builtin_dtos.clone(),
                 shutdown_rx,
             ));
         }
@@ -971,6 +981,8 @@ impl AdelieWindow {
             daemon_host,
             #[strong]
             client_tool_counts,
+            #[strong]
+            mcp_builtin_dtos,
             move |_| {
                 menu_popover.popdown();
                 let Some(connector) = client.borrow().clone() else {
@@ -1000,6 +1012,7 @@ impl AdelieWindow {
                     daemon_is_remote,
                     daemon_host.clone(),
                     Arc::clone(&client_tool_counts),
+                    Arc::clone(&mcp_builtin_dtos),
                 );
                 // The user may have added/removed connections; re-query the
                 // aggregated model list so the header picker reflects the new
