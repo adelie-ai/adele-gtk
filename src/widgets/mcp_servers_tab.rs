@@ -545,4 +545,59 @@ mod tests {
         // Out-of-range degrades to All rather than panicking.
         assert_eq!(filter_from_index(99), RunnerFilter::All);
     }
+
+    // --- builtin_row_display (da#538 Phase D, slice 3) ------------------------
+
+    /// A built-in [`ServerRow`] as produced by `server_rows_with_builtins`: an
+    /// in-process, client-run server whose `disabled_reason` is `Some` iff an
+    /// external server of the same name overrides it.
+    fn builtin_row(name: &str, tool_count: u32, reason: Option<&str>) -> ServerRow {
+        ServerRow {
+            name: name.into(),
+            runner: Runner::Client,
+            transport: "builtin".into(),
+            status: if reason.is_some() { "disabled" } else { "running" }.into(),
+            tool_count,
+            detail: None,
+            kind: client_ui_common::ServerKind::BuiltIn,
+            disabled_reason: reason.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn builtin_row_display_active_has_no_reason() {
+        let d = builtin_row_display(&builtin_row("fileio", 7, None));
+        assert!(!d.disabled, "an active built-in must not render disabled");
+        assert!(
+            d.reason.is_none(),
+            "an active built-in has no override reason"
+        );
+        assert_eq!(d.chip, "built-in", "the kind chip names the built-in kind");
+    }
+
+    #[test]
+    fn builtin_row_display_overridden_dims_and_shows_reason() {
+        let d = builtin_row_display(&builtin_row(
+            "web",
+            3,
+            Some("overridden by the external \"web\""),
+        ));
+        assert!(
+            d.disabled,
+            "an overridden built-in must render disabled/dimmed"
+        );
+        let reason = d
+            .reason
+            .as_deref()
+            .expect("an overridden built-in must surface a reason");
+        assert!(
+            reason.contains("overridden"),
+            "reason explains the override: {reason}"
+        );
+        assert!(
+            reason.contains("web"),
+            "reason names the overriding server: {reason}"
+        );
+        assert_eq!(d.chip, "built-in");
+    }
 }
