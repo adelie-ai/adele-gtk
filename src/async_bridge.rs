@@ -176,10 +176,17 @@ async fn start_mcp_host() -> Option<McpHost> {
         .into_iter()
         .cloned()
         .collect();
-    if servers.is_empty() {
+    // Compiled-in built-ins (da#538 Phase C): host the core MCP set in-process,
+    // suppressing any built-in whose name a configured client-mcp server already
+    // provides (external overrides built-in). Named `mcp_builtins` to avoid
+    // colliding with the voice-mode client-tool `builtins` used elsewhere.
+    let configured: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+    let mcp_builtins = crate::builtins::builtin_servers(&configured);
+    // Host if there is anything to host (configured servers OR built-ins).
+    if servers.is_empty() && mcp_builtins.is_empty() {
         None
     } else {
-        Some(McpHost::start(&servers).await)
+        Some(McpHost::start_with(&servers, mcp_builtins).await)
     }
 }
 

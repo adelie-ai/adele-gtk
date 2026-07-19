@@ -9,6 +9,8 @@
 
 mod assets;
 mod async_bridge;
+// Compiled-in core MCP servers hosted in-process (da#538 Phase C).
+mod builtins;
 // Avatar data-URI helpers feed the WebView chat renderer; the Label fallback
 // (`--no-default-features`) draws plain text and never references them.
 #[cfg(feature = "linux")]
