@@ -23,6 +23,8 @@
 //! leaves the shared definition enabled, so turning a server off in gtk never
 //! disables it for another surface sharing the same `client-mcp.toml`.
 
+use std::collections::HashMap;
+
 use client_ui_common::{ClientServerDto, Runner};
 use desktop_assistant_client_common::mcp_host::{ClientMcpConfig, McpServerConfig};
 use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
@@ -83,20 +85,27 @@ fn hosted_by_gtk(server: &McpServerConfig, gtk_enabled: &[String]) -> bool {
 ///
 /// Transport is taken honestly from the definition (`http` table present ⇒
 /// `"http"`, else `"stdio"`); status is the coarse `"enabled"`/`"disabled"` the
-/// gtk surface sees. `tool_count` is `0` for now — a live client tool count is a
-/// follow-up (the host would have to report per-server tool totals).
-pub fn client_server_dtos(cfg: &ClientMcpConfig) -> Vec<ClientServerDto> {
+/// gtk surface sees. `tool_count` is the live per-server total from the running
+/// [`McpHost`](desktop_assistant_client_common::mcp_host::McpHost), looked up in
+/// `counts` by the server's **namespace** (`namespace`, or the name when unset) —
+/// the same key the host reports against. It is `0` when the host has not
+/// reported yet (e.g. the panel is opened before a connection) or hosts no tools.
+pub fn client_server_dtos(
+    cfg: &ClientMcpConfig,
+    counts: &HashMap<String, u32>,
+) -> Vec<ClientServerDto> {
     let gtk_enabled = cfg.surface_enabled_names(GTK_SURFACE);
     cfg.list_defined_servers()
         .iter()
         .map(|s| {
             let transport = if s.http.is_some() { "http" } else { "stdio" };
             let on = hosted_by_gtk(s, gtk_enabled);
+            let namespace = s.namespace.clone().unwrap_or_else(|| s.name.clone());
             ClientServerDto {
                 name: s.name.clone(),
                 transport: transport.to_string(),
                 status: if on { "enabled" } else { "disabled" }.to_string(),
-                tool_count: 0,
+                tool_count: counts.get(&namespace).copied().unwrap_or(0),
             }
         })
         .collect()
@@ -256,7 +265,7 @@ url = "https://x.example/mcp"
 [surfaces.gtk]
 enabled = ["files", "remote"]
 "#);
-        let dtos = client_server_dtos(&c);
+        let dtos = client_server_dtos(&c, &HashMap::new());
         let files = dtos.iter().find(|d| d.name == "files").expect("files row");
         let remote = dtos
             .iter()
@@ -287,7 +296,7 @@ command = "c"
 [surfaces.gtk]
 enabled = ["on", "def-off"]
 "#);
-        let dtos = client_server_dtos(&c);
+        let dtos = client_server_dtos(&c, &HashMap::new());
         let status = |name: &str| {
             dtos.iter()
                 .find(|d| d.name == name)
@@ -304,7 +313,47 @@ enabled = ["on", "def-off"]
 
     #[test]
     fn client_dtos_empty_config_is_empty() {
-        assert!(client_server_dtos(&ClientMcpConfig::default()).is_empty());
+        assert!(client_server_dtos(&ClientMcpConfig::default(), &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn client_dto_tool_count_comes_from_counts_by_namespace() {
+        let c = cfg(r#"
+[[servers]]
+name = "files"
+command = "fileio-mcp"
+namespace = "fs"
+
+[[servers]]
+name = "git"
+command = "git-mcp"
+
+[surfaces.gtk]
+enabled = ["files", "git"]
+"#);
+        // The host reports counts keyed by namespace, or by name when a server
+        // declares none.
+        let mut counts = HashMap::new();
+        counts.insert("fs".to_string(), 3u32);
+        counts.insert("git".to_string(), 2u32);
+        let dtos = client_server_dtos(&c, &counts);
+        let files = dtos.iter().find(|d| d.name == "files").expect("files row");
+        let git = dtos.iter().find(|d| d.name == "git").expect("git row");
+        assert_eq!(files.tool_count, 3, "keyed by the namespace 'fs'");
+        assert_eq!(git.tool_count, 2, "keyed by the name when no namespace");
+    }
+
+    #[test]
+    fn client_dto_tool_count_defaults_zero_when_host_has_not_reported() {
+        let c = cfg(r#"
+[[servers]]
+name = "files"
+command = "fileio-mcp"
+[surfaces.gtk]
+enabled = ["files"]
+"#);
+        // Empty map (host not connected / no tools) -> 0 rather than a panic.
+        assert_eq!(client_server_dtos(&c, &HashMap::new())[0].tool_count, 0);
     }
 
     // --- client_row_enabled ---------------------------------------------------
@@ -346,7 +395,7 @@ enabled = ["on", "def-off"]
 
         assert_eq!(c.list_defined_servers().len(), 1);
         assert_eq!(c.surface_enabled_names(GTK_SURFACE), &["files"]);
-        assert_eq!(client_server_dtos(&c)[0].status, "enabled");
+        assert_eq!(client_server_dtos(&c, &HashMap::new())[0].status, "enabled");
     }
 
     #[test]
@@ -367,7 +416,10 @@ enabled = ["files"]
                 .iter()
                 .any(|n| n == "files")
         );
-        assert_eq!(client_server_dtos(&c)[0].status, "disabled");
+        assert_eq!(
+            client_server_dtos(&c, &HashMap::new())[0].status,
+            "disabled"
+        );
     }
 
     #[test]
@@ -416,7 +468,10 @@ enabled = ["files"]
         // Off: dropped from the gtk surface, but the DEFINITION stays enabled
         // (surface-scoped disable — see the asymmetric toggle).
         apply_client_toggle(&mut c, "files", false).expect("toggle off");
-        assert_eq!(client_server_dtos(&c)[0].status, "disabled");
+        assert_eq!(
+            client_server_dtos(&c, &HashMap::new())[0].status,
+            "disabled"
+        );
         assert!(
             c.list_defined_servers()
                 .iter()
@@ -433,7 +488,7 @@ enabled = ["files"]
 
         // On again: back in the gtk surface (and the definition is on).
         apply_client_toggle(&mut c, "files", true).expect("toggle on");
-        assert_eq!(client_server_dtos(&c)[0].status, "enabled");
+        assert_eq!(client_server_dtos(&c, &HashMap::new())[0].status, "enabled");
         assert!(
             c.surface_enabled_names(GTK_SURFACE)
                 .iter()
@@ -503,7 +558,7 @@ enabled = false
                 .iter()
                 .any(|n| n == "files")
         );
-        assert_eq!(client_server_dtos(&c)[0].status, "enabled");
+        assert_eq!(client_server_dtos(&c, &HashMap::new())[0].status, "enabled");
     }
 
     #[test]

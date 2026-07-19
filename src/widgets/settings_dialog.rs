@@ -18,9 +18,10 @@
 //! `ModelPicker` filters out.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use client_ui_common::Runner;
 use desktop_assistant_api_model as api;
@@ -122,6 +123,11 @@ fn confirm<F>(
 /// caller owns): they drive the MCP panel's runner chip so a daemon row on a
 /// remote WebSocket link reads `daemon · <host>` and a co-located one reads
 /// `daemon`.
+///
+/// `client_tool_counts` is the window-owned cell the connection manager fills
+/// from the running `McpHost` (per namespace); the MCP panel reads a snapshot of
+/// it when it builds its client rows so each shows a live tool count
+/// (adele-gtk#125). It is empty (rows show 0) until the host has started.
 pub fn show_settings_dialog(
     parent: &impl IsA<Window>,
     transport: Arc<Connector>,
@@ -129,6 +135,7 @@ pub fn show_settings_dialog(
     voice: VoiceController,
     daemon_is_remote: bool,
     daemon_host: Option<String>,
+    client_tool_counts: Arc<Mutex<HashMap<String, u32>>>,
 ) {
     let dialog = Window::builder()
         .title("Settings")
@@ -554,6 +561,7 @@ pub fn show_settings_dialog(
         Rc::clone(&status_label),
         Rc::clone(&client_config),
         Rc::clone(&client_mcp_path),
+        Arc::clone(&client_tool_counts),
         daemon_is_remote,
         daemon_host.clone(),
     );
@@ -788,7 +796,9 @@ pub fn show_settings_dialog(
 ///
 /// The client config is loaded on the runtime (a file read must not block the
 /// main loop), cached for client-row edits, and projected to the panel's client
-/// rows. `daemon_is_remote`/`daemon_host` drive the daemon rows' runner chip.
+/// rows — with a snapshot of `client_tool_counts` (namespace -> live tool total)
+/// so each client row shows a real count. `daemon_is_remote`/`daemon_host` drive
+/// the daemon rows' runner chip.
 #[allow(clippy::too_many_arguments)]
 fn mcp_refresh_closure(
     transport: Arc<Connector>,
@@ -798,6 +808,7 @@ fn mcp_refresh_closure(
     status_label: Rc<Label>,
     client_config: Rc<RefCell<ClientMcpConfig>>,
     client_mcp_path: Rc<PathBuf>,
+    client_tool_counts: Arc<Mutex<HashMap<String, u32>>>,
     daemon_is_remote: bool,
     daemon_host: Option<String>,
 ) -> Rc<dyn Fn()> {
@@ -807,6 +818,7 @@ fn mcp_refresh_closure(
         let service_accounts = Rc::clone(&service_accounts);
         let status_label = Rc::clone(&status_label);
         let client_config = Rc::clone(&client_config);
+        let client_tool_counts = Arc::clone(&client_tool_counts);
         let path = (*client_mcp_path).clone();
         let daemon_host = daemon_host.clone();
         #[allow(clippy::type_complexity)]
@@ -842,7 +854,11 @@ fn mcp_refresh_closure(
                         Vec::new()
                     }
                 };
-                let client_rows = mcp_admin::client_server_dtos(&cfg);
+                // Snapshot the live per-server tool counts (a quick lock+clone on
+                // the main thread; never held across an await) so client rows show
+                // a real count instead of 0.
+                let counts = client_tool_counts.lock().unwrap().clone();
+                let client_rows = mcp_admin::client_server_dtos(&cfg, &counts);
                 mcp_tab.set_data(
                     &daemon_views,
                     &client_rows,
