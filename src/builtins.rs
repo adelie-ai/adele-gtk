@@ -6,13 +6,71 @@
 //! built-in: external > built-in.
 
 use desktop_assistant_client_common::mcp_host::BuiltinServer;
+#[cfg(any(
+    feature = "mcp-fileio",
+    feature = "mcp-terminal",
+    feature = "mcp-tasks",
+    feature = "mcp-web"
+))]
+use std::sync::Arc;
 
 /// Build the enabled built-in servers, skipping any whose name is shadowed by a
 /// configured client-mcp server of the same name (external override wins).
+///
+/// Each `#[cfg]` block compiles in only when its `mcp-*` feature is on, so a
+/// `--no-default-features` build hosts nothing and gtk behaves as it did before
+/// Phase C. The infallible constructors (fileio, web) are always registered;
+/// the fallible ones (terminal, tasks) are logged and skipped if their
+/// zero-config constructor fails, so a broken environment degrades to the
+/// remaining tools rather than losing the whole set.
 pub fn builtin_servers(configured_names: &[String]) -> Vec<BuiltinServer> {
-    // Stub: the real cfg-gated registration lands in the implementation commit.
-    let _ = configured_names;
-    Vec::new()
+    // Unused only when every mcp-* feature is off (`--no-default-features`),
+    // where no built-in is compiled in to consult it.
+    #[cfg_attr(
+        not(any(
+            feature = "mcp-fileio",
+            feature = "mcp-terminal",
+            feature = "mcp-tasks",
+            feature = "mcp-web"
+        )),
+        allow(unused_variables)
+    )]
+    let shadowed = |name: &str| configured_names.iter().any(|n| n == name);
+    #[allow(unused_mut)]
+    let mut out: Vec<BuiltinServer> = Vec::new();
+
+    #[cfg(feature = "mcp-fileio")]
+    if !shadowed("fileio") {
+        out.push(BuiltinServer::new(
+            "fileio",
+            "fileio",
+            Arc::new(fileio_mcp::build_service()),
+        ));
+    }
+    #[cfg(feature = "mcp-terminal")]
+    if !shadowed("terminal") {
+        match terminal_mcp::build_service() {
+            Ok(svc) => out.push(BuiltinServer::new("terminal", "terminal", Arc::new(svc))),
+            Err(e) => tracing::warn!("built-in terminal server unavailable: {e}"),
+        }
+    }
+    #[cfg(feature = "mcp-tasks")]
+    if !shadowed("tasks") {
+        match tasks_mcp::build_service() {
+            Ok(svc) => out.push(BuiltinServer::new("tasks", "tasks", Arc::new(svc))),
+            Err(e) => tracing::warn!("built-in tasks server unavailable: {e}"),
+        }
+    }
+    #[cfg(feature = "mcp-web")]
+    if !shadowed("web") {
+        out.push(BuiltinServer::new(
+            "web",
+            "web",
+            Arc::new(web_mcp::build_service()),
+        ));
+    }
+
+    out
 }
 
 #[cfg(test)]
