@@ -1,13 +1,18 @@
 //! MCP-servers tab of the Settings dialog (issue #495; merged runner panel #122).
 //!
 //! Shows one list of the Model Context Protocol servers the user can administer,
-//! merging two populations: the **daemon** fleet (`ListMcpServers`) and this
-//! **client**'s locally-hosted servers (`client-mcp.toml`). Each row carries a
-//! runner chip ("daemon"/"client"), an honest transport chip ("stdio"/"http"),
-//! an *honest* per-server status, an enable/disable toggle, add/edit, and remove.
-//! A daemon OAuth server that needs sign-in also gets a Configure/Sign-in button;
-//! client servers have no daemon-driven OAuth, so they never show one. A filter
-//! dropdown (All / Daemon / Client) re-projects the same data without a re-fetch.
+//! merging three populations: the **daemon** fleet (`ListMcpServers`), this
+//! **client**'s locally-hosted servers (`client-mcp.toml`), and the client's
+//! compiled-in **built-in** servers hosted in-process (da#538). Each row carries a
+//! runner chip ("daemon"/"client"), a kind/transport chip ("stdio"/"http"/
+//! "built-in"), an *honest* per-server status, an enable/disable toggle, add/edit,
+//! and remove. A daemon OAuth server that needs sign-in also gets a Configure/
+//! Sign-in button; client servers have no daemon-driven OAuth, so they never show
+//! one. Built-in rows are informational only: they are hosted inside this client
+//! and present in neither config list, so they render read-only (no toggle/edit/
+//! remove) and, when an external server of the same name overrides one, disabled
+//! with an "overridden by ..." reason. A filter dropdown (All / Daemon / Client)
+//! re-projects the same data without a re-fetch; built-ins ride the Client filter.
 //!
 //! Like [`super::connections_tab`] it is a passive view: it renders the merged
 //! rows and asks the parent (the Settings dialog) to perform the actual work via
@@ -16,16 +21,17 @@
 //! async bridge, and the on-disk client config.
 //!
 //! The merge/sort/filter/label logic is the shared, unit-tested view-model in
-//! `client-ui-common` ([`server_rows`], [`filter_rows`], [`runner_label`],
-//! [`transport_chip`]); the status -> (dot colour, label) mapping is the small
-//! pure helper below. The row-building GTK code is the thin shell over them.
+//! `client-ui-common` ([`server_rows_with_builtins`], [`filter_rows`],
+//! [`runner_label`], [`kind_label`]); the status -> (dot colour, label) mapping
+//! and the built-in row's display decision ([`builtin_row_display`]) are the small
+//! pure helpers below. The row-building GTK code is the thin shell over them.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use client_ui_common::{
-    ClientServerDto, Runner, RunnerFilter, ServerRow, filter_rows, runner_label, server_rows,
-    transport_chip,
+    BuiltinServerDto, ClientServerDto, Runner, RunnerFilter, ServerKind, ServerRow, filter_rows,
+    kind_label, runner_label, server_rows_with_builtins, transport_chip,
 };
 use desktop_assistant_api_model as api;
 use gtk4::prelude::*;
@@ -296,23 +302,27 @@ impl McpServersTab {
             .collect()
     }
 
-    /// Replace the list contents with the merged daemon + client populations.
+    /// Replace the list contents with the merged daemon + client + built-in
+    /// populations.
     ///
     /// `daemon` are the daemon fleet's views; `client` the local client-hosted
-    /// rows; `is_remote`/`host` describe the client's link to the daemon (for the
-    /// runner chip). The rows are merged + sorted by the shared view-model and
-    /// re-rendered through the active filter.
+    /// rows; `builtins` the client's compiled-in in-process servers (da#538);
+    /// `is_remote`/`host` describe the client's link to the daemon (for the runner
+    /// chip). The rows are merged + sorted by the shared view-model and re-rendered
+    /// through the active filter. Built-in rows are tagged [`Runner::Client`] and
+    /// [`ServerKind::BuiltIn`], so they ride the Client filter and render read-only.
     pub fn set_data(
         &self,
         daemon: &[api::McpServerView],
         client: &[ClientServerDto],
+        builtins: &[BuiltinServerDto],
         is_remote: bool,
         host: Option<&str>,
     ) {
         *self.daemon.borrow_mut() = daemon.to_vec();
         // The render closure owns Rc clones of these same cells; mutate them then
         // render so set_data and the filter handler stay in lockstep.
-        *self.rows.borrow_mut() = server_rows(daemon, client);
+        *self.rows.borrow_mut() = server_rows_with_builtins(daemon, client, builtins);
         self.is_remote.set(is_remote);
         *self.host.borrow_mut() = host.map(str::to_string);
         (self.render)();
@@ -333,6 +343,14 @@ fn build_row_widget(
     on_remove: &Rc<RefCell<Option<NameCb>>>,
     on_signin: &Rc<RefCell<Option<SignInCb>>>,
 ) -> ListBoxRow {
+    // Built-in (in-process) rows are informational: hosted inside this client and
+    // present in neither the daemon fleet nor client-mcp.toml, so they render
+    // read-only (no toggle/edit/remove, which index into those config lists) with
+    // a "built-in" kind chip, and disabled when overridden (da#538 Phase D).
+    if row.kind == ServerKind::BuiltIn {
+        return build_builtin_row_widget(row);
+    }
+
     // Daemon rows carry extra fields on their view; client rows don't.
     let view = if row.runner == Runner::Daemon {
         daemon.iter().find(|s| s.name == row.name)
@@ -498,6 +516,120 @@ fn build_row_widget(
     list_row
 }
 
+/// Pure display decision for a built-in [`ServerRow`]: the kind chip text
+/// ([`kind_label`]), the optional override reason, and whether the row renders
+/// disabled/dimmed. Kept GTK-free so the overridden/disabled decision is
+/// unit-testable without a display.
+struct BuiltinRowDisplay {
+    /// The kind chip text — `"built-in"` for a built-in row.
+    chip: &'static str,
+    /// `Some(reason)` when an external server of the same name overrides this
+    /// built-in (so it renders disabled); `None` when it is active.
+    reason: Option<String>,
+    /// Whether the row renders disabled/dimmed (true iff overridden).
+    disabled: bool,
+}
+
+/// Build the display decision for a built-in row: its kind chip, and — when an
+/// external server of the same name shadows it — the override reason plus the
+/// disabled flag that dims the whole row.
+fn builtin_row_display(row: &ServerRow) -> BuiltinRowDisplay {
+    BuiltinRowDisplay {
+        chip: kind_label(row.kind),
+        reason: row.disabled_reason.clone(),
+        disabled: row.disabled_reason.is_some(),
+    }
+}
+
+/// Build one read-only widget for a built-in (in-process) [`ServerRow`].
+///
+/// Built-ins are hosted inside this client and present in neither config list, so
+/// the row is informational: a status dot, the name, a runner chip ("client"), a
+/// "built-in" kind chip, and a status subtitle with the tool count. When an
+/// external server of the same name overrides it, the whole row renders dimmed
+/// (`mcp-row-disabled`) and a `dim-label` line (also a tooltip) surfaces the
+/// "overridden by ..." reason. It is deliberately never wired to the toggle/edit/
+/// remove actions, which index into the daemon/client config lists.
+fn build_builtin_row_widget(row: &ServerRow) -> ListBoxRow {
+    let display = builtin_row_display(row);
+
+    let list_row = ListBoxRow::new();
+    list_row.set_selectable(false);
+    if display.disabled {
+        list_row.add_css_class("mcp-row-disabled");
+    }
+
+    let hbox = GtkBox::new(Orientation::Horizontal, 12);
+    hbox.set_margin_start(10);
+    hbox.set_margin_end(10);
+    hbox.set_margin_top(8);
+    hbox.set_margin_bottom(8);
+
+    // Status dot: an active built-in reads green ("running"); an overridden one
+    // reads neutral ("disabled"), from the same status map the other rows use.
+    let (dot_class, status_label) = status_display(&row.status);
+    let dot = Label::new(None);
+    dot.add_css_class("mcp-dot");
+    dot.add_css_class(dot_class);
+    dot.set_width_chars(2);
+    dot.set_valign(Align::Start);
+    dot.set_margin_top(4);
+    hbox.append(&dot);
+
+    let text_col = GtkBox::new(Orientation::Vertical, 2);
+    text_col.set_hexpand(true);
+
+    let title_row = GtkBox::new(Orientation::Horizontal, 6);
+    // Server-provided text: rendered as plain text (never markup).
+    let name_label = Label::new(Some(&row.name));
+    name_label.set_halign(Align::Start);
+    name_label.add_css_class("heading");
+    title_row.append(&name_label);
+
+    // Runner chip: built-ins always run in the client, so is_remote/host are
+    // irrelevant (runner_label ignores them for a client row).
+    let runner_chip = Label::new(Some(&runner_label(row.runner, false, None)));
+    runner_chip.add_css_class("mcp-runner-chip");
+    runner_chip.set_valign(Align::Center);
+    title_row.append(&runner_chip);
+
+    // Kind chip: names the in-process "built-in" kind (kind_label(row.kind)).
+    let kind_chip = Label::new(Some(display.chip));
+    kind_chip.add_css_class("mcp-kind-chip");
+    kind_chip.set_valign(Align::Center);
+    title_row.append(&kind_chip);
+    text_col.append(&title_row);
+
+    // Subtitle: status label (+ tool count when the built-in advertises tools).
+    let mut subtitle = status_label.to_string();
+    if row.tool_count > 0 {
+        let n = row.tool_count;
+        subtitle.push_str(&format!(" · {n} tool{}", if n == 1 { "" } else { "s" }));
+    }
+    let subtitle_label = Label::new(Some(&subtitle));
+    subtitle_label.set_halign(Align::Start);
+    subtitle_label.set_wrap(true);
+    subtitle_label.set_xalign(0.0);
+    subtitle_label.add_css_class("dim-label");
+    text_col.append(&subtitle_label);
+
+    // Override reason (only when a same-named external server shadows this
+    // built-in): a dim line — and tooltip — surfacing *why* it is disabled.
+    if let Some(reason) = display.reason.as_ref() {
+        let reason_label = Label::new(Some(reason));
+        reason_label.set_halign(Align::Start);
+        reason_label.set_wrap(true);
+        reason_label.set_xalign(0.0);
+        reason_label.add_css_class("dim-label");
+        reason_label.set_tooltip_text(Some(reason));
+        text_col.append(&reason_label);
+    }
+
+    hbox.append(&text_col);
+    list_row.set_child(Some(&hbox));
+    list_row
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,7 +688,12 @@ mod tests {
             name: name.into(),
             runner: Runner::Client,
             transport: "builtin".into(),
-            status: if reason.is_some() { "disabled" } else { "running" }.into(),
+            status: if reason.is_some() {
+                "disabled"
+            } else {
+                "running"
+            }
+            .into(),
             tool_count,
             detail: None,
             kind: client_ui_common::ServerKind::BuiltIn,

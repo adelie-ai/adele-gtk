@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use client_ui_common::Runner;
+use client_ui_common::{BuiltinServerDto, Runner};
 use desktop_assistant_api_model as api;
 use desktop_assistant_client_common::Connector;
 use desktop_assistant_client_common::mcp_host::{ClientMcpConfig, default_client_mcp_path};
@@ -128,6 +128,14 @@ fn confirm<F>(
 /// from the running `McpHost` (per namespace); the MCP panel reads a snapshot of
 /// it when it builds its client rows so each shows a live tool count
 /// (adele-gtk#125). It is empty (rows show 0) until the host has started.
+///
+/// `mcp_builtin_dtos` is the window-owned cell the connection manager fills once
+/// from the running `McpHost::builtin_status()` (da#538 Phase D); the MCP panel
+/// reads a snapshot when it builds its rows so the client's compiled-in built-in
+/// servers (and any shadowed by an external server of the same name) render
+/// alongside the daemon/client rows. It is empty until the host has started, or
+/// when built-ins are compiled out.
+#[allow(clippy::too_many_arguments)]
 pub fn show_settings_dialog(
     parent: &impl IsA<Window>,
     transport: Arc<Connector>,
@@ -136,6 +144,7 @@ pub fn show_settings_dialog(
     daemon_is_remote: bool,
     daemon_host: Option<String>,
     client_tool_counts: Arc<Mutex<HashMap<String, u32>>>,
+    mcp_builtin_dtos: Arc<Mutex<Vec<BuiltinServerDto>>>,
 ) {
     let dialog = Window::builder()
         .title("Settings")
@@ -562,6 +571,7 @@ pub fn show_settings_dialog(
         Rc::clone(&client_config),
         Rc::clone(&client_mcp_path),
         Arc::clone(&client_tool_counts),
+        Arc::clone(&mcp_builtin_dtos),
         daemon_is_remote,
         daemon_host.clone(),
     );
@@ -797,8 +807,9 @@ pub fn show_settings_dialog(
 /// The client config is loaded on the runtime (a file read must not block the
 /// main loop), cached for client-row edits, and projected to the panel's client
 /// rows — with a snapshot of `client_tool_counts` (namespace -> live tool total)
-/// so each client row shows a real count. `daemon_is_remote`/`daemon_host` drive
-/// the daemon rows' runner chip.
+/// so each client row shows a real count. The client's compiled-in built-ins are
+/// merged in from a snapshot of `mcp_builtin_dtos` (da#538 Phase D).
+/// `daemon_is_remote`/`daemon_host` drive the daemon rows' runner chip.
 #[allow(clippy::too_many_arguments)]
 fn mcp_refresh_closure(
     transport: Arc<Connector>,
@@ -809,6 +820,7 @@ fn mcp_refresh_closure(
     client_config: Rc<RefCell<ClientMcpConfig>>,
     client_mcp_path: Rc<PathBuf>,
     client_tool_counts: Arc<Mutex<HashMap<String, u32>>>,
+    mcp_builtin_dtos: Arc<Mutex<Vec<BuiltinServerDto>>>,
     daemon_is_remote: bool,
     daemon_host: Option<String>,
 ) -> Rc<dyn Fn()> {
@@ -819,6 +831,7 @@ fn mcp_refresh_closure(
         let status_label = Rc::clone(&status_label);
         let client_config = Rc::clone(&client_config);
         let client_tool_counts = Arc::clone(&client_tool_counts);
+        let mcp_builtin_dtos = Arc::clone(&mcp_builtin_dtos);
         let path = (*client_mcp_path).clone();
         let daemon_host = daemon_host.clone();
         #[allow(clippy::type_complexity)]
@@ -859,9 +872,13 @@ fn mcp_refresh_closure(
                 // a real count instead of 0.
                 let counts = client_tool_counts.lock().unwrap().clone();
                 let client_rows = mcp_admin::client_server_dtos(&cfg, &counts);
+                // Snapshot the client's compiled-in built-ins the same way, so
+                // they merge into the panel as read-only rows (da#538 Phase D).
+                let builtins = mcp_builtin_dtos.lock().unwrap().clone();
                 mcp_tab.set_data(
                     &daemon_views,
                     &client_rows,
+                    &builtins,
                     daemon_is_remote,
                     daemon_host.as_deref(),
                 );

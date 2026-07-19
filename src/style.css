@@ -353,6 +353,25 @@ entry:focus {
     color: #84dac1; /* brand teal */
 }
 
+/* Kind chip (da#538): a filled pill naming an in-process "built-in" server, in a
+   secondary accent (header blue) so it reads distinctly from the teal runner chip
+   beside it. Only built-in rows carry it; external rows use the outlined
+   transport chip above. */
+.mcp-kind-chip {
+    font-size: 11px;
+    padding: 0 6px;
+    border-radius: 6px;
+    background-color: alpha(#88d6f0, 0.16);
+    color: #88d6f0; /* header blue */
+}
+
+/* Overridden built-in row (da#538): a built-in shadowed by an external server of
+   the same name is informational and inactive, so the whole row dims. Opacity is
+   theme-neutral, so light mode re-asserts it unchanged. */
+.mcp-row-disabled {
+    opacity: 0.55;
+}
+
 /* Last-connect error / validation error text. */
 .mcp-error-label {
     color: #d9534f;
