@@ -9,8 +9,19 @@ name = "adele-gtk"
 path = "src/main.rs"
 
 [features]
-default = ["linux"]
+default = ["linux", "builtin-core"]
 linux = ["dep:webkit6", "desktop-assistant-client-common/dbus"]
+
+# The core built-in MCP set is compiled in and hosted in-process by default, so
+# a fresh gtk client is useful with no client-mcp.toml (da#538 Phase C). Turn a
+# server off with e.g. `--no-default-features --features linux,mcp-fileio`, or
+# drop them all with `--no-default-features` (gtk then behaves exactly as it did
+# before this feature — client-mcp.toml servers only).
+builtin-core = ["mcp-fileio", "mcp-terminal", "mcp-tasks", "mcp-web"]
+mcp-fileio = ["dep:fileio-mcp"]
+mcp-terminal = ["dep:terminal-mcp"]
+mcp-tasks = ["dep:tasks-mcp"]
+mcp-web = ["dep:web-mcp"]
 
 [dependencies]
 anyhow = "1"
@@ -48,6 +59,17 @@ rustls = { version = "0.23.37", features = ["ring"] }
 # track the XDG Settings portal `color-scheme` preference live. The `tokio`
 # feature matches the runtime the portal task is spawned on.
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+# Compiled-in ("built-in") MCP servers hosted in-process (da#538 Phase C). Each
+# core server lib exposes `build_service()`; gtk hosts them via
+# `McpHost::start_with` so a fresh client has core tools with no client-mcp.toml.
+# Optional + feature-gated (see `[features]`) so a `--no-default-features` build
+# links none of them and behaves exactly as before. Sibling path-deps, matching
+# how the desktop-assistant crates are path-depped above.
+fileio-mcp = { path = "../fileio-mcp", optional = true }
+terminal-mcp = { path = "../terminal-mcp", optional = true }
+tasks-mcp = { path = "../tasks-mcp", optional = true }
+web-mcp = { path = "../web-mcp", optional = true }
 
 [dependencies.webkit6]
 version = "0.6"
@@ -99,6 +121,18 @@ path = "../voice/crates/stt-whisper"
 # its `SentenceBuffer`. Same `../voice` symlink path-dep as the module above.
 [dependencies.adele-voice-client-common]
 path = "../voice/crates/client-voice"
+
+# Collapse mcp-core to a SINGLE source. client-common pins it to a git rev while
+# the built-in server libs (fileio/terminal/tasks/web) float the git dep; two
+# git sources would split `mcp_core::McpService` into incompatible types (E0308)
+# when a built-in's `Arc<dyn McpService>` is handed to `BuiltinServer::new`.
+# Patching the URL to the local checkout resolves every consumer to one
+# mcp-core. `../mcp-core` is a superset of the pinned rev (only security/CLI
+# hardening + docs ahead; the `McpService` trait is byte-identical), so the API
+# client-common compiles against is unchanged. gtk already path-deps the
+# desktop-assistant crates the same way (Option D above).
+[patch."https://github.com/adelie-ai/mcp-core"]
+mcp-core = { path = "../mcp-core" }
 
 [lints.rust]
 warnings = "deny"
