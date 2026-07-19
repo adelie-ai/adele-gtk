@@ -383,7 +383,7 @@ enabled = ["files"]
     // --- apply_client_toggle / remove ----------------------------------------
 
     #[test]
-    fn apply_client_toggle_flips_both_grains() {
+    fn apply_client_toggle_off_then_on_round_trips_status() {
         let mut c = cfg(r#"
 [[servers]]
 name = "files"
@@ -391,24 +391,108 @@ command = "fileio-mcp"
 [surfaces.gtk]
 enabled = ["files"]
 "#);
+        // Off: dropped from the gtk surface, but the DEFINITION stays enabled
+        // (surface-scoped disable — see the asymmetric toggle).
         apply_client_toggle(&mut c, "files", false).expect("toggle off");
         assert_eq!(client_server_dtos(&c)[0].status, "disabled");
         assert!(
-            !c.list_defined_servers()
+            c.list_defined_servers()
                 .iter()
                 .find(|s| s.name == "files")
                 .unwrap()
-                .enabled
+                .enabled,
+            "a surface-scoped disable must leave the definition enabled"
+        );
+        assert!(
+            !c.surface_enabled_names(GTK_SURFACE)
+                .iter()
+                .any(|n| n == "files")
         );
 
+        // On again: back in the gtk surface (and the definition is on).
         apply_client_toggle(&mut c, "files", true).expect("toggle on");
+        assert_eq!(client_server_dtos(&c)[0].status, "enabled");
+        assert!(
+            c.surface_enabled_names(GTK_SURFACE)
+                .iter()
+                .any(|n| n == "files")
+        );
+    }
+
+    #[test]
+    fn toggle_off_is_surface_scoped_leaving_other_surfaces() {
+        // A server exposed on BOTH gtk and tui: disabling it in gtk must remove
+        // it from the gtk surface ONLY, leaving tui's exposure and the shared
+        // definition intact so the other surface keeps hosting it.
+        let mut c = cfg(r#"
+[[servers]]
+name = "files"
+command = "fileio-mcp"
+[surfaces.gtk]
+enabled = ["files"]
+[surfaces.tui]
+enabled = ["files"]
+"#);
+        apply_client_toggle(&mut c, "files", false).expect("toggle off");
+        // Gone from gtk ...
+        assert!(
+            !c.surface_enabled_names(GTK_SURFACE)
+                .iter()
+                .any(|n| n == "files"),
+            "must be dropped from the gtk surface"
+        );
+        // ... still in tui ...
+        assert!(
+            c.surface_enabled_names("tui").iter().any(|n| n == "files"),
+            "another surface's exposure must be untouched"
+        );
+        // ... and the definition itself is still enabled.
+        assert!(
+            c.list_defined_servers()
+                .iter()
+                .find(|s| s.name == "files")
+                .unwrap()
+                .enabled,
+            "the shared definition must stay enabled for other surfaces"
+        );
+    }
+
+    #[test]
+    fn toggle_on_reenables_globally_disabled_definition() {
+        // Enabling for gtk must also flip a globally-disabled definition back on,
+        // otherwise the surface would list a server the host would never start.
+        let mut c = cfg(r#"
+[[servers]]
+name = "files"
+command = "fileio-mcp"
+enabled = false
+"#);
+        apply_client_toggle(&mut c, "files", true).expect("toggle on");
+        assert!(
+            c.list_defined_servers()
+                .iter()
+                .find(|s| s.name == "files")
+                .unwrap()
+                .enabled,
+            "enabling in gtk must re-enable the definition"
+        );
+        assert!(
+            c.surface_enabled_names(GTK_SURFACE)
+                .iter()
+                .any(|n| n == "files")
+        );
         assert_eq!(client_server_dtos(&c)[0].status, "enabled");
     }
 
     #[test]
     fn apply_client_toggle_unknown_errors() {
+        // Both directions fail closed on an unknown name rather than silently
+        // materializing a gtk surface entry for a server that does not exist.
         let mut c = ClientMcpConfig::default();
         assert!(apply_client_toggle(&mut c, "ghost", true).is_err());
+        assert!(apply_client_toggle(&mut c, "ghost", false).is_err());
+        // The failed off-toggle must not have created a gtk surface entry.
+        assert!(c.surface_enabled_names(GTK_SURFACE).is_empty());
     }
 
     #[test]
