@@ -945,8 +945,9 @@ fn do_client_save(
     });
 }
 
-/// Enable/disable a client-hosted server (both grains) and write the config back
-/// off the main loop, then refresh.
+/// Enable/disable a client-hosted server for the gtk surface (asymmetrically:
+/// enabling sets both grains, disabling is surface-scoped) and write the config
+/// back off the main loop, then refresh.
 fn do_client_toggle(
     bridge: Rc<AsyncBridge>,
     refresh: Rc<dyn Fn()>,

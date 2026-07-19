@@ -17,8 +17,11 @@
 //!   the config is written back atomically.
 //!
 //! The gtk surface exposes a client server iff its definition is `enabled` **and**
-//! the `[surfaces.gtk]` list names it; the panel drives both grains together so
-//! "enabled" in the UI means "gtk actually hosts this".
+//! the `[surfaces.gtk]` list names it, so "enabled" in the UI means "gtk actually
+//! hosts this". The disable toggle is deliberately **asymmetric**: enabling sets
+//! both grains, but disabling touches only the `[surfaces.gtk]` membership and
+//! leaves the shared definition enabled, so turning a server off in gtk never
+//! disables it for another surface sharing the same `client-mcp.toml`.
 
 use client_ui_common::{ClientServerDto, Runner};
 use desktop_assistant_client_common::mcp_host::{ClientMcpConfig, McpServerConfig};
@@ -129,12 +132,31 @@ pub fn apply_client_save(cfg: &mut ClientMcpConfig, mut server: McpServerConfig,
     cfg.set_surface_enabled(GTK_SURFACE, &name, enabled);
 }
 
-/// Enable/disable a client server for the gtk surface: flip both the definition
-/// flag and the surface membership so the two grains stay in lockstep. Errors if
-/// no definition by that name exists (surfaced to the status bar).
+/// Enable/disable a client server **for the gtk surface**, asymmetrically, so one
+/// surface's choice never disturbs another sharing the same `client-mcp.toml`:
+///
+/// - **On:** join the `[surfaces.gtk]` list **and** ensure the definition's own
+///   `enabled` flag is set, so enabling actually results in gtk hosting the
+///   server even if the shared definition had been globally disabled.
+/// - **Off:** drop it from `[surfaces.gtk]` **only**, leaving the definition
+///   enabled so every other surface that lists it keeps hosting it.
+///
+/// Errors (fail-closed) if no definition by that name exists, in either
+/// direction, rather than materializing a gtk surface entry for a phantom server
+/// (the error is surfaced to the status bar).
 pub fn apply_client_toggle(cfg: &mut ClientMcpConfig, name: &str, on: bool) -> Result<(), String> {
-    cfg.set_server_enabled(name, on)?;
-    cfg.set_surface_enabled(GTK_SURFACE, name, on);
+    if on {
+        cfg.set_server_enabled(name, true)?;
+        cfg.set_surface_enabled(GTK_SURFACE, name, true);
+    } else {
+        // Surface-scoped disable: `set_surface_enabled` never errors and would
+        // create a gtk entry for an unknown name, so validate existence first to
+        // preserve the fail-closed contract, then touch only the gtk membership.
+        if !cfg.list_defined_servers().iter().any(|s| s.name == name) {
+            return Err(format!("no such server: {name}"));
+        }
+        cfg.set_surface_enabled(GTK_SURFACE, name, false);
+    }
     Ok(())
 }
 
