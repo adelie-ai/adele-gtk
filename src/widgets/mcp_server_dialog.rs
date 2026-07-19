@@ -354,7 +354,17 @@ impl McpForm {
             validate_name(&name)?;
         }
 
-        let (dto, secret) = match self.transport {
+        // A client-run server is stdio-only: there is no client-side secret store
+        // to hold an http bearer token, so honor the runner over any (stale) http
+        // selection rather than silently dropping the token (adele-gtk#125). The
+        // dialog also forces this in the UI; this keeps the invariant in the pure,
+        // tested path. A daemon server keeps both transports.
+        let transport = match self.runner {
+            Runner::Client => McpTransport::Stdio,
+            Runner::Daemon => self.transport,
+        };
+
+        let (dto, secret) = match transport {
             McpTransport::Stdio => {
                 let command = self.command.trim().to_string();
                 if command.is_empty() {
@@ -618,6 +628,16 @@ pub fn show_mcp_server_dialog<FSave>(
     transport_dd.set_sensitive(!editing);
     content.append(&transport_dd);
 
+    // Client servers are stdio-only (no client-side secret store for an http
+    // bearer token), so for a client runner the transport picker + http fields
+    // are hidden and this hint is shown in their place (adele-gtk#125). Toggled by
+    // `update_visibility` below.
+    let client_transport_hint = Label::new(Some("Client servers run locally over stdio."));
+    client_transport_hint.set_wrap(true);
+    client_transport_hint.set_halign(Align::Start);
+    client_transport_hint.add_css_class("dim-label");
+    content.append(&client_transport_hint);
+
     content.append(&Separator::new(Orientation::Horizontal));
 
     // --- stdio fields ---
@@ -798,11 +818,26 @@ pub fn show_mcp_server_dialog<FSave>(
         let http_box = http_box.clone();
         let bearer_box = bearer_box.clone();
         let oauth_box = oauth_box.clone();
+        let runner_dd = runner_dd.clone();
+        let transport_label = transport_label.clone();
         let transport_dd = transport_dd.clone();
+        let client_transport_hint = client_transport_hint.clone();
         let auth_dd = auth_dd.clone();
         Rc::new(move || {
-            let transport = transport_from_index(transport_dd.selected());
-            let is_http = transport == McpTransport::Http;
+            // A client runner is stdio-only: force stdio and hide the transport
+            // picker + http fields, showing the hint in their place. Forcing the
+            // selection re-enters this closure via the notify handler, which
+            // converges (set_selected is a no-op once the value is already 0).
+            let is_client = runner_from_index(runner_dd.selected()) == Runner::Client;
+            if is_client && transport_dd.selected() != 0 {
+                transport_dd.set_selected(0);
+            }
+            transport_label.set_visible(!is_client);
+            transport_dd.set_visible(!is_client);
+            client_transport_hint.set_visible(is_client);
+
+            let is_http =
+                !is_client && transport_from_index(transport_dd.selected()) == McpTransport::Http;
             stdio_box.set_visible(!is_http);
             http_box.set_visible(is_http);
             let auth = auth_from_index(auth_dd.selected());
@@ -811,6 +846,12 @@ pub fn show_mcp_server_dialog<FSave>(
         })
     };
     update_visibility();
+    // Switching "Runs on" re-applies the client stdio-only constraint.
+    runner_dd.connect_selected_notify(glib::clone!(
+        #[strong]
+        update_visibility,
+        move |_| update_visibility()
+    ));
     transport_dd.connect_selected_notify(glib::clone!(
         #[strong]
         update_visibility,
