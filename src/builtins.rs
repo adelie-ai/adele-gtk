@@ -1,7 +1,11 @@
 //! Compiled-in ("built-in") MCP servers hosted in-process (da#538 Phase C/D).
 //!
 //! The core set (fileio/terminal/tasks/web) is compiled in and hosted by
-//! default so a fresh gtk client is useful with no `client-mcp.toml`. An
+//! default so a fresh gtk client is useful with no `client-mcp.toml`. The
+//! opt-in "broad set" (weather-forecast/internet-radio/openstreetmap/geocode/
+//! skills) is compiled in the same way but is default-OFF: it links and hosts
+//! only when built with the `builtin-extras` feature (or a single `mcp-*` of
+//! it), so the default gtk build is unchanged. An
 //! external client-mcp server of the SAME NAME overrides (suppresses) the
 //! built-in (external > built-in); that override decision now lives centrally in
 //! [`McpHost::start_with`], which skips + logs a shadowed built-in and reports it
@@ -17,7 +21,12 @@ use desktop_assistant_client_common::mcp_host::{BuiltinServer, BuiltinStatus};
     feature = "mcp-fileio",
     feature = "mcp-terminal",
     feature = "mcp-tasks",
-    feature = "mcp-web"
+    feature = "mcp-web",
+    feature = "mcp-weather",
+    feature = "mcp-internet-radio",
+    feature = "mcp-openstreetmap",
+    feature = "mcp-geocode",
+    feature = "mcp-skills"
 ))]
 use std::sync::Arc;
 
@@ -29,10 +38,13 @@ use std::sync::Arc;
 ///
 /// Each `#[cfg]` block compiles in only when its `mcp-*` feature is on, so a
 /// `--no-default-features` build hosts nothing and gtk behaves as it did before
-/// Phase C. The infallible constructors (fileio, web) are always registered;
-/// the fallible ones (terminal, tasks) are logged and skipped if their
-/// zero-config constructor fails, so a broken environment degrades to the
-/// remaining tools rather than losing the whole set.
+/// Phase C. The default build hosts only the core set; the opt-in broad set
+/// (weather-forecast/internet-radio/openstreetmap/geocode/skills) is added only
+/// under the `builtin-extras` feature. The infallible constructors (fileio,
+/// web, and all five broad-set servers) are always registered; the fallible
+/// ones (terminal, tasks) are logged and skipped if their zero-config
+/// constructor fails, so a broken environment degrades to the remaining tools
+/// rather than losing the whole set.
 ///
 /// [`McpHost::start_with`]: desktop_assistant_client_common::mcp_host::McpHost::start_with
 pub fn builtin_servers() -> Vec<BuiltinServer> {
@@ -60,6 +72,43 @@ pub fn builtin_servers() -> Vec<BuiltinServer> {
         "web",
         "web",
         Arc::new(web_mcp::build_service()),
+    ));
+
+    // The opt-in "broad set" (default-off; see the `builtin-extras` feature).
+    // Each is hosted under the SAME namespace its standalone fleet binary uses
+    // (`deploy/mcp/mcp_servers.default.toml`), so a tool's fully qualified name
+    // is identical whether the server is compiled-in here or run externally.
+    // All five have infallible `build_service()`, so each is always registered
+    // when its feature is on (the fileio/web form, not the fallible one).
+    #[cfg(feature = "mcp-weather")]
+    out.push(BuiltinServer::new(
+        "weather-forecast",
+        "weather-forecast",
+        Arc::new(weather_forecast_mcp::build_service()),
+    ));
+    #[cfg(feature = "mcp-internet-radio")]
+    out.push(BuiltinServer::new(
+        "internet-radio",
+        "internet-radio",
+        Arc::new(internet_radio_mcp::build_service()),
+    ));
+    #[cfg(feature = "mcp-openstreetmap")]
+    out.push(BuiltinServer::new(
+        "openstreetmap",
+        "openstreetmap",
+        Arc::new(openstreetmap_mcp::build_service()),
+    ));
+    #[cfg(feature = "mcp-geocode")]
+    out.push(BuiltinServer::new(
+        "geocode",
+        "geocode",
+        Arc::new(geocode_mcp::build_service()),
+    ));
+    #[cfg(feature = "mcp-skills")]
+    out.push(BuiltinServer::new(
+        "skills",
+        "skills",
+        Arc::new(skills_mcp::build_service()),
     ));
 
     out
@@ -131,9 +180,12 @@ mod tests {
             "geocode",
             "skills",
         ] {
-            let server = servers.iter().find(|s| s.namespace == ns).unwrap_or_else(|| {
-                panic!("broad-set built-in '{ns}' must be present with builtin-extras")
-            });
+            let server = servers
+                .iter()
+                .find(|s| s.namespace == ns)
+                .unwrap_or_else(|| {
+                    panic!("broad-set built-in '{ns}' must be present with builtin-extras")
+                });
             assert_eq!(
                 server.name, ns,
                 "a broad-set built-in uses its fleet name for both name and namespace"
