@@ -106,6 +106,41 @@ mod tests {
         );
     }
 
+    /// da#538 "mac broad set": compiled with the opt-in `builtin-extras` feature
+    /// (all five broad-set servers), `builtin_servers()` hosts each one under the
+    /// SAME namespace its standalone fleet binary uses (`weather-forecast`,
+    /// `internet-radio`, `openstreetmap`, `geocode`, `skills`), so a tool's fully
+    /// qualified name is identical whether the server is compiled-in or external.
+    /// All five have infallible `build_service()`, so each is deterministically
+    /// present. Gated behind the five feature flags so the default (core-only)
+    /// build neither compiles nor runs it.
+    #[cfg(all(
+        feature = "mcp-weather",
+        feature = "mcp-internet-radio",
+        feature = "mcp-openstreetmap",
+        feature = "mcp-geocode",
+        feature = "mcp-skills"
+    ))]
+    #[test]
+    fn broad_set_builtins_present_when_extras_enabled() {
+        let servers = builtin_servers();
+        for ns in [
+            "weather-forecast",
+            "internet-radio",
+            "openstreetmap",
+            "geocode",
+            "skills",
+        ] {
+            let server = servers.iter().find(|s| s.namespace == ns).unwrap_or_else(|| {
+                panic!("broad-set built-in '{ns}' must be present with builtin-extras")
+            });
+            assert_eq!(
+                server.name, ns,
+                "a broad-set built-in uses its fleet name for both name and namespace"
+            );
+        }
+    }
+
     /// da#538 Phase D slice 3: the host's per-built-in [`BuiltinStatus`] list maps
     /// to the panel's [`BuiltinServerDto`]s — name/namespace carried through, the
     /// `usize` tool_count widened to `u32`, and `overridden_by` preserved so an
