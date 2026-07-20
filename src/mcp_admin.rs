@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 
-use client_ui_common::{ClientServerDto, Runner};
+use client_ui_common::{BuiltinServerDto, ClientServerDto, Runner};
 use desktop_assistant_client_common::mcp_host::{ClientMcpConfig, McpServerConfig};
 use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
 
@@ -172,6 +172,29 @@ pub fn apply_client_toggle(cfg: &mut ClientMcpConfig, name: &str, on: bool) -> R
 /// Remove a client-server definition (and its membership in every surface).
 pub fn apply_client_remove(cfg: &mut ClientMcpConfig, name: &str) -> Result<(), String> {
     cfg.remove_server(name)
+}
+
+/// Overlay the client config's per-surface `disabled_builtins` set onto a snapshot
+/// of built-in DTOs taken from the running host, re-deriving each row's
+/// `disabled_by_config` from the *current* on-disk config.
+///
+/// Why: the host records which built-ins are disabled once, at start — built-ins
+/// are fixed until the client relaunches — so the [`BuiltinServerDto`] snapshot the
+/// panel holds reflects config-at-start, not later edits. After a live toggle the
+/// panel must re-project each row's disabled flag from the current config so it
+/// shows the *pending* state; the running host still hosts (or omits) the built-in
+/// until restart, so this corrects only the displayed flag, nothing else about the
+/// snapshot (tool count, `overridden_by`) (da#538 slice 4).
+// Spec commit: the refresh consumer lands with the real body in the next commit;
+// this narrow allow is removed there.
+#[allow(dead_code)]
+pub fn apply_builtin_disabled_overlay(
+    cfg: &ClientMcpConfig,
+    surface: &str,
+    builtins: &mut [BuiltinServerDto],
+) {
+    // STUB (spec commit): intentionally does nothing so the tests below fail red.
+    let _ = (cfg, surface, builtins);
 }
 
 /// Parse the dialog's `config_json` (a serialized `McpServerConfig` subset) into
@@ -603,5 +626,85 @@ enabled = ["files"]
     #[test]
     fn parse_server_config_rejects_malformed_json() {
         assert!(parse_server_config("{not json").is_err());
+    }
+
+    // --- apply_builtin_disabled_overlay (da#538 slice 4) ----------------------
+
+    /// A built-in DTO as snapshotted from the running host. `disabled` seeds the
+    /// snapshot's `disabled_by_config` (i.e. the config the host was started with),
+    /// which the overlay re-derives from the *current* config.
+    fn bdto(name: &str, disabled: bool, overridden_by: Option<&str>) -> BuiltinServerDto {
+        BuiltinServerDto {
+            name: name.to_string(),
+            namespace: name.to_string(),
+            tool_count: 5,
+            overridden_by: overridden_by.map(str::to_string),
+            disabled_by_config: disabled,
+        }
+    }
+
+    #[test]
+    fn overlay_flags_disabled_builtins_named_in_the_surface() {
+        let mut c = ClientMcpConfig::default();
+        c.set_builtin_disabled(GTK_SURFACE, "web", true);
+        let mut builtins = vec![bdto("fileio", false, None), bdto("web", false, None)];
+
+        apply_builtin_disabled_overlay(&c, GTK_SURFACE, &mut builtins);
+
+        let fileio = builtins.iter().find(|b| b.name == "fileio").unwrap();
+        let web = builtins.iter().find(|b| b.name == "web").unwrap();
+        assert!(!fileio.disabled_by_config, "unnamed built-in stays enabled");
+        assert!(web.disabled_by_config, "named built-in is flagged disabled");
+    }
+
+    #[test]
+    fn overlay_clears_stale_disabled_flag_when_config_re_enabled() {
+        // The snapshot was taken while "web" was disabled; the user has since
+        // re-enabled it in config. The overlay must clear the stale flag so the
+        // panel shows the pending-enabled state (host still not hosting until
+        // restart, but the display is honest about the config).
+        let c = ClientMcpConfig::default();
+        let mut builtins = vec![bdto("web", true, None)];
+
+        apply_builtin_disabled_overlay(&c, GTK_SURFACE, &mut builtins);
+
+        assert!(
+            !builtins[0].disabled_by_config,
+            "a built-in absent from the current disabled set is re-enabled in the display"
+        );
+    }
+
+    #[test]
+    fn overlay_is_per_surface() {
+        // "terminal" disabled for tui only must not flag the gtk-surface snapshot.
+        let mut c = ClientMcpConfig::default();
+        c.set_builtin_disabled("tui", "terminal", true);
+        let mut builtins = vec![bdto("terminal", false, None)];
+
+        apply_builtin_disabled_overlay(&c, GTK_SURFACE, &mut builtins);
+
+        assert!(
+            !builtins[0].disabled_by_config,
+            "a disable for another surface must not affect this one"
+        );
+    }
+
+    #[test]
+    fn overlay_preserves_override_and_tool_count() {
+        // The overlay corrects only the disabled flag; `overridden_by` and
+        // `tool_count` from the host snapshot are left intact.
+        let mut c = ClientMcpConfig::default();
+        c.set_builtin_disabled(GTK_SURFACE, "web", true);
+        let mut builtins = vec![bdto("web", false, Some("web"))];
+
+        apply_builtin_disabled_overlay(&c, GTK_SURFACE, &mut builtins);
+
+        assert!(builtins[0].disabled_by_config);
+        assert_eq!(
+            builtins[0].overridden_by.as_deref(),
+            Some("web"),
+            "override info from the snapshot is preserved"
+        );
+        assert_eq!(builtins[0].tool_count, 5, "tool count is preserved");
     }
 }

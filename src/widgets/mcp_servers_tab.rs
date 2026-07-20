@@ -541,6 +541,37 @@ fn builtin_row_display(row: &ServerRow) -> BuiltinRowDisplay {
     }
 }
 
+/// The on/off presentation of a built-in row's enable/disable switch, decided
+/// purely from the [`BuiltinServerDto`] so it is unit-testable without a display
+/// (da#538 slice 4).
+// Spec commit: the widget consumer lands with the real body in the next commit;
+// this narrow allow is removed there.
+#[allow(dead_code)]
+struct BuiltinToggleState {
+    /// The switch reads ON when the built-in is enabled in this client's config
+    /// (i.e. NOT `disabled_by_config`) and OFF when it has been turned off.
+    active: bool,
+    /// The switch is interactive unless the built-in is *only* shadowed by a
+    /// same-name external server: that override wins regardless of the toggle, so
+    /// the switch is greyed rather than implying it can countermand the override. A
+    /// config-disabled built-in stays interactive so the user can turn it back on
+    /// (even if it is also overridden).
+    sensitive: bool,
+}
+
+/// Decide the enable/disable switch's `active`/`sensitive` from the built-in's
+/// DTO: on iff enabled in config; interactive unless the row is disabled *only*
+/// because an external server of the same name overrides it.
+#[allow(dead_code)]
+fn builtin_toggle_state(dto: &BuiltinServerDto) -> BuiltinToggleState {
+    // STUB (spec commit): deliberately wrong so the tests below fail red.
+    let _ = dto;
+    BuiltinToggleState {
+        active: false,
+        sensitive: false,
+    }
+}
+
 /// Build one read-only widget for a built-in (in-process) [`ServerRow`].
 ///
 /// Built-ins are hosted inside this client and present in neither config list, so
@@ -736,5 +767,60 @@ mod tests {
             "reason names the overriding server: {reason}"
         );
         assert_eq!(d.chip, "built-in");
+    }
+
+    // --- builtin_toggle_state (da#538 slice 4) --------------------------------
+
+    /// A [`BuiltinServerDto`] with the flags the toggle-state decision reads.
+    fn dto(disabled_by_config: bool, overridden_by: Option<&str>) -> BuiltinServerDto {
+        BuiltinServerDto {
+            name: "web".into(),
+            namespace: "web".into(),
+            tool_count: 3,
+            overridden_by: overridden_by.map(Into::into),
+            disabled_by_config,
+        }
+    }
+
+    #[test]
+    fn toggle_state_enabled_builtin_is_on_and_interactive() {
+        let s = builtin_toggle_state(&dto(false, None));
+        assert!(s.active, "an enabled built-in shows the switch on");
+        assert!(s.sensitive, "an enabled built-in's switch is interactive");
+    }
+
+    #[test]
+    fn toggle_state_config_disabled_builtin_is_off_and_interactive() {
+        let s = builtin_toggle_state(&dto(true, None));
+        assert!(!s.active, "a config-disabled built-in shows the switch off");
+        assert!(
+            s.sensitive,
+            "a config-disabled built-in stays interactive so it can be re-enabled"
+        );
+    }
+
+    #[test]
+    fn toggle_state_overridden_only_builtin_is_on_but_inert() {
+        // Enabled in config but shadowed by a same-name external server: the
+        // switch reads on (it *is* enabled in config) yet is greyed, since the
+        // override wins regardless of the toggle.
+        let s = builtin_toggle_state(&dto(false, Some("web")));
+        assert!(s.active, "an overridden-but-enabled built-in reads on");
+        assert!(
+            !s.sensitive,
+            "a purely-overridden built-in's switch is inert (the override wins)"
+        );
+    }
+
+    #[test]
+    fn toggle_state_config_disabled_and_overridden_stays_interactive() {
+        // Both reasons apply: the config-disable is the user's explicit choice, so
+        // the switch stays interactive (off) so they can turn it back on.
+        let s = builtin_toggle_state(&dto(true, Some("web")));
+        assert!(!s.active, "config-disable shows the switch off");
+        assert!(
+            s.sensitive,
+            "a config-disabled built-in is interactive even when also overridden"
+        );
     }
 }
