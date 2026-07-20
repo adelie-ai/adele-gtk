@@ -200,23 +200,29 @@ fn snapshot_builtin_status(
 /// servers are configured for it. A missing/malformed `client-mcp.toml` resolves
 /// to an empty selection (logged), so this never fails the connection.
 async fn start_mcp_host() -> Option<McpHost> {
-    let servers: Vec<_> = ClientMcpConfig::load(&default_client_mcp_path())
-        .resolved_servers("gtk")
-        .into_iter()
-        .cloned()
-        .collect();
+    let cfg = ClientMcpConfig::load(&default_client_mcp_path());
+    let servers: Vec<_> = cfg.resolved_servers("gtk").into_iter().cloned().collect();
     // Compiled-in built-ins (da#538 Phase C/D): host the full core MCP set
-    // in-process. `McpHost::start_with` centralizes the override, skipping (and
-    // logging) any built-in whose name a configured client-mcp server already
-    // provides, and reports each built-in's status for the F5 panel. Named
-    // `mcp_builtins` to avoid colliding with the voice-mode client-tool
-    // `builtins` used elsewhere.
+    // in-process. `McpHost::start_with_disabled` centralizes the override, skipping
+    // (and logging) any built-in whose name a configured client-mcp server already
+    // provides, AND any built-in the user turned off for this surface via the
+    // config's `disabled_builtins` (da#538 slice 4). It reports each built-in's
+    // status (with the override / config-disable flags) for the F5 panel. Named
+    // `mcp_builtins` to avoid colliding with the voice-mode client-tool `builtins`
+    // used elsewhere.
     let mcp_builtins = crate::builtins::builtin_servers();
     // Host if there is anything to host (configured servers OR built-ins).
     if servers.is_empty() && mcp_builtins.is_empty() {
         None
     } else {
-        Some(McpHost::start_with(&servers, mcp_builtins).await)
+        Some(
+            McpHost::start_with_disabled(
+                &servers,
+                mcp_builtins,
+                cfg.surface_disabled_builtins("gtk"),
+            )
+            .await,
+        )
     }
 }
 

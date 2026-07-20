@@ -8,10 +8,11 @@
 //! "built-in"), an *honest* per-server status, an enable/disable toggle, add/edit,
 //! and remove. A daemon OAuth server that needs sign-in also gets a Configure/
 //! Sign-in button; client servers have no daemon-driven OAuth, so they never show
-//! one. Built-in rows are informational only: they are hosted inside this client
-//! and present in neither config list, so they render read-only (no toggle/edit/
-//! remove) and, when an external server of the same name overrides one, disabled
-//! with an "overridden by ..." reason. A filter dropdown (All / Daemon / Client)
+//! one. Built-in rows are hosted inside this client and present in neither config
+//! list, so they carry no add/edit/remove; they DO carry an enable/disable switch
+//! that writes the client config's per-surface `disabled_builtins` set (da#538
+//! slice 4), and render dimmed with a reason when disabled in config or overridden
+//! by a same-name external server. A filter dropdown (All / Daemon / Client)
 //! re-projects the same data without a re-fetch; built-ins ride the Client filter.
 //!
 //! Like [`super::connections_tab`] it is a passive view: it renders the merged
@@ -37,7 +38,7 @@ use desktop_assistant_api_model as api;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box as GtkBox, Button, DropDown, Label, ListBox, ListBoxRow, Orientation,
-    ScrolledWindow, SelectionMode, Separator, StringList, glib,
+    ScrolledWindow, SelectionMode, Separator, StringList, Switch, glib,
 };
 
 /// Map the coarse status string to a `(dot CSS modifier class, human label)`
@@ -80,6 +81,10 @@ type AddCb = Box<dyn Fn()>;
 type NameCb = Box<dyn Fn(String, Runner)>;
 /// `(name, runner, target_enabled)`.
 type ToggleCb = Box<dyn Fn(String, Runner, bool)>;
+/// `(name, target_disabled)` for a built-in server: `true` turns the built-in OFF
+/// for this surface, `false` turns it back ON. Built-ins run only in the client and
+/// carry no runner distinction (da#538 slice 4).
+type BuiltinToggleCb = Box<dyn Fn(String, bool)>;
 type SignInCb = Box<dyn Fn(Vec<String>)>;
 
 /// Passive MCP-servers list widget. Owns the list surface + the filter and holds
@@ -98,12 +103,17 @@ pub struct McpServersTab {
     /// Merged, ordered rows for the current data - re-filtered on filter change
     /// without a re-fetch.
     rows: Rc<RefCell<Vec<ServerRow>>>,
+    /// The client's compiled-in built-in DTOs, kept so a built-in row can read its
+    /// `disabled_by_config` / `overridden_by` flags (which a [`ServerRow`] flattens
+    /// into a single `disabled_reason`) to drive its enable/disable switch.
+    builtins: Rc<RefCell<Vec<BuiltinServerDto>>>,
     /// Whether the daemon link is remote, and its host, for the runner chip.
     is_remote: Rc<Cell<bool>>,
     host: Rc<RefCell<Option<String>>>,
     on_add: Rc<RefCell<Option<AddCb>>>,
     on_edit: Rc<RefCell<Option<NameCb>>>,
     on_toggle: Rc<RefCell<Option<ToggleCb>>>,
+    on_builtin_toggle: Rc<RefCell<Option<BuiltinToggleCb>>>,
     on_remove: Rc<RefCell<Option<NameCb>>>,
     on_signin: Rc<RefCell<Option<SignInCb>>>,
 }
@@ -172,11 +182,13 @@ impl McpServersTab {
         // Shared state.
         let daemon: Rc<RefCell<Vec<api::McpServerView>>> = Rc::new(RefCell::new(Vec::new()));
         let rows: Rc<RefCell<Vec<ServerRow>>> = Rc::new(RefCell::new(Vec::new()));
+        let builtins: Rc<RefCell<Vec<BuiltinServerDto>>> = Rc::new(RefCell::new(Vec::new()));
         let filter: Rc<Cell<RunnerFilter>> = Rc::new(Cell::new(RunnerFilter::default()));
         let is_remote: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let host: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let on_edit: Rc<RefCell<Option<NameCb>>> = Rc::new(RefCell::new(None));
         let on_toggle: Rc<RefCell<Option<ToggleCb>>> = Rc::new(RefCell::new(None));
+        let on_builtin_toggle: Rc<RefCell<Option<BuiltinToggleCb>>> = Rc::new(RefCell::new(None));
         let on_remove: Rc<RefCell<Option<NameCb>>> = Rc::new(RefCell::new(None));
         let on_signin: Rc<RefCell<Option<SignInCb>>> = Rc::new(RefCell::new(None));
 
@@ -185,12 +197,14 @@ impl McpServersTab {
         let render: Rc<dyn Fn()> = {
             let list_box = list_box.clone();
             let rows = Rc::clone(&rows);
+            let builtins = Rc::clone(&builtins);
             let filter = Rc::clone(&filter);
             let daemon = Rc::clone(&daemon);
             let is_remote = Rc::clone(&is_remote);
             let host = Rc::clone(&host);
             let on_edit = Rc::clone(&on_edit);
             let on_toggle = Rc::clone(&on_toggle);
+            let on_builtin_toggle = Rc::clone(&on_builtin_toggle);
             let on_remove = Rc::clone(&on_remove);
             let on_signin = Rc::clone(&on_signin);
             Rc::new(move || {
@@ -213,16 +227,19 @@ impl McpServersTab {
                     return;
                 }
                 let daemon = daemon.borrow();
+                let builtins = builtins.borrow();
                 let is_remote = is_remote.get();
                 let host = host.borrow();
                 for row in &visible {
                     list_box.append(&build_row_widget(
                         row,
                         &daemon,
+                        &builtins,
                         is_remote,
                         host.as_deref(),
                         &on_edit,
                         &on_toggle,
+                        &on_builtin_toggle,
                         &on_remove,
                         &on_signin,
                     ));
@@ -250,11 +267,13 @@ impl McpServersTab {
             render,
             daemon,
             rows,
+            builtins,
             is_remote,
             host,
             on_add,
             on_edit,
             on_toggle,
+            on_builtin_toggle,
             on_remove,
             on_signin,
         }
@@ -270,6 +289,13 @@ impl McpServersTab {
 
     pub fn connect_toggle<F: Fn(String, Runner, bool) + 'static>(&self, f: F) {
         *self.on_toggle.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Register the callback fired when a built-in row's enable/disable switch is
+    /// flipped. `f` receives `(name, disabled)` where `disabled == true` turns the
+    /// built-in off for this surface (da#538 slice 4).
+    pub fn connect_builtin_toggle<F: Fn(String, bool) + 'static>(&self, f: F) {
+        *self.on_builtin_toggle.borrow_mut() = Some(Box::new(f));
     }
 
     pub fn connect_remove<F: Fn(String, Runner) + 'static>(&self, f: F) {
@@ -320,6 +346,9 @@ impl McpServersTab {
         host: Option<&str>,
     ) {
         *self.daemon.borrow_mut() = daemon.to_vec();
+        // Kept so a built-in row's switch can read the DTO's disabled/override flags
+        // that the ServerRow flattens away.
+        *self.builtins.borrow_mut() = builtins.to_vec();
         // The render closure owns Rc clones of these same cells; mutate them then
         // render so set_data and the filter handler stay in lockstep.
         *self.rows.borrow_mut() = server_rows_with_builtins(daemon, client, builtins);
@@ -336,19 +365,24 @@ impl McpServersTab {
 fn build_row_widget(
     row: &ServerRow,
     daemon: &[api::McpServerView],
+    builtins: &[BuiltinServerDto],
     is_remote: bool,
     host: Option<&str>,
     on_edit: &Rc<RefCell<Option<NameCb>>>,
     on_toggle: &Rc<RefCell<Option<ToggleCb>>>,
+    on_builtin_toggle: &Rc<RefCell<Option<BuiltinToggleCb>>>,
     on_remove: &Rc<RefCell<Option<NameCb>>>,
     on_signin: &Rc<RefCell<Option<SignInCb>>>,
 ) -> ListBoxRow {
-    // Built-in (in-process) rows are informational: hosted inside this client and
-    // present in neither the daemon fleet nor client-mcp.toml, so they render
-    // read-only (no toggle/edit/remove, which index into those config lists) with
-    // a "built-in" kind chip, and disabled when overridden (da#538 Phase D).
+    // Built-in (in-process) rows are present in neither the daemon fleet nor
+    // client-mcp.toml, so they carry no Edit/Remove (which index into those config
+    // lists). They DO carry an enable/disable switch: it writes the client config's
+    // per-surface `disabled_builtins` list, not either server list (da#538 slice 4).
+    // The DTO (looked up by name) carries the disabled/override flags the switch
+    // reads; it is always present since the rows are projected from it.
     if row.kind == ServerKind::BuiltIn {
-        return build_builtin_row_widget(row);
+        let dto = builtins.iter().find(|b| b.name == row.name);
+        return build_builtin_row_widget(row, dto, on_builtin_toggle);
     }
 
     // Daemon rows carry extra fields on their view; client rows don't.
@@ -544,9 +578,6 @@ fn builtin_row_display(row: &ServerRow) -> BuiltinRowDisplay {
 /// The on/off presentation of a built-in row's enable/disable switch, decided
 /// purely from the [`BuiltinServerDto`] so it is unit-testable without a display
 /// (da#538 slice 4).
-// Spec commit: the widget consumer lands with the real body in the next commit;
-// this narrow allow is removed there.
-#[allow(dead_code)]
 struct BuiltinToggleState {
     /// The switch reads ON when the built-in is enabled in this client's config
     /// (i.e. NOT `disabled_by_config`) and OFF when it has been turned off.
@@ -562,26 +593,38 @@ struct BuiltinToggleState {
 /// Decide the enable/disable switch's `active`/`sensitive` from the built-in's
 /// DTO: on iff enabled in config; interactive unless the row is disabled *only*
 /// because an external server of the same name overrides it.
-#[allow(dead_code)]
 fn builtin_toggle_state(dto: &BuiltinServerDto) -> BuiltinToggleState {
-    // STUB (spec commit): deliberately wrong so the tests below fail red.
-    let _ = dto;
+    let overridden = dto.overridden_by.is_some();
     BuiltinToggleState {
-        active: false,
-        sensitive: false,
+        // On when the built-in is enabled in config (not turned off for the surface).
+        active: !dto.disabled_by_config,
+        // A config-disabled built-in stays interactive so it can be re-enabled; a
+        // purely-overridden one is inert because the override wins regardless.
+        sensitive: dto.disabled_by_config || !overridden,
     }
 }
 
-/// Build one read-only widget for a built-in (in-process) [`ServerRow`].
+/// Build one widget for a built-in (in-process) [`ServerRow`].
 ///
 /// Built-ins are hosted inside this client and present in neither config list, so
-/// the row is informational: a status dot, the name, a runner chip ("client"), a
-/// "built-in" kind chip, and a status subtitle with the tool count. When an
-/// external server of the same name overrides it, the whole row renders dimmed
-/// (`mcp-row-disabled`) and a `dim-label` line (also a tooltip) surfaces the
-/// "overridden by ..." reason. It is deliberately never wired to the toggle/edit/
-/// remove actions, which index into the daemon/client config lists.
-fn build_builtin_row_widget(row: &ServerRow) -> ListBoxRow {
+/// the row carries a status dot, the name, a runner chip ("client"), a "built-in"
+/// kind chip, a status subtitle with the tool count, and — unlike Edit/Remove,
+/// which index into the daemon/client config lists — an enable/disable **switch**
+/// that writes the client config's per-surface `disabled_builtins` set (da#538
+/// slice 4). When disabled in config or overridden by a same-name external server,
+/// the whole row renders dimmed (`mcp-row-disabled`) and a `dim-label` line (also a
+/// tooltip) surfaces the reason (config-disable takes precedence).
+///
+/// `dto` is the source [`BuiltinServerDto`] (looked up by name), whose
+/// `disabled_by_config` / `overridden_by` flags drive the switch's on/off and
+/// interactivity via [`builtin_toggle_state`]. When absent (defensive; the rows are
+/// projected from these DTOs so it should not happen) the switch is omitted and the
+/// row degrades to read-only.
+fn build_builtin_row_widget(
+    row: &ServerRow,
+    dto: Option<&BuiltinServerDto>,
+    on_builtin_toggle: &Rc<RefCell<Option<BuiltinToggleCb>>>,
+) -> ListBoxRow {
     let display = builtin_row_display(row);
 
     let list_row = ListBoxRow::new();
@@ -644,8 +687,8 @@ fn build_builtin_row_widget(row: &ServerRow) -> ListBoxRow {
     subtitle_label.add_css_class("dim-label");
     text_col.append(&subtitle_label);
 
-    // Override reason (only when a same-named external server shadows this
-    // built-in): a dim line — and tooltip — surfacing *why* it is disabled.
+    // Disabled reason (a same-named external server shadows it, OR it was turned
+    // off for this surface in config): a dim line — and tooltip — surfacing *why*.
     if let Some(reason) = display.reason.as_ref() {
         let reason_label = Label::new(Some(reason));
         reason_label.set_halign(Align::Start);
@@ -657,6 +700,40 @@ fn build_builtin_row_widget(row: &ServerRow) -> ListBoxRow {
     }
 
     hbox.append(&text_col);
+
+    // Enable/disable switch: on iff the built-in is enabled in this client's config.
+    // A `Switch` (not the Enable/Disable button the daemon/client rows use) suits a
+    // pure local boolean with no daemon round-trip: the row is rebuilt fresh on each
+    // render and the initial `set_active`/`set_sensitive` happen *before* the handler
+    // is connected, so there is no programmatic-set notify loop to guard against.
+    // Flipping it persists the config and refreshes; the running host keeps its
+    // built-in set until the client restarts, so the change is pending until then.
+    if let Some(dto) = dto {
+        let state = builtin_toggle_state(dto);
+        let switch = Switch::new();
+        switch.set_valign(Align::Center);
+        switch.set_active(state.active);
+        // Inert only for a purely-overridden built-in (the override wins regardless);
+        // a config-disabled one stays interactive so it can be turned back on.
+        switch.set_sensitive(state.sensitive);
+        switch.set_tooltip_text(Some(if state.active {
+            "Enabled for this client. Turning it off takes effect after a restart."
+        } else {
+            "Disabled for this client. Turning it on takes effect after a restart."
+        }));
+        let toggle_name = row.name.clone();
+        let on_builtin_toggle = Rc::clone(on_builtin_toggle);
+        // `state-set` fires on user activation with the requested position; a switch
+        // ON means enabled, so the target disabled state is its negation.
+        switch.connect_state_set(move |_sw, active| {
+            if let Some(ref cb) = *on_builtin_toggle.borrow() {
+                cb(toggle_name.clone(), !active);
+            }
+            glib::Propagation::Proceed
+        });
+        hbox.append(&switch);
+    }
+
     list_row.set_child(Some(&hbox));
     list_row
 }

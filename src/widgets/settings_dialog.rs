@@ -724,6 +724,31 @@ pub fn show_settings_dialog(
         }
     ));
 
+    // Built-in enable/disable toggle (da#538 slice 4): writes the client config's
+    // per-surface `disabled_builtins` set. The running host keeps its built-in set
+    // until the client restarts, so this persists the config + refreshes the display
+    // (the refresh overlays the new disabled set) and notes it applies on restart.
+    mcp_tab.connect_builtin_toggle(glib::clone!(
+        #[strong]
+        bridge,
+        #[strong]
+        refresh_mcp,
+        #[strong]
+        status_label,
+        #[strong]
+        client_mcp_path,
+        move |name, disabled| {
+            do_builtin_toggle(
+                Rc::clone(&bridge),
+                Rc::clone(&refresh_mcp),
+                Rc::clone(&status_label),
+                (*client_mcp_path).clone(),
+                name,
+                disabled,
+            );
+        }
+    ));
+
     // Remove (with confirmation) - forked by runner.
     mcp_tab.connect_remove(glib::clone!(
         #[strong]
@@ -872,9 +897,17 @@ fn mcp_refresh_closure(
                 // a real count instead of 0.
                 let counts = client_tool_counts.lock().unwrap().clone();
                 let client_rows = mcp_admin::client_server_dtos(&cfg, &counts);
-                // Snapshot the client's compiled-in built-ins the same way, so
-                // they merge into the panel as read-only rows (da#538 Phase D).
-                let builtins = mcp_builtin_dtos.lock().unwrap().clone();
+                // Snapshot the client's compiled-in built-ins the same way, so they
+                // merge into the panel (da#538 Phase D). The host snapshots its
+                // disabled set once at start (built-ins are fixed until relaunch), so
+                // overlay the *current* config's `disabled_builtins` for this surface
+                // to reflect a live toggle's pending state (da#538 slice 4).
+                let mut builtins = mcp_builtin_dtos.lock().unwrap().clone();
+                mcp_admin::apply_builtin_disabled_overlay(
+                    &cfg,
+                    mcp_admin::GTK_SURFACE,
+                    &mut builtins,
+                );
                 mcp_tab.set_data(
                     &daemon_views,
                     &client_rows,
@@ -1002,6 +1035,51 @@ fn do_client_toggle(
                 Ok(()) => refresh(),
                 Err(e) => {
                     let _ = ui_tx.send(UiMessage::Error(format!("Toggle client MCP server: {e}")));
+                }
+            }
+        }
+    });
+}
+
+/// Enable/disable a compiled-in **built-in** server for the gtk surface (da#538
+/// slice 4): load the client config off the main loop, set its per-surface
+/// `disabled_builtins` membership via [`ClientMcpConfig::set_builtin_disabled`],
+/// write it back, then refresh and note that it applies on restart.
+///
+/// The running [`McpHost`](desktop_assistant_client_common::mcp_host::McpHost)
+/// snapshots its built-in set once at start, so it does NOT drop/add the built-in
+/// live; the refresh re-projects the row's disabled state from the just-written
+/// config (overlaying the host snapshot), and the status note tells the user the
+/// hosting change lands on the next client launch. `disabled == true` turns it off.
+fn do_builtin_toggle(
+    bridge: Rc<AsyncBridge>,
+    refresh: Rc<dyn Fn()>,
+    status_label: Rc<Label>,
+    client_path: PathBuf,
+    name: String,
+    disabled: bool,
+) {
+    let ui_tx = bridge.ui_sender();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), String>>();
+    let name_for_task = name.clone();
+    bridge.spawn(async move {
+        let mut cfg = ClientMcpConfig::load(&client_path);
+        cfg.set_builtin_disabled(mcp_admin::GTK_SURFACE, &name_for_task, disabled);
+        let _ = tx.send(cfg.save(&client_path));
+    });
+    glib::spawn_future_local(async move {
+        if let Some(r) = rx.recv().await {
+            match r {
+                Ok(()) => {
+                    let verb = if disabled { "disabled" } else { "enabled" };
+                    status_label.set_text(&format!(
+                        "Built-in \"{name}\" {verb} - applies after the client restarts."
+                    ));
+                    refresh();
+                }
+                Err(e) => {
+                    let _ =
+                        ui_tx.send(UiMessage::Error(format!("Toggle built-in MCP server: {e}")));
                 }
             }
         }

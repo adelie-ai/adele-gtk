@@ -185,16 +185,15 @@ pub fn apply_client_remove(cfg: &mut ClientMcpConfig, name: &str) -> Result<(), 
 /// shows the *pending* state; the running host still hosts (or omits) the built-in
 /// until restart, so this corrects only the displayed flag, nothing else about the
 /// snapshot (tool count, `overridden_by`) (da#538 slice 4).
-// Spec commit: the refresh consumer lands with the real body in the next commit;
-// this narrow allow is removed there.
-#[allow(dead_code)]
 pub fn apply_builtin_disabled_overlay(
     cfg: &ClientMcpConfig,
     surface: &str,
     builtins: &mut [BuiltinServerDto],
 ) {
-    // STUB (spec commit): intentionally does nothing so the tests below fail red.
-    let _ = (cfg, surface, builtins);
+    let disabled = cfg.surface_disabled_builtins(surface);
+    for b in builtins.iter_mut() {
+        b.disabled_by_config = disabled.iter().any(|n| n == &b.name);
+    }
 }
 
 /// Parse the dialog's `config_json` (a serialized `McpServerConfig` subset) into

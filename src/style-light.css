@@ -303,8 +303,9 @@ entry:focus {
     color: #1f6f97; /* header blue, darkened for light bg */
 }
 
-/* Overridden built-in row (da#538): dimming is opacity-only (theme-neutral), so
-   the light theme re-asserts the same rule for parity with the dark base. */
+/* Disabled built-in row (da#538): dimming is opacity-only (theme-neutral) and
+   covers both an overridden and a config-disabled (slice 4) built-in, so the light
+   theme re-asserts the same rule for parity with the dark base. */
 .mcp-row-disabled {
     opacity: 0.55;
 }
