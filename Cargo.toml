@@ -23,6 +23,28 @@ mcp-terminal = ["dep:terminal-mcp"]
 mcp-tasks = ["dep:tasks-mcp"]
 mcp-web = ["dep:web-mcp"]
 
+# The "broad set" of built-in MCP servers (weather / internet-radio /
+# openstreetmap / geocode / skills) - the same fleet Adele ships on the daemon,
+# minus the core-4. They are compiled in and hosted in-process EXACTLY like the
+# core set, but are default-OFF, opt-in: NOT in `default`, so a plain
+# `cargo build` links none of them and the default gtk build is byte-identical
+# to before. Enable all five with `--features builtin-extras`, or cherry-pick a
+# single one (e.g. `--features mcp-weather`). This proves the broad set links and
+# hosts in-process; a future mac client copies this block and flips
+# `builtin-extras` on by default.
+builtin-extras = [
+    "mcp-weather",
+    "mcp-internet-radio",
+    "mcp-openstreetmap",
+    "mcp-geocode",
+    "mcp-skills",
+]
+mcp-weather = ["dep:weather-forecast-mcp"]
+mcp-internet-radio = ["dep:internet-radio-mcp"]
+mcp-openstreetmap = ["dep:openstreetmap-mcp"]
+mcp-geocode = ["dep:geocode-mcp"]
+mcp-skills = ["dep:skills-mcp"]
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
@@ -70,6 +92,18 @@ fileio-mcp = { path = "../fileio-mcp", optional = true }
 terminal-mcp = { path = "../terminal-mcp", optional = true }
 tasks-mcp = { path = "../tasks-mcp", optional = true }
 web-mcp = { path = "../web-mcp", optional = true }
+
+# The opt-in "broad set" built-in servers (see the `builtin-extras` feature).
+# Same optional + feature-gated path-dep shape as the core-4 above, so a build
+# without their feature links none of them. Each exposes an infallible
+# `build_service()` for in-process hosting. They float the `mcp-core` git dep
+# unpinned (like the core-4), which the `[patch]` below collapses to the single
+# `../mcp-core` source so every consumer resolves to one `McpService` type.
+weather-forecast-mcp = { path = "../weather-forecast-mcp", optional = true }
+internet-radio-mcp = { path = "../internet-radio-mcp", optional = true }
+openstreetmap-mcp = { path = "../openstreetmap-mcp", optional = true }
+geocode-mcp = { path = "../geocode-mcp", optional = true }
+skills-mcp = { path = "../skills-mcp", optional = true }
 
 [dependencies.webkit6]
 version = "0.6"
