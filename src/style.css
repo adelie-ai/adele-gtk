@@ -365,9 +365,11 @@ entry:focus {
     color: #88d6f0; /* header blue */
 }
 
-/* Overridden built-in row (da#538): a built-in shadowed by an external server of
-   the same name is informational and inactive, so the whole row dims. Opacity is
-   theme-neutral, so light mode re-asserts it unchanged. */
+/* Disabled built-in row (da#538): a built-in that is inactive - shadowed by a
+   same-name external server, or turned off for this surface in the client's config
+   (slice 4) - dims the whole row. Opacity is theme-neutral, so light mode
+   re-asserts it unchanged. The enable/disable switch inside stays interactive so a
+   config-disabled built-in can be turned back on. */
 .mcp-row-disabled {
     opacity: 0.55;
 }

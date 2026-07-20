@@ -68,8 +68,9 @@ pub fn builtin_servers() -> Vec<BuiltinServer> {
 /// Map the host's per-built-in [`BuiltinStatus`] into the view-model
 /// [`BuiltinServerDto`]s the shared MCP-servers panel renders via
 /// `client_ui_common::server_rows_with_builtins`. The `usize` `tool_count`
-/// widens to the DTO's `u32`; `overridden_by` carries straight through so an
-/// overridden built-in renders as a disabled row.
+/// widens to the DTO's `u32`; `overridden_by` and `disabled_by_config` carry
+/// straight through so an overridden *or* config-disabled built-in renders as a
+/// disabled row (da#538 slice 4).
 pub fn builtin_dtos(status: Vec<BuiltinStatus>) -> Vec<BuiltinServerDto> {
     status
         .into_iter()
@@ -78,6 +79,7 @@ pub fn builtin_dtos(status: Vec<BuiltinStatus>) -> Vec<BuiltinServerDto> {
             namespace: s.namespace,
             tool_count: s.tool_count as u32,
             overridden_by: s.overridden_by,
+            disabled_by_config: s.disabled_by_config,
         })
         .collect()
 }
@@ -116,12 +118,14 @@ mod tests {
                 namespace: "fileio".into(),
                 tool_count: 7,
                 overridden_by: None,
+                disabled_by_config: false,
             },
             BuiltinStatus {
                 name: "web".into(),
                 namespace: "web".into(),
                 tool_count: 3,
                 overridden_by: Some("web".into()),
+                disabled_by_config: false,
             },
         ];
 
@@ -151,6 +155,49 @@ mod tests {
         );
     }
 
+    /// da#538 slice 4: the host's `disabled_by_config` flag (a built-in turned off
+    /// for this surface in the client's config) carries through the DTO mapping so
+    /// the panel can render it as a disabled row even with no external override.
+    #[test]
+    fn builtin_dtos_carry_disabled_by_config() {
+        let status = vec![
+            BuiltinStatus {
+                name: "fileio".into(),
+                namespace: "fileio".into(),
+                tool_count: 7,
+                overridden_by: None,
+                disabled_by_config: false,
+            },
+            BuiltinStatus {
+                name: "terminal".into(),
+                namespace: "terminal".into(),
+                tool_count: 4,
+                overridden_by: None,
+                disabled_by_config: true,
+            },
+        ];
+
+        let dtos = builtin_dtos(status);
+
+        let fileio = dtos
+            .iter()
+            .find(|d| d.name == "fileio")
+            .expect("fileio dto present");
+        assert!(
+            !fileio.disabled_by_config,
+            "an enabled built-in is not disabled by config"
+        );
+
+        let terminal = dtos
+            .iter()
+            .find(|d| d.name == "terminal")
+            .expect("terminal dto present");
+        assert!(
+            terminal.disabled_by_config,
+            "a config-disabled built-in carries the flag through the mapping"
+        );
+    }
+
     /// The rows the F5 panel renders: mapping the DTOs through
     /// `server_rows_with_builtins` (with no daemon / external-client rows) yields a
     /// [`ServerKind::BuiltIn`] row for an active built-in (no disabled reason) and a
@@ -165,12 +212,14 @@ mod tests {
                 namespace: "fileio".into(),
                 tool_count: 7,
                 overridden_by: None,
+                disabled_by_config: false,
             },
             BuiltinStatus {
                 name: "web".into(),
                 namespace: "web".into(),
                 tool_count: 3,
                 overridden_by: Some("web".into()),
+                disabled_by_config: false,
             },
         ]);
 
