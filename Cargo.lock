@@ -12,6 +12,7 @@ dependencies = [
  "adele-voice-vad-silero",
  "ammonia",
  "anyhow",
+ "async-trait",
  "base64",
  "clap",
  "client-ui-common",
