@@ -23,6 +23,7 @@ use gtk4::{Align, Box as GtkBox, Button, Entry, Label, Orientation, Separator, W
 pub enum ConnectorType {
     Anthropic,
     OpenAi,
+    OpenRouter,
     Bedrock,
     Ollama,
 }
@@ -32,6 +33,7 @@ impl ConnectorType {
         match self {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
+            Self::OpenRouter => "OpenRouter",
             Self::Bedrock => "Bedrock",
             Self::Ollama => "Ollama",
         }
@@ -46,6 +48,7 @@ impl ConnectorType {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
+            Self::OpenRouter => "openrouter",
             Self::Bedrock => "bedrock",
             Self::Ollama => "ollama",
         }
@@ -55,6 +58,7 @@ impl ConnectorType {
         match s {
             "anthropic" => Some(Self::Anthropic),
             "openai" => Some(Self::OpenAi),
+            "openrouter" => Some(Self::OpenRouter),
             "bedrock" => Some(Self::Bedrock),
             "ollama" => Some(Self::Ollama),
             _ => None,
@@ -71,6 +75,13 @@ impl ConnectorType {
                 max_context_tokens: None,
             },
             Self::OpenAi => api::ConnectionConfigView::OpenAi {
+                base_url: None,
+                api_key_env: None,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            Self::OpenRouter => api::ConnectionConfigView::OpenRouter {
                 base_url: None,
                 api_key_env: None,
                 connect_timeout_secs: None,
@@ -133,6 +144,12 @@ impl PreservedFields {
                     max_context_tokens,
                     ..
                 }
+                | api::ConnectionConfigView::OpenRouter {
+                    connect_timeout_secs,
+                    stream_timeout_secs,
+                    max_context_tokens,
+                    ..
+                }
                 | api::ConnectionConfigView::Bedrock {
                     connect_timeout_secs,
                     stream_timeout_secs,
@@ -157,7 +174,11 @@ impl PreservedFields {
                 max_context_tokens: *max_context_tokens,
                 keep_warm: *keep_warm,
             },
-            None => Self::default(),
+            // Azure/Google are config-file-only in v1: their slugs don't map to
+            // a `ConnectorType`, so the dialog never opens for them and there is
+            // nothing to surface or preserve. `None` (the create path) also lands
+            // here — both yield all-`None` preserved fields.
+            _ => Self::default(),
         }
     }
 }
@@ -235,6 +256,32 @@ fn field_specs(
                 },
             ]
         }
+        ConnectorType::OpenRouter => {
+            let (base_url, api_key_env) = match config {
+                Some(api::ConnectionConfigView::OpenRouter {
+                    base_url,
+                    api_key_env,
+                    ..
+                }) => (base_url.clone(), api_key_env.clone()),
+                _ => (None, None),
+            };
+            vec![
+                FieldSpec {
+                    label: "Base URL (optional override)",
+                    name: "base_url",
+                    placeholder: Some("https://openrouter.ai/api/v1"),
+                    initial: base_url,
+                    secret: false,
+                },
+                FieldSpec {
+                    label: "API key env var (e.g. OPENROUTER_API_KEY)",
+                    name: "api_key_env",
+                    placeholder: Some("OPENROUTER_API_KEY"),
+                    initial: api_key_env,
+                    secret: false,
+                },
+            ]
+        }
         ConnectorType::Bedrock => {
             let (aws_profile, region, base_url) = match config {
                 Some(api::ConnectionConfigView::Bedrock {
@@ -292,7 +339,7 @@ fn connector_hint(connector: ConnectorType) -> Option<&'static str> {
         ConnectorType::Anthropic => Some(
             "The daemon reads the API key from the named env var. Set it in your daemon environment (systemd unit, shell, etc.).",
         ),
-        ConnectorType::OpenAi => Some(
+        ConnectorType::OpenAi | ConnectorType::OpenRouter => Some(
             "The daemon reads the API key from the named env var. Set it in your daemon environment.",
         ),
         ConnectorType::Bedrock | ConnectorType::Ollama => None,
@@ -515,6 +562,13 @@ pub fn show_configure_dialog<FSave, FRefresh>(
                     stream_timeout_secs: preserved.stream_timeout_secs,
                     max_context_tokens: preserved.max_context_tokens,
                 },
+                ConnectorType::OpenRouter => api::ConnectionConfigView::OpenRouter {
+                    base_url: by_name("base_url"),
+                    api_key_env: by_name("api_key_env"),
+                    connect_timeout_secs: preserved.connect_timeout_secs,
+                    stream_timeout_secs: preserved.stream_timeout_secs,
+                    max_context_tokens: preserved.max_context_tokens,
+                },
                 ConnectorType::Bedrock => api::ConnectionConfigView::Bedrock {
                     aws_profile: by_name("aws_profile"),
                     region: by_name("region"),
@@ -549,12 +603,28 @@ mod tests {
         for c in [
             ConnectorType::Anthropic,
             ConnectorType::OpenAi,
+            ConnectorType::OpenRouter,
             ConnectorType::Bedrock,
             ConnectorType::Ollama,
         ] {
             assert_eq!(ConnectorType::from_slug(c.slug()), Some(c));
         }
         assert_eq!(ConnectorType::from_slug("unknown"), None);
+    }
+
+    #[test]
+    fn openrouter_slug_maps_to_variant() {
+        // OpenRouter is a first-class creatable connector; its slug must round-trip
+        // and its empty config must carry the OpenRouter variant.
+        assert_eq!(
+            ConnectorType::from_slug("openrouter"),
+            Some(ConnectorType::OpenRouter)
+        );
+        assert_eq!(ConnectorType::OpenRouter.slug(), "openrouter");
+        assert!(matches!(
+            ConnectorType::OpenRouter.empty_config(),
+            api::ConnectionConfigView::OpenRouter { .. }
+        ));
     }
 
     #[test]
@@ -575,6 +645,48 @@ mod tests {
             ConnectorType::OpenAi.empty_config(),
             api::ConnectionConfigView::OpenAi { .. }
         ));
+        assert!(matches!(
+            ConnectorType::OpenRouter.empty_config(),
+            api::ConnectionConfigView::OpenRouter { .. }
+        ));
+    }
+
+    #[test]
+    fn field_specs_prefill_from_echoed_openrouter_config() {
+        // OpenRouter mirrors OpenAI: base_url + api_key_env pre-fill from the
+        // echoed config; neither is a secret.
+        let config = api::ConnectionConfigView::OpenRouter {
+            base_url: Some("https://openrouter.ai/api/v1".to_string()),
+            api_key_env: Some("MY_OPENROUTER_KEY".to_string()),
+            connect_timeout_secs: None,
+            stream_timeout_secs: None,
+            max_context_tokens: None,
+        };
+        let specs = field_specs(ConnectorType::OpenRouter, Some(&config));
+        assert_eq!(
+            initial_of(&specs, "base_url"),
+            Some("https://openrouter.ai/api/v1")
+        );
+        assert_eq!(initial_of(&specs, "api_key_env"), Some("MY_OPENROUTER_KEY"));
+        assert!(specs.iter().all(|f| !f.secret));
+    }
+
+    #[test]
+    fn preserved_fields_round_trip_openrouter() {
+        // OpenRouter is in the api-key preserved-fields group (like OpenAI): its
+        // unsurfaced timeouts / context ceiling round-trip; it has no keep_warm.
+        let openrouter = api::ConnectionConfigView::OpenRouter {
+            base_url: Some("https://openrouter.ai/api/v1".to_string()),
+            api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+            connect_timeout_secs: Some(7),
+            stream_timeout_secs: Some(90),
+            max_context_tokens: Some(128_000),
+        };
+        let p = PreservedFields::from_config(Some(&openrouter));
+        assert_eq!(p.connect_timeout_secs, Some(7));
+        assert_eq!(p.stream_timeout_secs, Some(90));
+        assert_eq!(p.max_context_tokens, Some(128_000));
+        assert_eq!(p.keep_warm, None);
     }
 
     /// Look up a field's pre-fill value by name within a spec list.
@@ -628,6 +740,7 @@ mod tests {
         for connector in [
             ConnectorType::Anthropic,
             ConnectorType::OpenAi,
+            ConnectorType::OpenRouter,
             ConnectorType::Bedrock,
             ConnectorType::Ollama,
         ] {

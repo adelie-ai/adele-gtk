@@ -57,6 +57,7 @@ impl ConnectionsTab {
         for connector in [
             ConnectorType::Anthropic,
             ConnectorType::OpenAi,
+            ConnectorType::OpenRouter,
             ConnectorType::Bedrock,
             ConnectorType::Ollama,
         ] {
