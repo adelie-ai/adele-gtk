@@ -416,6 +416,17 @@ impl InputBar {
     pub fn set_text(&self, text: &str) {
         self.text_view.buffer().set_text(text);
     }
+
+    /// Replace the composer text and place the caret at the end. Used by the
+    /// message-queue `Effect::SetComposerText` path so a recalled queued message
+    /// lands ready to continue editing (rather than with the caret at the
+    /// start), and an enqueue/cancel clear (`""`) leaves an empty box.
+    pub fn set_text_focus_end(&self, text: &str) {
+        let buffer = self.text_view.buffer();
+        buffer.set_text(text);
+        let end = buffer.end_iter();
+        buffer.place_cursor(&end);
+    }
 }
 
 #[cfg(test)]

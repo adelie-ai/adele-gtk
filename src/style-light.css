@@ -309,3 +309,24 @@ entry:focus {
 .mcp-row-disabled {
     opacity: 0.55;
 }
+
+/* Queued-message chips (message-queue feature): darken the accent fill/border and
+   the label so the pills read on the light composer surface, mirroring the
+   runner/kind chip light treatment. */
+.queued-chip {
+    background-color: alpha(#178a6e, 0.10);
+    border-color: alpha(#178a6e, 0.28);
+}
+
+.queued-chip-edit {
+    color: #14584a;
+}
+
+.queued-chip-edit:hover {
+    background-color: alpha(#178a6e, 0.16);
+}
+
+.queued-chips-editing .queued-chip {
+    background-color: alpha(#1f6f97, 0.12);
+    border-color: alpha(#1f6f97, 0.38);
+}

@@ -39,6 +39,16 @@ struct WindowWidgets {
     sidebar: Rc<Sidebar>,
     chat_view: Rc<RefCell<ChatView>>,
     status_label: Rc<Label>,
+    /// The transport/connection status text last shown in `status_label`, kept
+    /// so the message-queue "N queued" suffix (composed in `compose_status`) can
+    /// coexist with the connection status instead of overwriting it. Every
+    /// `Effect::SetStatusText` updates this base; every `Effect::SetQueuedMessages`
+    /// re-composes the label from it.
+    base_status: Rc<RefCell<String>>,
+    /// Row of "queued message" chips shown just above the composer, rebuilt from
+    /// each `Effect::SetQueuedMessages` snapshot (message-queue feature). Hidden
+    /// while the queue is empty.
+    queued_chips: Rc<GtkBox>,
     /// Read-only context-window fill indicator (#341).
     context_label: Rc<Label>,
     client: Rc<RefCell<Option<Arc<Connector>>>>,
@@ -282,6 +292,18 @@ impl AdelieWindow {
         let input_sep = Separator::new(Orientation::Horizontal);
         chat_column.append(&input_sep);
 
+        // Queued-message chips (message-queue feature): one pill per message
+        // waiting to flush after the current streaming reply finishes. Sits
+        // between the composer separator and the composer itself; hidden while
+        // the queue is empty. Rebuilt from each `Effect::SetQueuedMessages`.
+        let queued_chips = GtkBox::new(Orientation::Horizontal, 6);
+        queued_chips.add_css_class("queued-chips");
+        queued_chips.set_margin_start(12);
+        queued_chips.set_margin_end(12);
+        queued_chips.set_margin_top(4);
+        queued_chips.set_visible(false);
+        chat_column.append(&queued_chips);
+
         let input_bar = InputBar::new();
         input_bar.send_button.set_sensitive(false); // disabled until connected
         chat_column.append(&input_bar.container);
@@ -352,6 +374,8 @@ impl AdelieWindow {
         let chat_view = Rc::new(RefCell::new(chat_view));
         let input_bar = Rc::new(input_bar);
         let status_label = Rc::new(status_label);
+        let base_status = Rc::new(RefCell::new("Connecting...".to_string()));
+        let queued_chips = Rc::new(queued_chips);
         let context_label = Rc::new(context_label);
         let model_picker = Rc::new(model_picker);
         let tasks_panel = Rc::new(tasks_panel);
@@ -428,6 +452,8 @@ impl AdelieWindow {
             sidebar: sidebar.clone(),
             chat_view: chat_view.clone(),
             status_label: status_label.clone(),
+            base_status: base_status.clone(),
+            queued_chips: queued_chips.clone(),
             context_label: context_label.clone(),
             client: client.clone(),
             pending_connector: pending_connector.clone(),
@@ -863,20 +889,62 @@ impl AdelieWindow {
                 }
             ));
 
-            // Enter key in text view (Shift+Enter for newline)
+            // Enter key in text view (Shift+Enter for newline). Up/Down/Escape
+            // navigate the message queue (message-queue feature): recall a queued
+            // message into the composer to edit and re-submit, walk between queued
+            // items, or cancel an in-progress edit. Navigation only engages when
+            // it won't fight the caret (Up only when the composer is empty; Down
+            // and Escape only while an edit is checked out), so plain typing,
+            // multi-line newlines, and caret movement are untouched otherwise.
             let key_controller = gtk4::EventControllerKey::new();
             key_controller.connect_key_pressed(glib::clone!(
                 #[strong]
                 send_action,
+                #[strong]
+                state,
+                #[strong(rename_to = bridge_ref)]
+                bridge,
+                #[strong]
+                input_bar,
                 move |_, key, _, modifiers| {
                     if key == gdk::Key::Return
                         && !modifiers.contains(gdk::ModifierType::SHIFT_MASK)
                         && !modifiers.contains(gdk::ModifierType::CONTROL_MASK)
                     {
                         send_action();
-                        glib::Propagation::Stop
-                    } else {
-                        glib::Propagation::Proceed
+                        return glib::Propagation::Stop;
+                    }
+                    // Up/Down/Escape drive queued-message recall/cancel; every
+                    // other key keeps its default caret behaviour. The index
+                    // arithmetic (Up steps toward the front, Down steps back or
+                    // cancels past the last item) lives in the pure
+                    // `recall_decision` so its boundaries are unit-tested.
+                    let recall_key = match key {
+                        gdk::Key::Up => RecallKey::Up,
+                        gdk::Key::Down => RecallKey::Down,
+                        gdk::Key::Escape => RecallKey::Escape,
+                        _ => return glib::Propagation::Proceed,
+                    };
+                    let (editing, queue_len) = {
+                        let s = state.borrow();
+                        (s.editing_queued_index(), s.queued_messages_for_view().len())
+                    };
+                    let tx = bridge_ref.ui_sender();
+                    match recall_decision(
+                        recall_key,
+                        input_bar.peek_text().is_empty(),
+                        editing,
+                        queue_len,
+                    ) {
+                        RecallDecision::Recall(index) => {
+                            let _ = tx.send(UiMessage::EditQueued { index });
+                            glib::Propagation::Stop
+                        }
+                        RecallDecision::Cancel => {
+                            let _ = tx.send(UiMessage::CancelQueuedEdit);
+                            glib::Propagation::Stop
+                        }
+                        RecallDecision::Proceed => glib::Propagation::Proceed,
                     }
                 }
             ));
@@ -1305,6 +1373,206 @@ impl AdelieWindow {
     }
 }
 
+/// Maximum characters shown on a queued-message chip before it is truncated.
+/// Short enough that several chips fit on the row above the composer.
+const CHIP_PREVIEW_MAX: usize = 24;
+
+/// Compose the status-bar text from the base connection/transport status and the
+/// number of queued messages, so the message-queue "N queued" indicator coexists
+/// with the transport status rather than overwriting it (message-queue feature).
+/// An empty queue yields the base status verbatim.
+fn compose_status(base: &str, queued: usize) -> String {
+    if queued == 0 {
+        base.to_string()
+    } else {
+        format!("{base}, {queued} queued")
+    }
+}
+
+/// A short, single-line preview of a queued message for its chip label. Internal
+/// whitespace (including newlines) collapses to single spaces, and an over-long
+/// preview is truncated on a char boundary with a trailing "..." so a long or
+/// multi-line queued prompt stays a compact chip.
+fn chip_preview(text: &str, max: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max {
+        collapsed
+    } else {
+        let head: String = collapsed.chars().take(max.saturating_sub(3)).collect();
+        format!("{head}...")
+    }
+}
+
+/// A queue-navigation key while the composer has focus (message-queue AC5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecallKey {
+    Up,
+    Down,
+    Escape,
+}
+
+/// What a queue-navigation key should do given the current editing state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecallDecision {
+    /// Check the queued item at this FULL-queue index into the composer
+    /// (`UiMessage::EditQueued`).
+    Recall(usize),
+    /// Abandon the in-progress edit (`UiMessage::CancelQueuedEdit`).
+    Cancel,
+    /// Not a queue action — let the key keep its default caret behaviour.
+    Proceed,
+}
+
+/// Pure recall/cancel arithmetic for the composer's Up/Down/Escape keys
+/// (message-queue AC5), mirroring the KDE client's `recallDecision`. Kept
+/// separate from the GTK key closure so the index boundaries are unit-testable:
+///
+/// - **Up** on an *empty* composer recalls: with nothing checked out it grabs
+///   the last queued item; while editing it steps toward the front
+///   (`saturating_sub(1)`). A non-empty composer keeps Up as caret movement.
+/// - **Down** while editing steps toward the back; *past the last item*
+///   (`i == queue_len`) it cancels the edit rather than emitting an
+///   out-of-range `EditQueued`. Not editing → caret movement.
+/// - **Escape** while editing cancels; otherwise the key keeps its default.
+fn recall_decision(
+    key: RecallKey,
+    composer_empty: bool,
+    editing: Option<usize>,
+    queue_len: usize,
+) -> RecallDecision {
+    match key {
+        RecallKey::Up => {
+            if !composer_empty || (editing.is_none() && queue_len == 0) {
+                return RecallDecision::Proceed;
+            }
+            let index = editing
+                .map(|i| i.saturating_sub(1))
+                .unwrap_or(queue_len.saturating_sub(1));
+            RecallDecision::Recall(index)
+        }
+        RecallKey::Down => match editing {
+            Some(i) if i < queue_len => RecallDecision::Recall(i + 1),
+            Some(_) => RecallDecision::Cancel,
+            None => RecallDecision::Proceed,
+        },
+        RecallKey::Escape => {
+            if editing.is_some() {
+                RecallDecision::Cancel
+            } else {
+                RecallDecision::Proceed
+            }
+        }
+    }
+}
+
+/// Does this incoming message represent a *direct* user send whose live
+/// composer must be cleared once the send is accepted (message-queue AC9)? Only
+/// a `SubmitPrompt` (Enter / send-button / dictation) is a direct send: the
+/// composer holds exactly the text being sent. A background queue flush emits
+/// the same `Effect::SendPrompt` from a `StreamComplete` / conversation
+/// switch-back while the composer may hold an unrelated fresh draft that must
+/// survive — so those must NOT clear the composer. Extracted as a pure predicate
+/// so the clear-guard is unit-testable away from the GTK widgets.
+fn is_user_initiated_send(msg: &UiMessage) -> bool {
+    matches!(msg, UiMessage::SubmitPrompt { .. })
+}
+
+/// Translate a *visible* chip position into the full-queue index the reducer's
+/// `EditQueued` expects. While an item is checked out for editing it is absent
+/// from the rendered list (`queued_messages_for_view`), but `EditQueued`
+/// reinserts it at its original slot *before* indexing — so a click on a visible
+/// chip at or past the checked-out slot `e` must skip over that slot (`+ 1`).
+/// With nothing checked out the visible and full indices coincide. `RemoveQueued`
+/// needs no such translation: it removes straight from the current outbox (the
+/// visible list), so the visible index is passed through directly.
+fn chip_edit_index(visible: usize, editing: Option<usize>) -> usize {
+    match editing {
+        Some(e) if visible >= e => visible + 1,
+        _ => visible,
+    }
+}
+
+/// Which affordance on a queued chip was clicked. Keeps the edit-vs-remove
+/// index policy (which one translates through [`chip_edit_index`], which passes
+/// the visible index straight through) in one pure place so a wiring swap is
+/// unit-detectable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChipButton {
+    Edit,
+    Remove,
+}
+
+/// The `UiMessage` a queued-chip click dispatches (message-queue AC11). The
+/// *edit* affordance targets the FULL-queue index (translated via
+/// [`chip_edit_index`], because the reducer reinserts any checked-out item
+/// before indexing), while the *remove* affordance drops straight from the
+/// visible outbox and so passes the visible index through unchanged. Extracted
+/// so the edit-translates / remove-is-raw contract is pinned by a unit test even
+/// though the button wiring itself lives in un-unit-testable widget closures.
+fn chip_click_message(button: ChipButton, visible: usize, editing: Option<usize>) -> UiMessage {
+    match button {
+        ChipButton::Edit => UiMessage::EditQueued {
+            index: chip_edit_index(visible, editing),
+        },
+        ChipButton::Remove => UiMessage::RemoveQueued { index: visible },
+    }
+}
+
+/// Rebuild the queued-message chip row from a `SetQueuedMessages` snapshot: one
+/// pill per outbox entry with a click-to-edit preview (dispatches `EditQueued`,
+/// its index translated via [`chip_edit_index`]) and an "x" that drops it
+/// (`RemoveQueued`, visible index passed straight through). The row is hidden
+/// while the queue is empty. While an edit is checked out the row carries a
+/// "mid-edit" class: the edited message is absent from `messages` (it lives in
+/// the composer), so there is no per-chip highlight to show, and `editing` is a
+/// row-level cue.
+fn rebuild_queued_chips(
+    row: &GtkBox,
+    messages: &[String],
+    editing: Option<usize>,
+    ui_tx: &mpsc::UnboundedSender<UiMessage>,
+) {
+    while let Some(child) = row.first_child() {
+        row.remove(&child);
+    }
+    for (index, text) in messages.iter().enumerate() {
+        let chip = GtkBox::new(Orientation::Horizontal, 0);
+        chip.add_css_class("queued-chip");
+
+        let preview = Button::with_label(&chip_preview(text, CHIP_PREVIEW_MAX));
+        preview.add_css_class("flat");
+        preview.add_css_class("queued-chip-edit");
+        preview.set_tooltip_text(Some(text));
+        // Clicking a chip while another item is checked out must target the FULL
+        // queue index (the reducer reinserts the checked-out item first), not the
+        // visible position — otherwise the click edits a neighbouring message.
+        // The edit/remove index policy lives in `chip_click_message`.
+        let edit_tx = ui_tx.clone();
+        preview.connect_clicked(move |_| {
+            let _ = edit_tx.send(chip_click_message(ChipButton::Edit, index, editing));
+        });
+        chip.append(&preview);
+
+        let remove = Button::from_icon_name("window-close-symbolic");
+        remove.add_css_class("flat");
+        remove.add_css_class("queued-chip-remove");
+        remove.set_tooltip_text(Some("Remove from queue"));
+        let remove_tx = ui_tx.clone();
+        remove.connect_clicked(move |_| {
+            let _ = remove_tx.send(chip_click_message(ChipButton::Remove, index, editing));
+        });
+        chip.append(&remove);
+
+        row.append(&chip);
+    }
+    if editing.is_some() {
+        row.add_css_class("queued-chips-editing");
+    } else {
+        row.remove_css_class("queued-chips-editing");
+    }
+    row.set_visible(!messages.is_empty());
+}
+
 /// Current wall-clock time in epoch milliseconds. Centralized so the
 /// task-panel callers all use the same units as `TaskView.started_at`.
 fn now_epoch_ms() -> i64 {
@@ -1325,6 +1593,8 @@ fn handle_ui_message(
         sidebar,
         chat_view,
         status_label,
+        base_status,
+        queued_chips,
         context_label,
         client,
         pending_connector,
@@ -1381,6 +1651,16 @@ fn handle_ui_message(
         None
     };
 
+    // Composer clearing on `Effect::SendPrompt` (message-queue feature): a
+    // *direct* user send (the composer holds exactly the text being sent) must
+    // clear the live editor, but a *background* queue flush (StreamComplete /
+    // switch-back) emits the same `SendPrompt` while the composer may hold an
+    // unrelated fresh, not-yet-Entered draft that must survive (the reducer's
+    // `commit_send` deliberately leaves the live widget to the client). Only a
+    // `SubmitPrompt` origin is a direct send — capture it before `apply` consumes
+    // `msg`. The queue-op clears (enqueue / cancel edit) run via `SetComposerText`.
+    let user_initiated_send = is_user_initiated_send(&msg);
+
     // Pure decision: mutate state + compute the effects to perform.
     let effects = state.borrow_mut().apply(msg);
 
@@ -1391,7 +1671,26 @@ fn handle_ui_message(
                 *client.borrow_mut() = None;
             }
             Effect::SetStatusText(text) => {
-                status_label.set_text(&text);
+                // Remember the connection/transport status as the base, then
+                // re-compose with any active "N queued" suffix so a queue
+                // indicator and the transport status coexist (message-queue
+                // feature) rather than clobbering each other.
+                *base_status.borrow_mut() = text.clone();
+                let queued = state.borrow().queued_messages_for_view().len();
+                status_label.set_text(&compose_status(&text, queued));
+            }
+            Effect::SetComposerText(text) => {
+                // The core owns composer content for the queue flows: this loads a
+                // recalled queued message for editing (caret to end) or clears the
+                // box (`""`) when a submit is queued or an edit is cancelled.
+                input_bar.set_text_focus_end(&text);
+            }
+            Effect::SetQueuedMessages { messages, editing } => {
+                // Repaint the queued-message chips and the "N queued" indicator
+                // from the current conversation's outbox snapshot.
+                rebuild_queued_chips(queued_chips, &messages, editing, ui_tx);
+                let status = compose_status(&base_status.borrow(), messages.len());
+                status_label.set_text(&status);
             }
             Effect::SetSendSensitive(sensitive) => {
                 input_bar.send_button.set_sensitive(sensitive);
@@ -1660,7 +1959,12 @@ fn handle_ui_message(
                 // the live composer, and run the actual RPC off the GTK loop.
                 if let Some(connector) = client.borrow().clone() {
                     chat_view.borrow_mut().add_user_message(&prompt);
-                    input_bar.set_text("");
+                    // Clear the live composer only for a direct user send; a
+                    // background queue flush (same effect) must leave a fresh
+                    // draft intact (see `user_initiated_send` above).
+                    if user_initiated_send {
+                        input_bar.set_text("");
+                    }
                     let override_selection = model_picker.current_override();
                     let refinement = system_refinement.unwrap_or_default();
                     let ui_tx = ui_tx.clone();
@@ -1867,4 +2171,195 @@ pub fn install_app_icon() {
     icon_theme.add_search_path(cache_root.to_str().unwrap_or_default());
 
     gtk4::Window::set_default_icon_name(ICON_NAME);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CHIP_PREVIEW_MAX, ChipButton, RecallDecision, RecallKey, UiMessage, chip_click_message,
+        chip_edit_index, chip_preview, compose_status, is_user_initiated_send, recall_decision,
+    };
+
+    // --- AC9: a background queue flush must not wipe a fresh composer draft ----
+    // The `Effect::SendPrompt` executor clears the live composer only when the
+    // send is user-initiated. A direct `SubmitPrompt` clears; a background flush
+    // (which reaches the executor via a `StreamComplete`) must not.
+    #[test]
+    fn background_queue_flush_preserves_fresh_composer_draft() {
+        // A direct user send clears the composer.
+        assert!(is_user_initiated_send(&UiMessage::SubmitPrompt {
+            prompt: "hi".into(),
+        }));
+        // A background queue flush is triggered by a StreamComplete, which is
+        // NOT user-initiated: the composer (possibly a fresh draft) must survive.
+        assert!(!is_user_initiated_send(&UiMessage::StreamComplete {
+            request_id: "r1".into(),
+            full_response: "done".into(),
+        }));
+    }
+
+    // --- AC5: Down at the last queued item cancels rather than stepping out ----
+    #[test]
+    fn queue_recall_down_at_last_item_cancels_instead_of_stepping_out_of_range() {
+        // Queue length 3, editing the last item (index 2 == queue_len - 1... but
+        // the checked-out item is reinserted at `i`, so `i == queue_len` is the
+        // "past the last" boundary). Down at `i == queue_len` must Cancel, never
+        // Recall(queue_len) (an out-of-range EditQueued).
+        assert_eq!(
+            recall_decision(RecallKey::Down, false, Some(3), 3),
+            RecallDecision::Cancel
+        );
+        // Just before the boundary Down still steps toward the back.
+        assert_eq!(
+            recall_decision(RecallKey::Down, false, Some(2), 3),
+            RecallDecision::Recall(3)
+        );
+        // Down with nothing checked out is plain caret movement.
+        assert_eq!(
+            recall_decision(RecallKey::Down, false, None, 3),
+            RecallDecision::Proceed
+        );
+        // Up recall targets: nothing checked out grabs the last queued item;
+        // editing steps toward the front via saturating_sub.
+        assert_eq!(
+            recall_decision(RecallKey::Up, true, None, 3),
+            RecallDecision::Recall(2)
+        );
+        assert_eq!(
+            recall_decision(RecallKey::Up, true, Some(2), 3),
+            RecallDecision::Recall(1)
+        );
+        // Up from the front saturates (no underflow) rather than wrapping.
+        assert_eq!(
+            recall_decision(RecallKey::Up, true, Some(0), 3),
+            RecallDecision::Recall(0)
+        );
+        // Up on a non-empty composer / empty idle queue is caret movement.
+        assert_eq!(
+            recall_decision(RecallKey::Up, false, None, 3),
+            RecallDecision::Proceed
+        );
+        assert_eq!(
+            recall_decision(RecallKey::Up, true, None, 0),
+            RecallDecision::Proceed
+        );
+        // Escape cancels only while editing.
+        assert_eq!(
+            recall_decision(RecallKey::Escape, false, Some(1), 3),
+            RecallDecision::Cancel
+        );
+        assert_eq!(
+            recall_decision(RecallKey::Escape, false, None, 3),
+            RecallDecision::Proceed
+        );
+    }
+
+    // --- AC11: edit translates the visible index, remove passes it raw ---------
+    // Queue [a,b,c], editing b (slot 1) → visible [a,c]. Clicking edit on the
+    // visible chip `c` (visible 1) must target FULL index 2, while clicking its
+    // remove `x` targets the visible index 1 (the outbox position).
+    #[test]
+    fn rebuild_queued_chips_wires_edit_translated_and_remove_raw() {
+        match chip_click_message(ChipButton::Edit, 1, Some(1)) {
+            UiMessage::EditQueued { index } => assert_eq!(index, 2),
+            other => panic!("edit affordance must dispatch EditQueued, got {other:?}"),
+        }
+        match chip_click_message(ChipButton::Remove, 1, Some(1)) {
+            UiMessage::RemoveQueued { index } => assert_eq!(index, 1),
+            other => panic!("remove affordance must dispatch RemoveQueued, got {other:?}"),
+        }
+        // With nothing checked out the edit index is the visible index.
+        match chip_click_message(ChipButton::Edit, 2, None) {
+            UiMessage::EditQueued { index } => assert_eq!(index, 2),
+            other => panic!("expected EditQueued, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chip_edit_index_is_identity_when_nothing_checked_out() {
+        // With no active edit the visible list IS the full queue.
+        assert_eq!(chip_edit_index(0, None), 0);
+        assert_eq!(chip_edit_index(3, None), 3);
+    }
+
+    #[test]
+    fn chip_edit_index_skips_the_checked_out_slot() {
+        // Full queue [a,b,c], editing b (slot 1) → visible [a,c]. A click on the
+        // visible chip at or past slot 1 must skip the reinserted b: visible 0→0,
+        // visible 1 (c) → full 2, so the reducer checks out c, not b.
+        assert_eq!(chip_edit_index(0, Some(1)), 0);
+        assert_eq!(chip_edit_index(1, Some(1)), 2);
+    }
+
+    #[test]
+    fn chip_edit_index_editing_first_shifts_all_visible() {
+        // Editing slot 0 → every visible chip is one past its slot.
+        assert_eq!(chip_edit_index(0, Some(0)), 1);
+        assert_eq!(chip_edit_index(1, Some(0)), 2);
+    }
+
+    #[test]
+    fn chip_edit_index_editing_last_leaves_earlier_chips_unshifted() {
+        // Full [a,b,c], editing c (slot 2) → visible [a,b], both below the slot.
+        assert_eq!(chip_edit_index(0, Some(2)), 0);
+        assert_eq!(chip_edit_index(1, Some(2)), 1);
+    }
+
+    #[test]
+    fn compose_status_no_queue_is_base_verbatim() {
+        // With nothing queued the transport status shows unchanged (no suffix),
+        // so a queue update on conversation load can't clobber "Local daemon".
+        assert_eq!(compose_status("Local daemon", 0), "Local daemon");
+    }
+
+    #[test]
+    fn compose_status_appends_queue_count() {
+        // A pending queue adds an "N queued" indicator alongside the base status.
+        assert_eq!(compose_status("Local daemon", 1), "Local daemon, 1 queued");
+        assert_eq!(compose_status("Connected", 3), "Connected, 3 queued");
+    }
+
+    #[test]
+    fn chip_preview_passes_short_text_through() {
+        assert_eq!(chip_preview("hello", CHIP_PREVIEW_MAX), "hello");
+    }
+
+    #[test]
+    fn chip_preview_collapses_internal_whitespace_and_newlines() {
+        // Multi-line / multi-space prompts render as one compact line.
+        assert_eq!(chip_preview("first\nsecond", 40), "first second");
+        assert_eq!(chip_preview("a   b\t c", 40), "a b c");
+    }
+
+    #[test]
+    fn chip_preview_truncates_over_long_text_with_ellipsis() {
+        let long = "abcdefghijklmnopqrstuvwxyz"; // 26 chars
+        let preview = chip_preview(long, 10);
+        assert_eq!(preview, "abcdefg...");
+        assert_eq!(preview.chars().count(), 10);
+    }
+
+    #[test]
+    fn chip_preview_keeps_text_at_exactly_max() {
+        // The boundary length is passed through untruncated (<= max).
+        let exact = "1234567890"; // 10 chars
+        assert_eq!(chip_preview(exact, 10), exact);
+    }
+
+    #[test]
+    fn chip_preview_handles_multibyte_on_char_boundaries() {
+        // Truncation counts chars, not bytes: no panic mid-codepoint, and the
+        // char count stays within the limit for wide/emoji content.
+        let wide = "😀😀😀😀😀😀😀😀😀😀"; // 10 emoji
+        let preview = chip_preview(wide, 6);
+        assert_eq!(preview.chars().count(), 6);
+        assert!(preview.ends_with("..."));
+    }
+
+    #[test]
+    fn chip_preview_tiny_max_does_not_panic() {
+        // max < ellipsis width saturates to just the ellipsis rather than
+        // underflowing.
+        assert_eq!(chip_preview("abcdef", 2), "...");
+    }
 }
