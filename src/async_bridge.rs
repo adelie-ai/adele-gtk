@@ -864,16 +864,21 @@ mod tests {
             conversation_id: "c1".to_string(),
             request_id: "r1".to_string(),
             content: "what's the weather?".to_string(),
+            idempotency_key: Some("turn-key-1".to_string()),
         });
         match msg {
             UiMessage::UserMessageAdded {
                 conversation_id,
                 request_id,
                 content,
+                idempotency_key,
             } => {
                 assert_eq!(conversation_id, "c1");
                 assert_eq!(request_id, "r1");
                 assert_eq!(content, "what's the weather?");
+                // The echoed send key (#570) rides through the signal→UI map so
+                // the reducer can dedupe our own optimistic bubble by exact key.
+                assert_eq!(idempotency_key, Some("turn-key-1".to_string()));
             }
             other => panic!("expected UserMessageAdded, got {other:?}"),
         }

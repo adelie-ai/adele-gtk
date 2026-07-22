@@ -4,7 +4,9 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use desktop_assistant_api_model as api;
-use desktop_assistant_client_common::{AssistantClient, ConnectionConfig, Connector};
+use desktop_assistant_client_common::{
+    AssistantClient, AssistantCommands, ConnectionConfig, Connector,
+};
 use gtk4::prelude::*;
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, Entry, Label,
@@ -874,9 +876,7 @@ impl AdelieWindow {
                         ));
                         return;
                     }
-                    let _ = bridge_ref
-                        .ui_sender()
-                        .send(UiMessage::SubmitPrompt { prompt: text });
+                    let _ = bridge_ref.ui_sender().send(submit_prompt_message(text));
                 }
             ));
 
@@ -1477,6 +1477,44 @@ fn is_user_initiated_send(msg: &UiMessage) -> bool {
     matches!(msg, UiMessage::SubmitPrompt { .. })
 }
 
+/// Build the `SubmitPrompt` message for a user send (Enter / send-button /
+/// dictation), minting a fresh v4 UUID idempotency key (#570). The reducer stays
+/// wasm-clean and never mints keys; the host stamps one here so a
+/// dropped-connection retry re-attaches to the live turn and the echoed
+/// `UserMessageAdded` dedupes by exact key. A new key per send keeps distinct
+/// sends independent. Extracted so the mint is unit-testable away from the GTK
+/// widgets the send closure is bound to.
+fn submit_prompt_message(prompt: String) -> UiMessage {
+    UiMessage::SubmitPrompt {
+        prompt,
+        idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
+    }
+}
+
+/// Run the socket-transport send for an accepted [`Effect::SendPrompt`],
+/// threading the per-send idempotency key (#570) so a dropped-connection retry
+/// re-attaches to the live turn instead of re-running it (`None` preserves the
+/// keyless send). Split out of the GTK executor closure (which can't run
+/// headless) so the key-forwarding is unit-testable with a stub
+/// [`AssistantCommands`].
+async fn send_prompt_with_key(
+    cmds: &dyn AssistantCommands,
+    conversation_id: &str,
+    prompt: &str,
+    override_selection: Option<api::SendPromptOverride>,
+    system_refinement: String,
+    idempotency_key: Option<String>,
+) -> anyhow::Result<String> {
+    cmds.send_prompt_idempotent(
+        conversation_id,
+        prompt,
+        override_selection,
+        system_refinement,
+        idempotency_key,
+    )
+    .await
+}
+
 /// Translate a *visible* chip position into the full-queue index the reducer's
 /// `EditQueued` expects. While an item is checked out for editing it is absent
 /// from the rendered list (`queued_messages_for_view`), but `EditQueued`
@@ -1950,6 +1988,7 @@ fn handle_ui_message(
                 conversation_id,
                 prompt,
                 system_refinement,
+                idempotency_key,
             } => {
                 // The core accepted the send (`UiMessage::SubmitPrompt`): it ran
                 // the streaming gate (TUI-7), pushed the optimistic user message
@@ -1970,27 +2009,32 @@ fn handle_ui_message(
                     let ui_tx = ui_tx.clone();
                     crate::async_bridge::spawn_on_runtime(async move {
                         let client = connector.client();
-                        // Socket transports (UDS/WS) carry the model override AND
-                        // the refinement together via `send_prompt_full`; the
-                        // shared `AssistantClient` exposes neither, so over D-Bus
-                        // we fall back to `send_prompt_with_system_refinement`
-                        // (the override is unavailable there regardless).
+                        // Socket transports (UDS/WS) carry the model override, the
+                        // refinement, AND the per-send idempotency key (#570)
+                        // together via `send_prompt_idempotent`; the shared
+                        // `AssistantClient` exposes none of them, so over D-Bus we
+                        // fall back to the connector's refinement send (the
+                        // override is unavailable there regardless, and a dropped
+                        // D-Bus call can't re-attach, so the key is dropped).
                         let result = match client.as_commands() {
                             Some(cmds) => {
-                                cmds.send_prompt_full(
+                                send_prompt_with_key(
+                                    cmds,
                                     &conversation_id,
                                     &prompt,
                                     override_selection,
                                     refinement,
+                                    idempotency_key,
                                 )
                                 .await
                             }
                             None => {
                                 connector
-                                    .send_prompt_with_system_refinement(
+                                    .send_prompt_with_system_refinement_idempotent(
                                         &conversation_id,
                                         &prompt,
                                         &refinement,
+                                        idempotency_key,
                                     )
                                     .await
                             }
@@ -2190,6 +2234,7 @@ mod tests {
         // A direct user send clears the composer.
         assert!(is_user_initiated_send(&UiMessage::SubmitPrompt {
             prompt: "hi".into(),
+            idempotency_key: None,
         }));
         // A background queue flush is triggered by a StreamComplete, which is
         // NOT user-initiated: the composer (possibly a fresh draft) must survive.
@@ -2432,10 +2477,16 @@ mod tests {
             last: std::sync::Mutex::new(None),
         };
         let key = "turn-key-1".to_string();
-        let returned =
-            send_prompt_with_key(&cmds, "conv-1", "hello", None, String::new(), Some(key.clone()))
-                .await
-                .expect("send dispatch");
+        let returned = send_prompt_with_key(
+            &cmds,
+            "conv-1",
+            "hello",
+            None,
+            String::new(),
+            Some(key.clone()),
+        )
+        .await
+        .expect("send dispatch");
         // Returns the correlation `request_id` (voice#49), not the `task_id`.
         assert_eq!(returned, "req-1");
         match cmds
