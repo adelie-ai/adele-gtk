@@ -1,6 +1,8 @@
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 
+use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
 use gtk4::prelude::*;
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, GestureClick, Image, Label,
@@ -10,6 +12,7 @@ use gtk4::{
 use crate::async_bridge;
 use crate::credential_store::CredentialStore;
 use crate::oauth;
+use crate::preferences::PreferencesStore;
 use crate::profile::{ConnectionProfile, LastConnectionStore, ProfileStore, ProtocolConfig};
 use crate::widgets::context_menu;
 use crate::widgets::setup_dialog;
@@ -423,10 +426,14 @@ impl LoginScreen {
 }
 
 /// Attempt to connect to a profile by discovering auth method and obtaining credentials.
-pub async fn connect_to_profile(
-    profile: &ConnectionProfile,
-) -> anyhow::Result<desktop_assistant_client_common::ConnectionConfig> {
-    use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
+///
+/// The persisted "share device info" preference
+/// ([`PreferencesStore`], desktop-assistant#549) is read once here and stamped
+/// onto whichever config variant we return, so an off-switch takes effect on the
+/// next connect regardless of transport or auth method. Reading it defaults to on
+/// (absent/corrupt file), matching [`ConnectionConfig`]'s own default.
+pub async fn connect_to_profile(profile: &ConnectionProfile) -> anyhow::Result<ConnectionConfig> {
+    let share_client_context = PreferencesStore::new().load().share_client_context;
 
     // Local socket: skip auth discovery entirely. The UDS connection is
     // authenticated by kernel peer-cred (desktop-assistant#407) — no token is
@@ -435,11 +442,7 @@ pub async fn connect_to_profile(
     // server via OAuth/password.
     let (ws_url, ws_subject) = match &profile.protocol {
         ProtocolConfig::Local { path } => {
-            return Ok(ConnectionConfig {
-                transport_mode: TransportMode::Uds,
-                socket_path: path.clone(),
-                ..Default::default()
-            });
+            return Ok(local_uds_config(path.clone(), share_client_context));
         }
         ProtocolConfig::Websocket { url, subject } => (url.clone(), subject.clone()),
     };
@@ -472,7 +475,12 @@ pub async fn connect_to_profile(
                     if let Some(ref new_refresh) = tokens.refresh_token {
                         let _ = CredentialStore::store_refresh_token(&profile.id, new_refresh);
                     }
-                    return Ok(ws_jwt_config(&ws_url, &ws_subject, tokens.access_token));
+                    return Ok(ws_jwt_config(
+                        &ws_url,
+                        &ws_subject,
+                        tokens.access_token,
+                        share_client_context,
+                    ));
                 }
                 Err(e) => {
                     tracing::info!("silent refresh failed, will try browser flow: {e}");
@@ -489,7 +497,12 @@ pub async fn connect_to_profile(
             let _ = CredentialStore::store_refresh_token(&profile.id, refresh_token);
         }
 
-        return Ok(ws_jwt_config(&ws_url, &ws_subject, tokens.access_token));
+        return Ok(ws_jwt_config(
+            &ws_url,
+            &ws_subject,
+            tokens.access_token,
+            share_client_context,
+        ));
     }
 
     // Fall back to password auth
@@ -499,29 +512,63 @@ pub async fn connect_to_profile(
             .flatten();
         let password = CredentialStore::get_password(&profile.id).ok().flatten();
 
-        return Ok(ConnectionConfig {
-            transport_mode: TransportMode::Ws,
-            ws_url: ws_url.clone(),
-            ws_jwt: None,
-            ws_login_username: username,
-            ws_login_password: password,
-            ws_subject: ws_subject.clone(),
-            ..Default::default()
-        });
+        return Ok(ws_password_config(
+            &ws_url,
+            &ws_subject,
+            username,
+            password,
+            share_client_context,
+        ));
     }
 
     anyhow::bail!("server does not offer any supported auth methods")
 }
 
+/// Build the connection config for a local Unix-domain-socket link.
+///
+/// `share_client_context` carries the persisted "share device info" preference
+/// (default on, desktop-assistant#549) onto the config so the Connector attaches
+/// device context to the connect handshake only when the user leaves it on.
+fn local_uds_config(socket_path: Option<PathBuf>, share_client_context: bool) -> ConnectionConfig {
+    ConnectionConfig {
+        transport_mode: TransportMode::Uds,
+        socket_path,
+        share_client_context,
+        ..Default::default()
+    }
+}
+
+/// Build the WebSocket + username/password connection config. `share_client_context`
+/// is threaded through exactly as in [`local_uds_config`].
+fn ws_password_config(
+    ws_url: &str,
+    ws_subject: &str,
+    username: Option<String>,
+    password: Option<String>,
+    share_client_context: bool,
+) -> ConnectionConfig {
+    ConnectionConfig {
+        transport_mode: TransportMode::Ws,
+        ws_url: ws_url.to_string(),
+        ws_jwt: None,
+        ws_login_username: username,
+        ws_login_password: password,
+        ws_subject: ws_subject.to_string(),
+        share_client_context,
+        ..Default::default()
+    }
+}
+
 /// Build the WebSocket + bearer-JWT connection config shared by both OAuth
 /// success paths (silent refresh and full browser flow). The only thing that
 /// differs between those paths is where the `jwt` comes from.
+/// `share_client_context` is threaded through as in [`local_uds_config`].
 fn ws_jwt_config(
     ws_url: &str,
     ws_subject: &str,
     jwt: String,
-) -> desktop_assistant_client_common::ConnectionConfig {
-    use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
+    share_client_context: bool,
+) -> ConnectionConfig {
     ConnectionConfig {
         transport_mode: TransportMode::Ws,
         ws_url: ws_url.to_string(),
@@ -529,6 +576,44 @@ fn ws_jwt_config(
         ws_login_username: None,
         ws_login_password: None,
         ws_subject: ws_subject.to_string(),
+        share_client_context,
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_uds_config_carries_share_flag_on() {
+        let cfg = local_uds_config(None, true);
+        assert!(matches!(cfg.transport_mode, TransportMode::Uds));
+        assert!(cfg.share_client_context);
+    }
+
+    #[test]
+    fn local_uds_config_carries_share_flag_off() {
+        let cfg = local_uds_config(Some(PathBuf::from("/run/adelie/sock")), false);
+        assert!(matches!(cfg.transport_mode, TransportMode::Uds));
+        assert!(!cfg.share_client_context);
+    }
+
+    #[test]
+    fn ws_password_config_carries_share_flag() {
+        let on = ws_password_config("ws://x", "s", None, None, true);
+        assert!(matches!(on.transport_mode, TransportMode::Ws));
+        assert!(on.share_client_context);
+        let off = ws_password_config("ws://x", "s", None, None, false);
+        assert!(!off.share_client_context);
+    }
+
+    #[test]
+    fn ws_jwt_config_carries_share_flag() {
+        let on = ws_jwt_config("ws://x", "s", "jwt".to_string(), true);
+        assert_eq!(on.ws_jwt.as_deref(), Some("jwt"));
+        assert!(on.share_client_context);
+        let off = ws_jwt_config("ws://x", "s", "jwt".to_string(), false);
+        assert!(!off.share_client_context);
     }
 }

@@ -28,6 +28,7 @@ mod markdown;
 #[cfg(not(feature = "linux"))]
 mod markdown_text;
 mod oauth;
+mod preferences;
 mod profile;
 mod selected_models;
 mod theme;
