@@ -379,3 +379,53 @@ entry:focus {
     color: #d9534f;
     font-size: 12px;
 }
+
+/* Queued-message chips (message-queue feature): the row of pills above the
+   composer, one per message waiting to flush after the current reply finishes.
+   Each chip's label recalls the message into the composer for editing; the x
+   drops it. Rebuilt from every SetQueuedMessages snapshot. */
+.queued-chip {
+    border-radius: 12px;
+    background-color: alpha(#84dac1, 0.14);
+    border: 1px solid alpha(#84dac1, 0.30);
+    padding: 0 2px;
+}
+
+/* The recall/edit affordance fills the pill; flat so it reads as chip text, not
+   a button. */
+.queued-chip-edit {
+    padding: 2px 8px;
+    min-height: 0;
+    color: #cfeee4;
+    font-size: 12px;
+    background: none;
+    border: none;
+    box-shadow: none;
+}
+
+.queued-chip-edit:hover {
+    background-color: alpha(#84dac1, 0.20);
+    border-radius: 10px;
+}
+
+/* The x button that drops a queued message; reddens on hover to signal removal. */
+.queued-chip-remove {
+    min-height: 0;
+    min-width: 0;
+    padding: 0 4px;
+    color: #9aa3b2;
+    background: none;
+    border: none;
+    box-shadow: none;
+}
+
+.queued-chip-remove:hover {
+    color: #d9534f;
+}
+
+/* An edit is checked out into the composer (its chip is absent from the row):
+   tint the remaining chips so the queue reads as mid-edit (header-blue accent). */
+.queued-chips-editing .queued-chip {
+    background-color: alpha(#88d6f0, 0.14);
+    border-color: alpha(#88d6f0, 0.40);
+}
