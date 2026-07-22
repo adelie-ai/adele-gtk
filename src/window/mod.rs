@@ -4,7 +4,9 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use desktop_assistant_api_model as api;
-use desktop_assistant_client_common::{AssistantClient, ConnectionConfig, Connector};
+use desktop_assistant_client_common::{
+    AssistantClient, AssistantCommands, ConnectionConfig, Connector,
+};
 use gtk4::prelude::*;
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, Entry, Label,
@@ -874,9 +876,7 @@ impl AdelieWindow {
                         ));
                         return;
                     }
-                    let _ = bridge_ref
-                        .ui_sender()
-                        .send(UiMessage::SubmitPrompt { prompt: text });
+                    let _ = bridge_ref.ui_sender().send(submit_prompt_message(text));
                 }
             ));
 
@@ -1477,6 +1477,44 @@ fn is_user_initiated_send(msg: &UiMessage) -> bool {
     matches!(msg, UiMessage::SubmitPrompt { .. })
 }
 
+/// Build the `SubmitPrompt` message for a user send (Enter / send-button /
+/// dictation), minting a fresh v4 UUID idempotency key (#570). The reducer stays
+/// wasm-clean and never mints keys; the host stamps one here so a
+/// dropped-connection retry re-attaches to the live turn and the echoed
+/// `UserMessageAdded` dedupes by exact key. A new key per send keeps distinct
+/// sends independent. Extracted so the mint is unit-testable away from the GTK
+/// widgets the send closure is bound to.
+fn submit_prompt_message(prompt: String) -> UiMessage {
+    UiMessage::SubmitPrompt {
+        prompt,
+        idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
+    }
+}
+
+/// Run the socket-transport send for an accepted [`Effect::SendPrompt`],
+/// threading the per-send idempotency key (#570) so a dropped-connection retry
+/// re-attaches to the live turn instead of re-running it (`None` preserves the
+/// keyless send). Split out of the GTK executor closure (which can't run
+/// headless) so the key-forwarding is unit-testable with a stub
+/// [`AssistantCommands`].
+async fn send_prompt_with_key(
+    cmds: &dyn AssistantCommands,
+    conversation_id: &str,
+    prompt: &str,
+    override_selection: Option<api::SendPromptOverride>,
+    system_refinement: String,
+    idempotency_key: Option<String>,
+) -> anyhow::Result<String> {
+    cmds.send_prompt_idempotent(
+        conversation_id,
+        prompt,
+        override_selection,
+        system_refinement,
+        idempotency_key,
+    )
+    .await
+}
+
 /// Translate a *visible* chip position into the full-queue index the reducer's
 /// `EditQueued` expects. While an item is checked out for editing it is absent
 /// from the rendered list (`queued_messages_for_view`), but `EditQueued`
@@ -1950,6 +1988,7 @@ fn handle_ui_message(
                 conversation_id,
                 prompt,
                 system_refinement,
+                idempotency_key,
             } => {
                 // The core accepted the send (`UiMessage::SubmitPrompt`): it ran
                 // the streaming gate (TUI-7), pushed the optimistic user message
@@ -1970,27 +2009,32 @@ fn handle_ui_message(
                     let ui_tx = ui_tx.clone();
                     crate::async_bridge::spawn_on_runtime(async move {
                         let client = connector.client();
-                        // Socket transports (UDS/WS) carry the model override AND
-                        // the refinement together via `send_prompt_full`; the
-                        // shared `AssistantClient` exposes neither, so over D-Bus
-                        // we fall back to `send_prompt_with_system_refinement`
-                        // (the override is unavailable there regardless).
+                        // Socket transports (UDS/WS) carry the model override, the
+                        // refinement, AND the per-send idempotency key (#570)
+                        // together via `send_prompt_idempotent`; the shared
+                        // `AssistantClient` exposes none of them, so over D-Bus we
+                        // fall back to the connector's refinement send (the
+                        // override is unavailable there regardless, and a dropped
+                        // D-Bus call can't re-attach, so the key is dropped).
                         let result = match client.as_commands() {
                             Some(cmds) => {
-                                cmds.send_prompt_full(
+                                send_prompt_with_key(
+                                    cmds,
                                     &conversation_id,
                                     &prompt,
                                     override_selection,
                                     refinement,
+                                    idempotency_key,
                                 )
                                 .await
                             }
                             None => {
                                 connector
-                                    .send_prompt_with_system_refinement(
+                                    .send_prompt_with_system_refinement_idempotent(
                                         &conversation_id,
                                         &prompt,
                                         &refinement,
+                                        idempotency_key,
                                     )
                                     .await
                             }
@@ -2176,8 +2220,9 @@ pub fn install_app_icon() {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHIP_PREVIEW_MAX, ChipButton, RecallDecision, RecallKey, UiMessage, chip_click_message,
-        chip_edit_index, chip_preview, compose_status, is_user_initiated_send, recall_decision,
+        AssistantCommands, CHIP_PREVIEW_MAX, ChipButton, RecallDecision, RecallKey, UiMessage, api,
+        chip_click_message, chip_edit_index, chip_preview, compose_status, is_user_initiated_send,
+        recall_decision, send_prompt_with_key, submit_prompt_message,
     };
 
     // --- AC9: a background queue flush must not wipe a fresh composer draft ----
@@ -2189,6 +2234,7 @@ mod tests {
         // A direct user send clears the composer.
         assert!(is_user_initiated_send(&UiMessage::SubmitPrompt {
             prompt: "hi".into(),
+            idempotency_key: None,
         }));
         // A background queue flush is triggered by a StreamComplete, which is
         // NOT user-initiated: the composer (possibly a fresh draft) must survive.
@@ -2361,5 +2407,136 @@ mod tests {
         // max < ellipsis width saturates to just the ellipsis rather than
         // underflowing.
         assert_eq!(chip_preview("abcdef", 2), "...");
+    }
+
+    // --- #570 Phase 1: per-send idempotency key -------------------------------
+    // A user send mints a fresh v4 UUID idempotency key so a dropped-connection
+    // retry re-attaches to the live turn and the echoed `UserMessageAdded`
+    // dedupes by exact match. The reducer stays wasm-clean (it never mints
+    // keys); the host stamps one here.
+    #[test]
+    fn send_action_stamps_a_fresh_v4_idempotency_key() {
+        match submit_prompt_message("hello".into()) {
+            UiMessage::SubmitPrompt {
+                prompt,
+                idempotency_key,
+            } => {
+                assert_eq!(prompt, "hello");
+                let key = idempotency_key.expect("a user send must carry an idempotency key");
+                let parsed =
+                    uuid::Uuid::parse_str(&key).expect("the idempotency key must be a valid UUID");
+                assert_eq!(
+                    parsed.get_version(),
+                    Some(uuid::Version::Random),
+                    "the key must be a v4 (random) UUID"
+                );
+            }
+            other => panic!("expected SubmitPrompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_send_mints_a_distinct_idempotency_key() {
+        // Two sends must not collide — each turn gets its own key so retrying
+        // one send never re-attaches to another turn.
+        fn key_of(msg: UiMessage) -> String {
+            match msg {
+                UiMessage::SubmitPrompt {
+                    idempotency_key, ..
+                } => idempotency_key.expect("send must carry a key"),
+                other => panic!("expected SubmitPrompt, got {other:?}"),
+            }
+        }
+        assert_ne!(
+            key_of(submit_prompt_message("a".into())),
+            key_of(submit_prompt_message("b".into()))
+        );
+    }
+
+    /// A stub `AssistantCommands` capturing the last command, so an
+    /// executor-level test can assert the idempotency key reaches the wire
+    /// without standing up a transport.
+    struct RecordingCommands {
+        last: std::sync::Mutex<Option<api::Command>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AssistantCommands for RecordingCommands {
+        async fn send_command(&self, command: api::Command) -> anyhow::Result<api::CommandResult> {
+            *self.last.lock().unwrap() = Some(command);
+            Ok(api::CommandResult::SendMessageAck {
+                request_id: "req-1".into(),
+                task_id: "task-1".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_send_forwards_idempotency_key_on_the_wire() {
+        let cmds = RecordingCommands {
+            last: std::sync::Mutex::new(None),
+        };
+        let key = "turn-key-1".to_string();
+        let returned = send_prompt_with_key(
+            &cmds,
+            "conv-1",
+            "hello",
+            None,
+            String::new(),
+            Some(key.clone()),
+        )
+        .await
+        .expect("send dispatch");
+        // Returns the correlation `request_id` (voice#49), not the `task_id`.
+        assert_eq!(returned, "req-1");
+        match cmds
+            .last
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a command was sent")
+        {
+            api::Command::SendMessage {
+                conversation_id,
+                content,
+                idempotency_key,
+                ..
+            } => {
+                assert_eq!(conversation_id, "conv-1");
+                assert_eq!(content, "hello");
+                assert_eq!(
+                    idempotency_key,
+                    Some(key),
+                    "the executor must forward the send's idempotency key unchanged"
+                );
+            }
+            other => panic!("expected Command::SendMessage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_keyless_send_stays_keyless() {
+        // Backward-compat: a `None` key must not fabricate one on the wire, so a
+        // keyless caller keeps the pre-#570 behaviour.
+        let cmds = RecordingCommands {
+            last: std::sync::Mutex::new(None),
+        };
+        send_prompt_with_key(&cmds, "c", "hi", None, String::new(), None)
+            .await
+            .expect("send dispatch");
+        match cmds
+            .last
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a command was sent")
+        {
+            api::Command::SendMessage {
+                idempotency_key, ..
+            } => {
+                assert_eq!(idempotency_key, None);
+            }
+            other => panic!("expected Command::SendMessage, got {other:?}"),
+        }
     }
 }
