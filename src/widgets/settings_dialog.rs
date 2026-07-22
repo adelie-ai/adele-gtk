@@ -34,10 +34,12 @@ use tokio::sync::mpsc;
 use crate::async_bridge::{AsyncBridge, UiMessage};
 use crate::management_client;
 use crate::mcp_admin::{self, McpBackend};
+use crate::preferences::PreferencesStore;
 use crate::voice_client::VoiceController;
 
 use super::connection_config_dialog::{ConnectorType, show_configure_dialog};
 use super::connections_tab::ConnectionsTab;
+use super::general_tab::GeneralTab;
 use super::mcp_server_dialog::{BuiltMcpServer, McpForm, McpTransport, show_mcp_server_dialog};
 use super::mcp_servers_tab::McpServersTab;
 use super::purposes_tab::PurposesTab;
@@ -164,6 +166,7 @@ pub fn show_settings_dialog(
     let purposes_tab = Rc::new(PurposesTab::new());
     let mcp_tab = Rc::new(McpServersTab::new());
     let voice_tab = Rc::new(VoiceTab::new());
+    let general_tab = Rc::new(GeneralTab::new());
 
     // Snapshot of the OAuth service accounts (epic #477), refreshed alongside
     // the MCP server list and handed to the editor's account picker.
@@ -185,6 +188,7 @@ pub fn show_settings_dialog(
     notebook.append_page(&purposes_tab.container, Some(&Label::new(Some("Purposes"))));
     notebook.append_page(&mcp_tab.container, Some(&Label::new(Some("MCP Servers"))));
     notebook.append_page(&voice_tab.container, Some(&Label::new(Some("Voice"))));
+    notebook.append_page(&general_tab.container, Some(&Label::new(Some("General"))));
 
     vbox.append(&notebook);
 
@@ -558,6 +562,32 @@ pub fn show_settings_dialog(
     // Voice tab wiring (separate D-Bus service — see `voice_client`).
     // ---------------------------------------------------------------
     wire_voice_tab(&voice_tab, &voice, &bridge);
+
+    // ---------------------------------------------------------------
+    // General tab wiring (client-local preferences, da#549).
+    //
+    // The share-device-info toggle is backed by the client's own
+    // `PreferencesStore` (not the daemon): hydrate it from the persisted value
+    // (default on) and persist every change. The `preferences.json` read/write
+    // is a tiny local file op, matching the existing sync store usage
+    // (profiles, selected models); the new value is applied on the next
+    // (re)connect, so the toggle notes that rather than reconnecting live.
+    let prefs_store = Rc::new(PreferencesStore::new());
+    general_tab.set_share_client_context(prefs_store.load().share_client_context);
+    general_tab.connect_toggled(glib::clone!(
+        #[strong]
+        prefs_store,
+        #[strong]
+        status_label,
+        move |on| {
+            match prefs_store.set_share_client_context(on) {
+                Ok(()) => status_label.set_text(
+                    "Device-info sharing preference saved - applies on the next connect.",
+                ),
+                Err(e) => status_label.set_text(&format!("Save preference: {e}")),
+            }
+        }
+    ));
 
     // ---------------------------------------------------------------
     // MCP-servers tab wiring (issue #495).
