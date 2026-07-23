@@ -631,6 +631,8 @@ mod tests {
             children: vec![],
             title: format!("Task {id}"),
             progress_hint: None,
+            owner_todo: String::new(),
+            spawn_marker: None,
         }
     }
 
@@ -681,6 +683,7 @@ mod tests {
                 parent_task_id: api::TaskId("p".into()),
                 conversation_id: "c".into(),
                 name: "child".into(),
+                session_conversation_id: String::new(),
             }),
             "Subagent"
         );
@@ -904,6 +907,8 @@ mod tests {
             children: vec![],
             title: "t".into(),
             progress_hint: None,
+            owner_todo: String::new(),
+            spawn_marker: None,
         };
         let vm = view_model_for(&t, 1_000);
         assert_eq!(vm.conversation_id.as_deref(), Some(""));
