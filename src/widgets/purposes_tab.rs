@@ -34,6 +34,81 @@ fn purpose_label(p: api::PurposeKindApi) -> &'static str {
     }
 }
 
+/// What a row's dropdowns currently show, lifted out of GTK so the decision
+/// to write is plain data. `None` on a value means the dropdown has nothing
+/// real selected — typically because its model list failed to load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RowSelection {
+    connection: Option<String>,
+    model: Option<String>,
+    effort: Option<api::EffortLevel>,
+    max_context_tokens: Option<u64>,
+}
+
+/// Decide whether `current` is a write worth sending for `purpose`.
+///
+/// Why this is a pure function rather than a guard flag: the previous version
+/// suppressed writes with a boolean held across `reconcile`, which only covers
+/// notifications GTK delivers synchronously. Anything arriving after
+/// `reconcile` returned was unguarded, re-emitted a `SetPurpose`, and the
+/// resulting refresh reconciled again — a write loop that only ended when the
+/// socket dropped.
+///
+/// Returns `None` — meaning "not a user-intended change, send nothing" — when:
+///
+/// * either dropdown has no real selection (the model list never loaded, so
+///   the UI cannot represent a binding it would be honest to write);
+/// * the pair is mixed: `"primary"` means inherit and is only meaningful when
+///   *both* connection and model carry it. A real connection with a `"primary"`
+///   model is the shape that silently retired a live binding;
+/// * `Interactive` claims to inherit — there is no primary above it;
+/// * the result equals `last_known`, the state the daemon last reported. This
+///   is what makes reconciliation structurally incapable of writing: it sets
+///   the widgets to exactly that state, so anything it triggers is a no-op.
+fn planned_write(
+    purpose: api::PurposeKindApi,
+    current: &RowSelection,
+    last_known: Option<&api::PurposeConfigView>,
+) -> Option<api::PurposeConfigView> {
+    let connection = current.connection.as_ref()?;
+    let model = current.model.as_ref()?;
+
+    let connection_inherits = connection == PRIMARY_SENTINEL;
+    let model_inherits = model == PRIMARY_SENTINEL;
+    if connection_inherits != model_inherits {
+        return None;
+    }
+    if connection_inherits && matches!(purpose, api::PurposeKindApi::Interactive) {
+        return None;
+    }
+
+    let candidate = api::PurposeConfigView {
+        connection: connection.clone(),
+        model: model.clone(),
+        effort: current.effort,
+        max_context_tokens: current.max_context_tokens,
+    };
+    if last_known == Some(&candidate) {
+        return None;
+    }
+    Some(candidate)
+}
+
+/// The daemon's last reported binding for `purpose`, if it has one.
+fn purpose_config(
+    purposes: &api::PurposesView,
+    purpose: api::PurposeKindApi,
+) -> Option<&api::PurposeConfigView> {
+    match purpose {
+        api::PurposeKindApi::Interactive => purposes.interactive.as_ref(),
+        api::PurposeKindApi::Dreaming => purposes.dreaming.as_ref(),
+        api::PurposeKindApi::Consolidation => purposes.consolidation.as_ref(),
+        api::PurposeKindApi::Embedding => purposes.embedding.as_ref(),
+        api::PurposeKindApi::Titling => purposes.titling.as_ref(),
+        api::PurposeKindApi::Voice => purposes.voice.as_ref(),
+    }
+}
+
 /// Ephemeral UI state for each row.
 struct Row {
     connection_dd: DropDown,
@@ -64,8 +139,12 @@ pub struct PurposesTab {
     models_by_connection: Rc<RefCell<BTreeMap<String, Vec<api::ModelListing>>>>,
     on_set_purpose: Rc<RefCell<Option<SetPurposeCb>>>,
     on_request_models: Rc<RefCell<Option<RequestModelsCb>>>,
-    /// When true, we're reconciling the UI to state — suppress
-    /// `set_purpose` callbacks on change notifications.
+    /// When true, we're reconciling the UI to state. This skips the work of
+    /// re-deriving a write from notifications GTK delivers synchronously — an
+    /// optimization, *not* the correctness guarantee. Guarding on this flag
+    /// alone is what allowed the write loop: a notification arriving after
+    /// `reconcile` returned found it cleared. `planned_write` is the actual
+    /// guarantee, because it drops any write matching last-known server state.
     suppress: Rc<RefCell<bool>>,
 }
 
@@ -155,6 +234,8 @@ impl PurposesTab {
                 on_request_models,
                 #[strong]
                 suppress,
+                #[strong]
+                purposes,
                 move |_| {
                     if *suppress.borrow() {
                         return;
@@ -168,7 +249,7 @@ impl PurposesTab {
                         &on_request_models,
                         &suppress,
                     );
-                    emit_current(purpose, &rows, &on_set_purpose);
+                    emit_current(purpose, &rows, &purposes, &on_set_purpose);
                 }
             ));
 
@@ -179,11 +260,13 @@ impl PurposesTab {
                 on_set_purpose,
                 #[strong]
                 suppress,
+                #[strong]
+                purposes,
                 move |_| {
                     if *suppress.borrow() {
                         return;
                     }
-                    emit_current(purpose, &rows, &on_set_purpose);
+                    emit_current(purpose, &rows, &purposes, &on_set_purpose);
                 }
             ));
 
@@ -194,11 +277,13 @@ impl PurposesTab {
                 on_set_purpose,
                 #[strong]
                 suppress,
+                #[strong]
+                purposes,
                 move |_| {
                     if *suppress.borrow() {
                         return;
                     }
-                    emit_current(purpose, &rows, &on_set_purpose);
+                    emit_current(purpose, &rows, &purposes, &on_set_purpose);
                 }
             ));
 
@@ -372,15 +457,7 @@ fn apply_purpose_config(
         return;
     };
     let purposes = purposes.borrow();
-    let cfg = match purpose {
-        api::PurposeKindApi::Interactive => purposes.interactive.as_ref(),
-        api::PurposeKindApi::Dreaming => purposes.dreaming.as_ref(),
-        api::PurposeKindApi::Consolidation => purposes.consolidation.as_ref(),
-        api::PurposeKindApi::Embedding => purposes.embedding.as_ref(),
-        api::PurposeKindApi::Titling => purposes.titling.as_ref(),
-        api::PurposeKindApi::Voice => purposes.voice.as_ref(),
-    };
-    let Some(cfg) = cfg else {
+    let Some(cfg) = purpose_config(&purposes, purpose) else {
         return;
     };
 
@@ -418,37 +495,218 @@ fn apply_purpose_config(
 fn emit_current(
     purpose: api::PurposeKindApi,
     rows: &Rc<RefCell<BTreeMap<String, Row>>>,
+    purposes: &Rc<RefCell<api::PurposesView>>,
     on_set_purpose: &Rc<RefCell<Option<SetPurposeCb>>>,
 ) {
     let rows_borrow = rows.borrow();
     let Some(row) = rows_borrow.get(purpose.as_key()) else {
         return;
     };
+
+    // Read the dropdowns into plain data. A selection that does not index into
+    // the row's value mirror means the list is empty or out of sync, which is
+    // "nothing real is selected" rather than a value worth writing.
     let conn_idx = row.connection_dd.selected() as usize;
-    let Some(connection) = row.connection_values.borrow().get(conn_idx).cloned() else {
-        return;
-    };
     let model_idx = row.model_dd.selected() as usize;
-    let Some(model) = row.model_values.borrow().get(model_idx).cloned() else {
-        return;
-    };
-    let effort = match row.effort_dd.selected() {
-        0 => None,
-        1 => Some(api::EffortLevel::Low),
-        2 => Some(api::EffortLevel::Medium),
-        3 => Some(api::EffortLevel::High),
-        _ => None,
-    };
-    let config = api::PurposeConfigView {
-        connection,
-        model,
-        effort,
+    let current = RowSelection {
+        connection: row.connection_values.borrow().get(conn_idx).cloned(),
+        model: row.model_values.borrow().get(model_idx).cloned(),
+        effort: match row.effort_dd.selected() {
+            1 => Some(api::EffortLevel::Low),
+            2 => Some(api::EffortLevel::Medium),
+            3 => Some(api::EffortLevel::High),
+            _ => None,
+        },
         // Context-window override (#51) isn't editable in this UI, but
         // `SetPurpose` is a full replace — preserve whatever the daemon
         // last reported so we don't clobber an override set elsewhere.
         max_context_tokens: *row.max_context_tokens.borrow(),
     };
+
+    let purposes_borrow = purposes.borrow();
+    let last_known = purpose_config(&purposes_borrow, purpose);
+    let Some(config) = planned_write(purpose, &current, last_known) else {
+        return;
+    };
+    drop(purposes_borrow);
+
     if let Some(ref cb) = *on_set_purpose.borrow() {
         cb(purpose, config);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sel(connection: Option<&str>, model: Option<&str>) -> RowSelection {
+        RowSelection {
+            connection: connection.map(str::to_string),
+            model: model.map(str::to_string),
+            effort: None,
+            max_context_tokens: None,
+        }
+    }
+
+    fn cfg(connection: &str, model: &str) -> api::PurposeConfigView {
+        api::PurposeConfigView {
+            connection: connection.into(),
+            model: model.into(),
+            effort: None,
+            max_context_tokens: None,
+        }
+    }
+
+    #[test]
+    fn reconciling_to_server_state_is_not_a_write() {
+        // The loop: refresh -> reconcile -> stray notify -> emit -> refresh.
+        // Reconcile sets the widgets to exactly `last_known`, so the write it
+        // would produce is a no-op and must be dropped.
+        let server = cfg("bedrock", "zai.glm-5");
+        assert_eq!(
+            planned_write(
+                api::PurposeKindApi::Embedding,
+                &sel(Some("bedrock"), Some("zai.glm-5")),
+                Some(&server),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unavailable_model_list_is_not_writable() {
+        // Bedrock's model list failed, so the dropdown holds nothing real.
+        // The row must not be writable at all.
+        assert_eq!(
+            planned_write(
+                api::PurposeKindApi::Embedding,
+                &sel(Some("bedrock"), None),
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unavailable_connection_list_is_not_writable() {
+        assert_eq!(
+            planned_write(
+                api::PurposeKindApi::Embedding,
+                &sel(None, Some("nomic-embed-text")),
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn mixed_primary_pair_is_never_emitted() {
+        // The exact shape that retired a live binding in production:
+        // a real connection with the inherit sentinel as the model.
+        assert_eq!(
+            planned_write(
+                api::PurposeKindApi::Embedding,
+                &sel(Some("bedrock"), Some(PRIMARY_SENTINEL)),
+                Some(&cfg("default", "nomic-embed-text")),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn mixed_primary_pair_is_never_emitted_in_either_order() {
+        assert_eq!(
+            planned_write(
+                api::PurposeKindApi::Embedding,
+                &sel(Some(PRIMARY_SENTINEL), Some("zai.glm-5")),
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn interactive_cannot_inherit() {
+        // There is no primary above interactive to inherit from.
+        assert_eq!(
+            planned_write(
+                api::PurposeKindApi::Interactive,
+                &sel(Some(PRIMARY_SENTINEL), Some(PRIMARY_SENTINEL)),
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_genuine_change_is_a_write() {
+        assert_eq!(
+            planned_write(
+                api::PurposeKindApi::Embedding,
+                &sel(Some("default"), Some("nomic-embed-text")),
+                Some(&cfg("bedrock", "zai.glm-5")),
+            ),
+            Some(cfg("default", "nomic-embed-text"))
+        );
+    }
+
+    #[test]
+    fn a_deliberate_inherit_pair_is_a_write() {
+        assert_eq!(
+            planned_write(
+                api::PurposeKindApi::Dreaming,
+                &sel(Some(PRIMARY_SENTINEL), Some(PRIMARY_SENTINEL)),
+                Some(&cfg("bedrock", "zai.glm-5")),
+            ),
+            Some(cfg(PRIMARY_SENTINEL, PRIMARY_SENTINEL))
+        );
+    }
+
+    #[test]
+    fn an_effort_only_change_is_a_write() {
+        let current = RowSelection {
+            connection: Some("bedrock".into()),
+            model: Some("zai.glm-5".into()),
+            effort: Some(api::EffortLevel::High),
+            max_context_tokens: None,
+        };
+        let written = planned_write(
+            api::PurposeKindApi::Titling,
+            &current,
+            Some(&cfg("bedrock", "zai.glm-5")),
+        )
+        .expect("changing only the effort is still a real change");
+        assert_eq!(written.effort, Some(api::EffortLevel::High));
+    }
+
+    #[test]
+    fn a_context_window_override_is_preserved() {
+        // SetPurpose is a full replace and the UI does not edit this field,
+        // so an override set elsewhere must survive a dropdown edit.
+        let current = RowSelection {
+            connection: Some("default".into()),
+            model: Some("nomic-embed-text".into()),
+            effort: None,
+            max_context_tokens: Some(8192),
+        };
+        let written = planned_write(
+            api::PurposeKindApi::Embedding,
+            &current,
+            Some(&cfg("bedrock", "zai.glm-5")),
+        )
+        .expect("a real change");
+        assert_eq!(written.max_context_tokens, Some(8192));
+    }
+
+    #[test]
+    fn first_write_with_no_known_server_state_is_allowed() {
+        assert_eq!(
+            planned_write(
+                api::PurposeKindApi::Voice,
+                &sel(Some("bedrock"), Some("zai.glm-5")),
+                None
+            ),
+            Some(cfg("bedrock", "zai.glm-5"))
+        );
     }
 }
