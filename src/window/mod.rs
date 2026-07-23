@@ -2155,6 +2155,20 @@ fn handle_ui_message(
         input_bar.set_text(&prompt);
     }
 
+    // Retry a failed / timed-out turn (#138 item 3): if applying this message
+    // left a retry offer — a streaming turn errored for the open conversation
+    // with nothing queued — put the failed prompt back in the composer so the
+    // user can resend it with one click ("try again"). Only when the composer is
+    // empty, so text typed while waiting is never overwritten; taking the offer
+    // clears it so it can't resurface later. (Grouped with the `failed_prompt`
+    // refill above: both restore an un-sent prompt to the live editor.)
+    let retry_prompt = state.borrow_mut().take_pending_retry_prompt();
+    if let Some(prompt) = retry_prompt
+        && input_bar.peek_text().trim().is_empty()
+    {
+        input_bar.set_text(&prompt);
+    }
+
     // Adopt the connector the connect task handed off (#106), now that any
     // `Connected` effects (status, send-enable) have been applied. Lifted from
     // the old `Effect::SetClient` arm; the only change is the source — the
