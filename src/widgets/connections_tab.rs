@@ -58,6 +58,8 @@ impl ConnectionsTab {
             ConnectorType::Anthropic,
             ConnectorType::OpenAi,
             ConnectorType::OpenRouter,
+            ConnectorType::Azure,
+            ConnectorType::Google,
             ConnectorType::Bedrock,
             ConnectorType::Ollama,
         ] {

@@ -24,6 +24,8 @@ pub enum ConnectorType {
     Anthropic,
     OpenAi,
     OpenRouter,
+    Azure,
+    Google,
     Bedrock,
     Ollama,
 }
@@ -34,6 +36,8 @@ impl ConnectorType {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
             Self::OpenRouter => "OpenRouter",
+            Self::Azure => "Azure",
+            Self::Google => "Google",
             Self::Bedrock => "Bedrock",
             Self::Ollama => "Ollama",
         }
@@ -49,6 +53,8 @@ impl ConnectorType {
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
             Self::OpenRouter => "openrouter",
+            Self::Azure => "azure",
+            Self::Google => "google",
             Self::Bedrock => "bedrock",
             Self::Ollama => "ollama",
         }
@@ -59,6 +65,8 @@ impl ConnectorType {
             "anthropic" => Some(Self::Anthropic),
             "openai" => Some(Self::OpenAi),
             "openrouter" => Some(Self::OpenRouter),
+            "azure" => Some(Self::Azure),
+            "google" => Some(Self::Google),
             "bedrock" => Some(Self::Bedrock),
             "ollama" => Some(Self::Ollama),
             _ => None,
@@ -84,6 +92,27 @@ impl ConnectorType {
             Self::OpenRouter => api::ConnectionConfigView::OpenRouter {
                 base_url: None,
                 api_key_env: None,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            Self::Azure => api::ConnectionConfigView::Azure {
+                base_url: None,
+                api_key_env: None,
+                api_surface: None,
+                auth_mode: None,
+                api_version: None,
+                connect_timeout_secs: None,
+                stream_timeout_secs: None,
+                max_context_tokens: None,
+            },
+            Self::Google => api::ConnectionConfigView::Google {
+                base_url: None,
+                api_key_env: None,
+                project: None,
+                location: None,
+                auth_mode: None,
+                credentials_path: None,
                 connect_timeout_secs: None,
                 stream_timeout_secs: None,
                 max_context_tokens: None,
@@ -174,11 +203,31 @@ impl PreservedFields {
                 max_context_tokens: *max_context_tokens,
                 keep_warm: *keep_warm,
             },
-            // Azure/Google are config-file-only in v1: their slugs don't map to
-            // a `ConnectorType`, so the dialog never opens for them and there is
-            // nothing to surface or preserve. `None` (the create path) also lands
-            // here — both yield all-`None` preserved fields.
-            _ => Self::default(),
+            // Azure and Google are first-class creatable/editable connectors, so
+            // their unsurfaced timeouts and context ceiling must round-trip
+            // through an edit the same way the other API-key connectors do.
+            // Neither carries `keep_warm` (Ollama-only).
+            Some(
+                api::ConnectionConfigView::Azure {
+                    connect_timeout_secs,
+                    stream_timeout_secs,
+                    max_context_tokens,
+                    ..
+                }
+                | api::ConnectionConfigView::Google {
+                    connect_timeout_secs,
+                    stream_timeout_secs,
+                    max_context_tokens,
+                    ..
+                },
+            ) => Self {
+                connect_timeout_secs: *connect_timeout_secs,
+                stream_timeout_secs: *stream_timeout_secs,
+                max_context_tokens: *max_context_tokens,
+                keep_warm: None,
+            },
+            // Create path (no stored config): nothing to preserve.
+            None => Self::default(),
         }
     }
 }
@@ -282,6 +331,128 @@ fn field_specs(
                 },
             ]
         }
+        ConnectorType::Azure => {
+            let (base_url, api_key_env, api_surface, auth_mode, api_version) = match config {
+                Some(api::ConnectionConfigView::Azure {
+                    base_url,
+                    api_key_env,
+                    api_surface,
+                    auth_mode,
+                    api_version,
+                    ..
+                }) => (
+                    base_url.clone(),
+                    api_key_env.clone(),
+                    api_surface.clone(),
+                    auth_mode.clone(),
+                    api_version.clone(),
+                ),
+                _ => (None, None, None, None, None),
+            };
+            vec![
+                FieldSpec {
+                    label: "Resource endpoint (base URL)",
+                    name: "base_url",
+                    placeholder: Some("https://<name>.openai.azure.com"),
+                    initial: base_url,
+                    secret: false,
+                },
+                FieldSpec {
+                    label: "API key env var (e.g. AZURE_OPENAI_API_KEY)",
+                    name: "api_key_env",
+                    placeholder: Some("AZURE_OPENAI_API_KEY"),
+                    initial: api_key_env,
+                    secret: false,
+                },
+                FieldSpec {
+                    label: "API surface (v1 or classic)",
+                    name: "api_surface",
+                    placeholder: Some("v1 (default) or classic"),
+                    initial: api_surface,
+                    secret: false,
+                },
+                FieldSpec {
+                    label: "Auth mode (api_key or entra)",
+                    name: "auth_mode",
+                    placeholder: Some("api_key (default) or entra"),
+                    initial: auth_mode,
+                    secret: false,
+                },
+                FieldSpec {
+                    label: "API version (classic surface only)",
+                    name: "api_version",
+                    placeholder: Some("e.g. 2024-10-21"),
+                    initial: api_version,
+                    secret: false,
+                },
+            ]
+        }
+        ConnectorType::Google => {
+            let (base_url, api_key_env, project, location, auth_mode, credentials_path) =
+                match config {
+                    Some(api::ConnectionConfigView::Google {
+                        base_url,
+                        api_key_env,
+                        project,
+                        location,
+                        auth_mode,
+                        credentials_path,
+                        ..
+                    }) => (
+                        base_url.clone(),
+                        api_key_env.clone(),
+                        project.clone(),
+                        location.clone(),
+                        auth_mode.clone(),
+                        credentials_path.clone(),
+                    ),
+                    _ => (None, None, None, None, None, None),
+                };
+            vec![
+                FieldSpec {
+                    label: "Base URL (optional override)",
+                    name: "base_url",
+                    placeholder: Some("usually blank"),
+                    initial: base_url,
+                    secret: false,
+                },
+                FieldSpec {
+                    label: "API key env var (e.g. GOOGLE_API_KEY)",
+                    name: "api_key_env",
+                    placeholder: Some("GOOGLE_API_KEY"),
+                    initial: api_key_env,
+                    secret: false,
+                },
+                FieldSpec {
+                    label: "GCP project",
+                    name: "project",
+                    placeholder: Some("my-gcp-project"),
+                    initial: project,
+                    secret: false,
+                },
+                FieldSpec {
+                    label: "Location / region",
+                    name: "location",
+                    placeholder: Some("us-central1"),
+                    initial: location,
+                    secret: false,
+                },
+                FieldSpec {
+                    label: "Auth mode (vertex or api_key)",
+                    name: "auth_mode",
+                    placeholder: Some("vertex (default) or api_key"),
+                    initial: auth_mode,
+                    secret: false,
+                },
+                FieldSpec {
+                    label: "Service-account credentials path (Vertex)",
+                    name: "credentials_path",
+                    placeholder: Some("/path/to/service-account.json"),
+                    initial: credentials_path,
+                    secret: false,
+                },
+            ]
+        }
         ConnectorType::Bedrock => {
             let (aws_profile, region, base_url) = match config {
                 Some(api::ConnectionConfigView::Bedrock {
@@ -339,8 +510,11 @@ fn connector_hint(connector: ConnectorType) -> Option<&'static str> {
         ConnectorType::Anthropic => Some(
             "The daemon reads the API key from the named env var. Set it in your daemon environment (systemd unit, shell, etc.).",
         ),
-        ConnectorType::OpenAi | ConnectorType::OpenRouter => Some(
-            "The daemon reads the API key from the named env var. Set it in your daemon environment.",
+        ConnectorType::OpenAi
+        | ConnectorType::OpenRouter
+        | ConnectorType::Azure
+        | ConnectorType::Google => Some(
+            "The daemon reads the API key from the named env var (used in api-key auth modes). Set it in your daemon environment.",
         ),
         ConnectorType::Bedrock | ConnectorType::Ollama => None,
     }
@@ -569,6 +743,27 @@ pub fn show_configure_dialog<FSave, FRefresh>(
                     stream_timeout_secs: preserved.stream_timeout_secs,
                     max_context_tokens: preserved.max_context_tokens,
                 },
+                ConnectorType::Azure => api::ConnectionConfigView::Azure {
+                    base_url: by_name("base_url"),
+                    api_key_env: by_name("api_key_env"),
+                    api_surface: by_name("api_surface"),
+                    auth_mode: by_name("auth_mode"),
+                    api_version: by_name("api_version"),
+                    connect_timeout_secs: preserved.connect_timeout_secs,
+                    stream_timeout_secs: preserved.stream_timeout_secs,
+                    max_context_tokens: preserved.max_context_tokens,
+                },
+                ConnectorType::Google => api::ConnectionConfigView::Google {
+                    base_url: by_name("base_url"),
+                    api_key_env: by_name("api_key_env"),
+                    project: by_name("project"),
+                    location: by_name("location"),
+                    auth_mode: by_name("auth_mode"),
+                    credentials_path: by_name("credentials_path"),
+                    connect_timeout_secs: preserved.connect_timeout_secs,
+                    stream_timeout_secs: preserved.stream_timeout_secs,
+                    max_context_tokens: preserved.max_context_tokens,
+                },
                 ConnectorType::Bedrock => api::ConnectionConfigView::Bedrock {
                     aws_profile: by_name("aws_profile"),
                     region: by_name("region"),
@@ -604,6 +799,8 @@ mod tests {
             ConnectorType::Anthropic,
             ConnectorType::OpenAi,
             ConnectorType::OpenRouter,
+            ConnectorType::Azure,
+            ConnectorType::Google,
             ConnectorType::Bedrock,
             ConnectorType::Ollama,
         ] {
@@ -649,6 +846,14 @@ mod tests {
             ConnectorType::OpenRouter.empty_config(),
             api::ConnectionConfigView::OpenRouter { .. }
         ));
+        assert!(matches!(
+            ConnectorType::Azure.empty_config(),
+            api::ConnectionConfigView::Azure { .. }
+        ));
+        assert!(matches!(
+            ConnectorType::Google.empty_config(),
+            api::ConnectionConfigView::Google { .. }
+        ));
     }
 
     #[test]
@@ -687,6 +892,126 @@ mod tests {
         assert_eq!(p.stream_timeout_secs, Some(90));
         assert_eq!(p.max_context_tokens, Some(128_000));
         assert_eq!(p.keep_warm, None);
+    }
+
+    #[test]
+    fn field_specs_prefill_from_echoed_azure_config() {
+        // Azure surfaces base_url + api_key_env plus the two enum fields
+        // (api_surface / auth_mode) and classic-only api_version. Every surfaced
+        // field pre-fills from the echoed config on the edit path, and none is a
+        // secret (only the env-var *name* travels).
+        let config = api::ConnectionConfigView::Azure {
+            base_url: Some("https://my-resource.openai.azure.com".to_string()),
+            api_key_env: Some("MY_AZURE_KEY".to_string()),
+            api_surface: Some("classic".to_string()),
+            auth_mode: Some("entra".to_string()),
+            api_version: Some("2024-10-21".to_string()),
+            connect_timeout_secs: None,
+            stream_timeout_secs: None,
+            max_context_tokens: None,
+        };
+        let specs = field_specs(ConnectorType::Azure, Some(&config));
+        assert_eq!(
+            initial_of(&specs, "base_url"),
+            Some("https://my-resource.openai.azure.com")
+        );
+        assert_eq!(initial_of(&specs, "api_key_env"), Some("MY_AZURE_KEY"));
+        assert_eq!(initial_of(&specs, "api_surface"), Some("classic"));
+        assert_eq!(initial_of(&specs, "auth_mode"), Some("entra"));
+        assert_eq!(initial_of(&specs, "api_version"), Some("2024-10-21"));
+        assert!(specs.iter().all(|f| !f.secret));
+    }
+
+    #[test]
+    fn preserved_fields_round_trip_azure() {
+        // Azure joins the API-key preserved-fields group: its unsurfaced
+        // timeouts / context ceiling round-trip through an edit, and it has no
+        // keep_warm (Ollama-only). This is the guard against a `_ =>` fold
+        // silently dropping Azure's stored values on save.
+        let azure = api::ConnectionConfigView::Azure {
+            base_url: Some("https://my-resource.openai.azure.com".to_string()),
+            api_key_env: Some("AZURE_OPENAI_API_KEY".to_string()),
+            api_surface: Some("v1".to_string()),
+            auth_mode: Some("api_key".to_string()),
+            api_version: None,
+            connect_timeout_secs: Some(4),
+            stream_timeout_secs: Some(75),
+            max_context_tokens: Some(200_000),
+        };
+        let p = PreservedFields::from_config(Some(&azure));
+        assert_eq!(p.connect_timeout_secs, Some(4));
+        assert_eq!(p.stream_timeout_secs, Some(75));
+        assert_eq!(p.max_context_tokens, Some(200_000));
+        assert_eq!(p.keep_warm, None);
+    }
+
+    #[test]
+    fn field_specs_prefill_from_echoed_google_config() {
+        // Google (Vertex / Gemini) surfaces base_url, api_key_env, project,
+        // location, the auth_mode enum, and the Vertex credentials_path. Every
+        // surfaced field pre-fills; none is a secret.
+        let config = api::ConnectionConfigView::Google {
+            base_url: None,
+            api_key_env: Some("MY_GOOGLE_KEY".to_string()),
+            project: Some("my-gcp-project".to_string()),
+            location: Some("us-central1".to_string()),
+            auth_mode: Some("vertex".to_string()),
+            credentials_path: Some("/etc/gcp/sa.json".to_string()),
+            connect_timeout_secs: None,
+            stream_timeout_secs: None,
+            max_context_tokens: None,
+        };
+        let specs = field_specs(ConnectorType::Google, Some(&config));
+        assert_eq!(initial_of(&specs, "base_url"), None);
+        assert_eq!(initial_of(&specs, "api_key_env"), Some("MY_GOOGLE_KEY"));
+        assert_eq!(initial_of(&specs, "project"), Some("my-gcp-project"));
+        assert_eq!(initial_of(&specs, "location"), Some("us-central1"));
+        assert_eq!(initial_of(&specs, "auth_mode"), Some("vertex"));
+        assert_eq!(
+            initial_of(&specs, "credentials_path"),
+            Some("/etc/gcp/sa.json")
+        );
+        assert!(specs.iter().all(|f| !f.secret));
+    }
+
+    #[test]
+    fn preserved_fields_round_trip_google() {
+        // Google joins the API-key preserved-fields group: unsurfaced timeouts /
+        // context ceiling round-trip; no keep_warm. Guards against a `_ =>` fold
+        // dropping Google's stored values on save.
+        let google = api::ConnectionConfigView::Google {
+            base_url: None,
+            api_key_env: Some("GOOGLE_API_KEY".to_string()),
+            project: Some("my-gcp-project".to_string()),
+            location: Some("us-central1".to_string()),
+            auth_mode: Some("vertex".to_string()),
+            credentials_path: Some("/etc/gcp/sa.json".to_string()),
+            connect_timeout_secs: Some(6),
+            stream_timeout_secs: Some(120),
+            max_context_tokens: Some(1_000_000),
+        };
+        let p = PreservedFields::from_config(Some(&google));
+        assert_eq!(p.connect_timeout_secs, Some(6));
+        assert_eq!(p.stream_timeout_secs, Some(120));
+        assert_eq!(p.max_context_tokens, Some(1_000_000));
+        assert_eq!(p.keep_warm, None);
+    }
+
+    #[test]
+    fn field_specs_blank_when_azure_config_on_google_connector() {
+        // Variant mismatch must not leak values across the two new connectors.
+        let azure = api::ConnectionConfigView::Azure {
+            base_url: Some("https://my-resource.openai.azure.com".to_string()),
+            api_key_env: Some("AZURE_OPENAI_API_KEY".to_string()),
+            api_surface: Some("v1".to_string()),
+            auth_mode: Some("api_key".to_string()),
+            api_version: None,
+            connect_timeout_secs: None,
+            stream_timeout_secs: None,
+            max_context_tokens: None,
+        };
+        let specs = field_specs(ConnectorType::Google, Some(&azure));
+        assert!(specs.iter().all(|f| f.initial.is_none()));
     }
 
     /// Look up a field's pre-fill value by name within a spec list.
@@ -741,6 +1066,8 @@ mod tests {
             ConnectorType::Anthropic,
             ConnectorType::OpenAi,
             ConnectorType::OpenRouter,
+            ConnectorType::Azure,
+            ConnectorType::Google,
             ConnectorType::Bedrock,
             ConnectorType::Ollama,
         ] {
