@@ -55,6 +55,16 @@ window {
     padding-right: 16px;
 }
 
+/* Cancel button in the chat input bar (issue #138): matches Send's sizing so
+   the two sit as an even pair. Its red comes from the built-in
+   `destructive-action` class, so it themes correctly in both light and dark. */
+.cancel-button {
+    border-radius: 6px;
+    min-height: 36px;
+    padding-left: 16px;
+    padding-right: 16px;
+}
+
 /* Push-to-talk button in the chat input bar (issue #59). Flat at rest;
    tinted with the accent while the voice pipeline is active
    (listening/processing/speaking) so an in-progress turn reads at a glance. */

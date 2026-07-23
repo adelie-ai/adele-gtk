@@ -68,6 +68,12 @@ pub struct InputBar {
     pub container: GtkBox,
     pub text_view: TextView,
     pub send_button: Button,
+    /// Cancel button (#138): stops the turn streaming into the open conversation
+    /// by sending `CancelBackgroundTask` for its background-task id. Sits just
+    /// left of Send and is hidden unless a *cancelable* turn is in flight — the
+    /// window toggles its visibility off `active_task_id_for_view`. Send stays in
+    /// place beside it so messages can still be queued while a turn runs.
+    pub cancel_button: Button,
     /// Push-to-talk button (issue #80). Lives in the voice-controls row and is
     /// shown only when `You == Enabled` AND voice capture is available on this
     /// machine (the daemon owns its bus name, or the embedded engine is
@@ -190,6 +196,17 @@ impl InputBar {
         scrolled.set_child(Some(&text_view));
         entry_row.append(&scrolled);
 
+        // Cancel sits just left of Send (#138). Hidden until the window sees a
+        // cancelable in-flight turn; `destructive-action` gives it the theme's
+        // red so "stop the running turn" reads at a glance, while `cancel-button`
+        // matches Send's sizing.
+        let cancel_button = Button::with_label("Cancel");
+        cancel_button.add_css_class("cancel-button");
+        cancel_button.add_css_class("destructive-action");
+        cancel_button.set_valign(gtk4::Align::End);
+        cancel_button.set_visible(false);
+        entry_row.append(&cancel_button);
+
         let send_button = Button::with_label("Send");
         send_button.add_css_class("send-button");
         send_button.set_valign(gtk4::Align::End);
@@ -308,6 +325,7 @@ impl InputBar {
             container,
             text_view,
             send_button,
+            cancel_button,
             mic_button,
             mic_image,
             voice_available,
