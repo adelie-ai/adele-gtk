@@ -889,6 +889,49 @@ impl AdelieWindow {
                 }
             ));
 
+            // Cancel button click (#138): stop the turn streaming into the open
+            // conversation. The reducer holds that turn's background-task id
+            // (recorded from its `PromptSent` ack); read it at click time and
+            // send `CancelBackgroundTask`, reusing the tasks-panel cancel path.
+            // The button is only visible when this id is `Some` (see the
+            // visibility refresh in `handle_ui_message`), so a click without one
+            // is a no-op rather than an error. Cancel needs the socket command
+            // channel (`as_commands`), the same constraint the tasks-panel Cancel
+            // has — unavailable over D-Bus.
+            input_bar.cancel_button.connect_clicked(glib::clone!(
+                #[strong]
+                client,
+                #[strong(rename_to = bridge_ref)]
+                bridge,
+                #[strong]
+                state,
+                move |_| {
+                    let Some(task_id) = state.borrow().active_task_id_for_view() else {
+                        return;
+                    };
+                    let Some(connector) = client.borrow().clone() else {
+                        return;
+                    };
+                    let tx = bridge_ref.ui_sender();
+                    bridge_ref.spawn(async move {
+                        let Some(cmds) = connector.client().as_commands() else {
+                            let _ = tx.send(UiMessage::Error(
+                                "Cancel requires a local-socket or WebSocket connection \
+                                 (not available over D-Bus)"
+                                    .to_string(),
+                            ));
+                            return;
+                        };
+                        if let Err(e) = cmds
+                            .send_command(api::Command::CancelBackgroundTask { id: task_id })
+                            .await
+                        {
+                            let _ = tx.send(UiMessage::Error(format!("Cancel turn: {e}")));
+                        }
+                    });
+                }
+            ));
+
             // Enter key in text view (Shift+Enter for newline). Up/Down/Escape
             // navigate the message queue (message-queue feature): recall a queued
             // message into the composer to edit and re-submit, walk between queued
@@ -1497,6 +1540,11 @@ fn submit_prompt_message(prompt: String) -> UiMessage {
 /// keyless send). Split out of the GTK executor closure (which can't run
 /// headless) so the key-forwarding is unit-testable with a stub
 /// [`AssistantCommands`].
+///
+/// Returns the turn's **background-task id** — the handle a Cancel button acts
+/// on (`CancelBackgroundTask { id }`, #138), which the reducer records on the
+/// stream via `PromptSent`. The correlation `request_id` is not needed here: the
+/// reducer claims it from the first streamed frame.
 async fn send_prompt_with_key(
     cmds: &dyn AssistantCommands,
     conversation_id: &str,
@@ -1505,7 +1553,7 @@ async fn send_prompt_with_key(
     system_refinement: String,
     idempotency_key: Option<String>,
 ) -> anyhow::Result<String> {
-    cmds.send_prompt_idempotent(
+    cmds.send_prompt_idempotent_ack(
         conversation_id,
         prompt,
         override_selection,
@@ -1513,6 +1561,7 @@ async fn send_prompt_with_key(
         idempotency_key,
     )
     .await
+    .map(|ack| ack.task_id)
 }
 
 /// Translate a *visible* chip position into the full-queue index the reducer's
@@ -2037,6 +2086,13 @@ fn handle_ui_message(
                                         idempotency_key,
                                     )
                                     .await
+                                    // D-Bus surfaces only a request_id, not the
+                                    // background-task handle Cancel needs, so
+                                    // report an empty task id — no Cancel
+                                    // affordance over D-Bus, the same constraint
+                                    // the tasks-panel Cancel already has (it needs
+                                    // the socket command channel). (#138)
+                                    .map(|_request_id| String::new())
                             }
                         };
                         match result {
@@ -2044,7 +2100,9 @@ fn handle_ui_message(
                                 // `conversation_id` was captured at send time
                                 // (GTK-2): the stream stays tied to the
                                 // conversation it was sent into even if the user
-                                // switches away before the ack lands.
+                                // switches away before the ack lands. `task_id` is
+                                // the turn's background-task id (empty over D-Bus)
+                                // — the handle the Cancel button acts on (#138).
                                 let _ = ui_tx.send(UiMessage::PromptSent {
                                     task_id,
                                     conversation_id,
@@ -2111,6 +2169,18 @@ fn handle_ui_message(
     if connector_arrived && let Some(connector) = pending_connector.lock().unwrap().take() {
         *client.borrow_mut() = Some(connector);
     }
+
+    // Cancel affordance (#138): show the Cancel button exactly when the open
+    // conversation has an in-flight, cancelable turn — a turn this client sent,
+    // whose background-task id the reducer holds. Recomputed after every message
+    // so it tracks the turn's start (`PromptSent`), end
+    // (`StreamComplete`/`StreamError`), a cancel, a disconnect, and conversation
+    // switches. `None` also covers legacy id-less acks and adopted external
+    // turns — nothing to cancel, so nothing shown. Send is never disabled here,
+    // so messages can still be queued while a turn runs.
+    input_bar
+        .cancel_button
+        .set_visible(state.borrow().active_task_id_for_view().is_some());
 }
 
 /// Make sure the window has an active conversation. The daemon returns the
@@ -2487,8 +2557,9 @@ mod tests {
         )
         .await
         .expect("send dispatch");
-        // Returns the correlation `request_id` (voice#49), not the `task_id`.
-        assert_eq!(returned, "req-1");
+        // Returns the turn's background-task id — the handle a Cancel button
+        // acts on (#138) — not the correlation `request_id`.
+        assert_eq!(returned, "task-1");
         match cmds
             .last
             .lock()

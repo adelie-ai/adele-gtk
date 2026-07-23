@@ -727,6 +727,8 @@ mod tests {
             children: Vec::new(),
             title: "demo".to_string(),
             progress_hint: None,
+            owner_todo: String::new(),
+            spawn_marker: None,
         }
     }
 
