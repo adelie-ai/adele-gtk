@@ -94,6 +94,21 @@ fn planned_write(
     Some(candidate)
 }
 
+/// The daemon's last reported binding for `purpose`, if it has one.
+fn purpose_config(
+    purposes: &api::PurposesView,
+    purpose: api::PurposeKindApi,
+) -> Option<&api::PurposeConfigView> {
+    match purpose {
+        api::PurposeKindApi::Interactive => purposes.interactive.as_ref(),
+        api::PurposeKindApi::Dreaming => purposes.dreaming.as_ref(),
+        api::PurposeKindApi::Consolidation => purposes.consolidation.as_ref(),
+        api::PurposeKindApi::Embedding => purposes.embedding.as_ref(),
+        api::PurposeKindApi::Titling => purposes.titling.as_ref(),
+        api::PurposeKindApi::Voice => purposes.voice.as_ref(),
+    }
+}
+
 /// Ephemeral UI state for each row.
 struct Row {
     connection_dd: DropDown,
@@ -124,8 +139,12 @@ pub struct PurposesTab {
     models_by_connection: Rc<RefCell<BTreeMap<String, Vec<api::ModelListing>>>>,
     on_set_purpose: Rc<RefCell<Option<SetPurposeCb>>>,
     on_request_models: Rc<RefCell<Option<RequestModelsCb>>>,
-    /// When true, we're reconciling the UI to state — suppress
-    /// `set_purpose` callbacks on change notifications.
+    /// When true, we're reconciling the UI to state. This skips the work of
+    /// re-deriving a write from notifications GTK delivers synchronously — an
+    /// optimization, *not* the correctness guarantee. Guarding on this flag
+    /// alone is what allowed the write loop: a notification arriving after
+    /// `reconcile` returned found it cleared. `planned_write` is the actual
+    /// guarantee, because it drops any write matching last-known server state.
     suppress: Rc<RefCell<bool>>,
 }
 
@@ -215,6 +234,8 @@ impl PurposesTab {
                 on_request_models,
                 #[strong]
                 suppress,
+                #[strong]
+                purposes,
                 move |_| {
                     if *suppress.borrow() {
                         return;
@@ -228,7 +249,7 @@ impl PurposesTab {
                         &on_request_models,
                         &suppress,
                     );
-                    emit_current(purpose, &rows, &on_set_purpose);
+                    emit_current(purpose, &rows, &purposes, &on_set_purpose);
                 }
             ));
 
@@ -239,11 +260,13 @@ impl PurposesTab {
                 on_set_purpose,
                 #[strong]
                 suppress,
+                #[strong]
+                purposes,
                 move |_| {
                     if *suppress.borrow() {
                         return;
                     }
-                    emit_current(purpose, &rows, &on_set_purpose);
+                    emit_current(purpose, &rows, &purposes, &on_set_purpose);
                 }
             ));
 
@@ -254,11 +277,13 @@ impl PurposesTab {
                 on_set_purpose,
                 #[strong]
                 suppress,
+                #[strong]
+                purposes,
                 move |_| {
                     if *suppress.borrow() {
                         return;
                     }
-                    emit_current(purpose, &rows, &on_set_purpose);
+                    emit_current(purpose, &rows, &purposes, &on_set_purpose);
                 }
             ));
 
@@ -432,15 +457,7 @@ fn apply_purpose_config(
         return;
     };
     let purposes = purposes.borrow();
-    let cfg = match purpose {
-        api::PurposeKindApi::Interactive => purposes.interactive.as_ref(),
-        api::PurposeKindApi::Dreaming => purposes.dreaming.as_ref(),
-        api::PurposeKindApi::Consolidation => purposes.consolidation.as_ref(),
-        api::PurposeKindApi::Embedding => purposes.embedding.as_ref(),
-        api::PurposeKindApi::Titling => purposes.titling.as_ref(),
-        api::PurposeKindApi::Voice => purposes.voice.as_ref(),
-    };
-    let Some(cfg) = cfg else {
+    let Some(cfg) = purpose_config(&purposes, purpose) else {
         return;
     };
 
@@ -478,36 +495,41 @@ fn apply_purpose_config(
 fn emit_current(
     purpose: api::PurposeKindApi,
     rows: &Rc<RefCell<BTreeMap<String, Row>>>,
+    purposes: &Rc<RefCell<api::PurposesView>>,
     on_set_purpose: &Rc<RefCell<Option<SetPurposeCb>>>,
 ) {
     let rows_borrow = rows.borrow();
     let Some(row) = rows_borrow.get(purpose.as_key()) else {
         return;
     };
+
+    // Read the dropdowns into plain data. A selection that does not index into
+    // the row's value mirror means the list is empty or out of sync, which is
+    // "nothing real is selected" rather than a value worth writing.
     let conn_idx = row.connection_dd.selected() as usize;
-    let Some(connection) = row.connection_values.borrow().get(conn_idx).cloned() else {
-        return;
-    };
     let model_idx = row.model_dd.selected() as usize;
-    let Some(model) = row.model_values.borrow().get(model_idx).cloned() else {
-        return;
-    };
-    let effort = match row.effort_dd.selected() {
-        0 => None,
-        1 => Some(api::EffortLevel::Low),
-        2 => Some(api::EffortLevel::Medium),
-        3 => Some(api::EffortLevel::High),
-        _ => None,
-    };
-    let config = api::PurposeConfigView {
-        connection,
-        model,
-        effort,
+    let current = RowSelection {
+        connection: row.connection_values.borrow().get(conn_idx).cloned(),
+        model: row.model_values.borrow().get(model_idx).cloned(),
+        effort: match row.effort_dd.selected() {
+            1 => Some(api::EffortLevel::Low),
+            2 => Some(api::EffortLevel::Medium),
+            3 => Some(api::EffortLevel::High),
+            _ => None,
+        },
         // Context-window override (#51) isn't editable in this UI, but
         // `SetPurpose` is a full replace — preserve whatever the daemon
         // last reported so we don't clobber an override set elsewhere.
         max_context_tokens: *row.max_context_tokens.borrow(),
     };
+
+    let purposes_borrow = purposes.borrow();
+    let last_known = purpose_config(&purposes_borrow, purpose);
+    let Some(config) = planned_write(purpose, &current, last_known) else {
+        return;
+    };
+    drop(purposes_borrow);
+
     if let Some(ref cb) = *on_set_purpose.borrow() {
         cb(purpose, config);
     }
