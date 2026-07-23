@@ -165,6 +165,13 @@ path = "../voice/crates/client-voice"
 # hardening + docs ahead; the `McpService` trait is byte-identical), so the API
 # client-common compiles against is unchanged. gtk already path-deps the
 # desktop-assistant crates the same way (Option D above).
+# `async-trait` implements the stub `AssistantCommands` an executor-level test
+# uses to capture the `SendMessage.idempotency_key` reaching the wire (#570).
+# The trait is `#[async_trait]`, so a stub impl needs the same attribute; already
+# in the graph transitively (client-common), pinned here as a dev-only dep.
+[dev-dependencies]
+async-trait = "0.1"
+
 [patch."https://github.com/adelie-ai/mcp-core"]
 mcp-core = { path = "../mcp-core" }
 
