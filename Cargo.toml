@@ -69,9 +69,10 @@ clap = { version = "4", features = ["derive", "env"] }
 # `-D warnings`; `theme.rs` was migrated off the deprecated `CssProvider` and
 # GtkSettings prefer-dark-theme APIs (issue #116) to keep the build clean.
 gtk4 = { version = "0.11", features = ["v4_22"], package = "gtk4" }
+# Still a direct dep: `markdown_text.rs` walks CommonMark events to build GTK
+# Pango markup for the non-webview label path. The HTML render path lives in
+# `adele-markdown` now and brings its own copy of the same version.
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
-ammonia = "4"
-sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -126,6 +127,14 @@ path = "../desktop-assistant/crates/api-model"
 # adele-voice-client-common unify to one source each (no [patch] needed — Option D).
 [dependencies.client-ui-common]
 path = "../client-ui-common"
+
+# The shared markdown -> sanitized-HTML pipeline + the CSP-pinned chat page
+# (gtk#25's security boundary), lifted out of this crate so adele-mac renders
+# assistant replies through the SAME sanitizer rather than a second Swift one.
+# Sibling member of the client-ui-common workspace, resolved through the same
+# `../client-ui-common` path this crate already uses.
+[dependencies.adele-markdown]
+path = "../client-ui-common/markdown"
 
 # The embeddable voice module (adelie-ai/voice phase 1). Path-dep, mirroring the
 # desktop-assistant deps above: a `../voice` symlink under `.worktrees/adele-gtk/`
