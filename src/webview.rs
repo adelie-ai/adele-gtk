@@ -42,27 +42,35 @@ pub fn create_chat_webview() -> WebView {
     webview
 }
 
-/// JSON-encode a string so it is safe to interpolate into JavaScript.
-/// `serde_json::to_string` produces a quoted, properly escaped JSON string
-/// literal which is also a valid JavaScript string literal — no manual
-/// escaping of backticks, backslashes, or template expressions needed.
-fn js_safe_string(s: &str) -> String {
-    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
-}
+// The statements below are evaluated by the WebView, so an assistant or tool
+// message reaching one is untrusted text inside a program. Encoding it is
+// `adele_markdown::js::string_literal`'s job, not this module's: host-side
+// evaluation is exempt from the page's pinned `script-src`, so this is the last
+// layer, and a second copy of the escaper here is exactly the drift the shared
+// crate exists to prevent (gtk#25).
 
 /// Build the `updateMessages(...)` statement for a rendered transcript.
 fn update_messages_script(messages_html: &str) -> String {
-    format!("updateMessages({});", js_safe_string(messages_html))
+    format!(
+        "updateMessages({});",
+        adele_markdown::js::string_literal(messages_html)
+    )
 }
 
 /// Build the `appendChunk(...)` statement for a streaming chunk.
 fn append_chunk_script(chunk: &str) -> String {
-    format!("appendChunk({});", js_safe_string(chunk))
+    format!(
+        "appendChunk({});",
+        adele_markdown::js::string_literal(chunk)
+    )
 }
 
 /// Build the `setStatus(...)` statement for a transient status line.
 fn set_status_script(message: &str) -> String {
-    format!("setStatus({});", js_safe_string(message))
+    format!(
+        "setStatus({});",
+        adele_markdown::js::string_literal(message)
+    )
 }
 
 /// Update the webview with rendered messages HTML.
