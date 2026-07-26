@@ -6,11 +6,11 @@ version = 4
 name = "adele-gtk"
 version = "0.1.0"
 dependencies = [
+ "adele-markdown",
  "adele-voice-client-common",
  "adele-voice-module",
  "adele-voice-stt-whisper",
  "adele-voice-vad-silero",
- "ammonia",
  "anyhow",
  "async-trait",
  "base64",
@@ -32,7 +32,6 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "skills-mcp",
  "tasks-mcp",
  "terminal-mcp",
@@ -47,6 +46,17 @@ dependencies = [
  "webkit6",
  "zbus",
  "zbus-secret-service-keyring-store",
+]
+
+[[package]]
+name = "adele-markdown"
+version = "0.1.0"
+dependencies = [
+ "ammonia",
+ "base64",
+ "pulldown-cmark",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
