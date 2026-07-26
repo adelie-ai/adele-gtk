@@ -50,21 +50,36 @@ fn js_safe_string(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
+/// Build the `updateMessages(...)` statement for a rendered transcript.
+fn update_messages_script(messages_html: &str) -> String {
+    format!("updateMessages({});", js_safe_string(messages_html))
+}
+
+/// Build the `appendChunk(...)` statement for a streaming chunk.
+fn append_chunk_script(chunk: &str) -> String {
+    format!("appendChunk({});", js_safe_string(chunk))
+}
+
+/// Build the `setStatus(...)` statement for a transient status line.
+fn set_status_script(message: &str) -> String {
+    format!("setStatus({});", js_safe_string(message))
+}
+
 /// Update the webview with rendered messages HTML.
 pub fn update_messages(webview: &WebView, messages_html: &str) {
-    let js = format!("updateMessages({});", js_safe_string(messages_html));
+    let js = update_messages_script(messages_html);
     webview.evaluate_javascript(&js, None, None, None::<&gtk4::gio::Cancellable>, |_| {});
 }
 
 /// Append a streaming chunk to the webview.
 pub fn append_chunk(webview: &WebView, chunk: &str) {
-    let js = format!("appendChunk({});", js_safe_string(chunk));
+    let js = append_chunk_script(chunk);
     webview.evaluate_javascript(&js, None, None, None::<&gtk4::gio::Cancellable>, |_| {});
 }
 
 /// Show a transient status message below the chat (e.g. "Searching knowledge base...").
 pub fn set_status(webview: &WebView, message: &str) {
-    let js = format!("setStatus({});", js_safe_string(message));
+    let js = set_status_script(message);
     webview.evaluate_javascript(&js, None, None, None::<&gtk4::gio::Cancellable>, |_| {});
 }
 
@@ -82,71 +97,82 @@ pub fn clear_status(webview: &WebView) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markdown::{AvatarUrls, render_messages_html};
+    use desktop_assistant_client_common::MessageKind;
 
-    /// `js_safe_string` is the security boundary that prevents a hostile
-    /// assistant/tool message from breaking out of the JS string literal it is
-    /// interpolated into. Its contract is the JSON-string contract: the output
-    /// is a quoted JSON string literal that parses back to *exactly* the input.
-    /// This property-style test drives it with a representative input set that
-    /// covers every C0 control char (0x00–0x1F), quotes, backslashes, the
-    /// line/paragraph separators that are valid JSON but break naive JS string
-    /// literals, and non-ASCII, asserting the round-trip holds for each.
+    /// Every statement this module evaluates, for one message body.
+    fn statements(body: &str) -> Vec<String> {
+        vec![
+            update_messages_script(body),
+            append_chunk_script(body),
+            set_status_script(body),
+        ]
+    }
+
     #[test]
-    fn js_safe_string_round_trips_through_json_for_all_control_chars() {
-        // Build the representative corpus.
-        let mut inputs: Vec<String> = Vec::new();
-
-        // Every C0 control character, individually and embedded in text.
-        for code in 0x00u32..=0x1F {
-            let c = char::from_u32(code).unwrap();
-            inputs.push(c.to_string());
-            inputs.push(format!("before{c}after"));
-        }
-
-        // Quotes, backslashes, slashes, and combinations that classically
-        // escape JS string / template literals.
-        for s in [
-            "\"",
-            "'",
-            "\\",
-            "\\\"",
-            "\\n",           // literal backslash-n, not a newline
-            "</script>",     // HTML closer
-            "`${alert(1)}`", // JS template-literal injection
-            "\u{2028}",      // LINE SEPARATOR (breaks naive JS string literals)
-            "\u{2029}",      // PARAGRAPH SEPARATOR
-            "\u{FEFF}",      // BOM / zero-width no-break space
-            "\0embedded\0null",
-            "emoji 🦀 and accents éàü",
-            "中文字符",
-            "",
-        ] {
-            inputs.push(s.to_string());
-        }
-
-        for input in &inputs {
-            let encoded = js_safe_string(input);
-            // The output must be a self-contained JSON string literal that
-            // parses back to the exact original — the guarantee callers rely on
-            // when they do `format!("appendChunk({});", js_safe_string(x))`.
-            let decoded: String = serde_json::from_str(&encoded).unwrap_or_else(|e| {
-                panic!("js_safe_string({input:?}) -> {encoded:?} did not parse as JSON: {e}")
-            });
-            assert_eq!(
-                &decoded, input,
-                "round-trip mismatch: input {input:?} encoded as {encoded:?} decoded as {decoded:?}"
+    fn a_js_line_separator_in_a_message_cannot_end_the_statement() {
+        // U+2028 / U+2029 are legal *unescaped* inside a JSON string but are
+        // JavaScript line terminators, so a JSON encoder alone leaves a reply
+        // able to end the statement it was interpolated into. The shared
+        // encoder escapes them; a client-local `serde_json::to_string` does not.
+        for statement in statements("before\u{2028}after\u{2029}end") {
+            assert!(
+                !statement.contains('\u{2028}') && !statement.contains('\u{2029}'),
+                "raw JS line separator survived into: {statement:?}"
             );
-            // Defensive: a raw control char must never survive into the output
-            // unescaped, or it could terminate/derange the JS literal.
-            for code in 0x00u32..=0x1F {
-                let c = char::from_u32(code).unwrap();
-                if input.contains(c) {
-                    assert!(
-                        !encoded.contains(c),
-                        "control char {code:#04x} leaked unescaped into {encoded:?}"
-                    );
-                }
-            }
         }
+    }
+
+    #[test]
+    fn a_hostile_message_stays_inside_the_js_string_literal() {
+        // The end-to-end shape: a reply flows through the sanitizer into the
+        // transcript markup, and that markup is interpolated into the call this
+        // module evaluates. It must arrive as one argument, not as code.
+        let hostile = "he said \"x\");alert(document.cookie);//\n\nand <b>more</b>";
+        let messages = vec![(
+            "assistant".to_string(),
+            hostile.to_string(),
+            MessageKind::Normal,
+        )];
+        let body = render_messages_html(
+            &messages,
+            None,
+            &AvatarUrls {
+                adele: String::new(),
+                user: String::new(),
+            },
+        );
+
+        for statement in statements(&body) {
+            let (open, inner) = statement
+                .split_once('(')
+                .expect("statement is a function call");
+            let inner = inner
+                .strip_suffix(");")
+                .unwrap_or_else(|| panic!("statement is one call: {statement:?}"));
+            let decoded: String = serde_json::from_str(inner).unwrap_or_else(|e| {
+                panic!("{open} argument is not a single string literal: {e}: {statement:?}")
+            });
+            assert_eq!(decoded, body, "the message must arrive intact as data");
+            assert!(!statement.contains('\n'), "no raw newline: {statement:?}");
+        }
+    }
+
+    #[test]
+    fn every_statement_is_built_through_the_shared_encoder() {
+        // Drift is the failure mode this repo's markdown lift exists to stop:
+        // a client-local escaper diverges from the shared one silently. Pin
+        // that these builders delegate rather than quote for themselves.
+        let body = "quotes \" and \\ and </script> and \u{2028}";
+        let encoded = adele_markdown::js::string_literal(body);
+        assert_eq!(
+            update_messages_script(body),
+            format!("updateMessages({encoded});")
+        );
+        assert_eq!(
+            append_chunk_script(body),
+            format!("appendChunk({encoded});")
+        );
+        assert_eq!(set_status_script(body), format!("setStatus({encoded});"));
     }
 }
