@@ -31,13 +31,13 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use client_ui_common::{
-    BuiltinServerDto, ClientServerDto, Runner, RunnerFilter, ServerKind, ServerRow, filter_rows,
-    kind_label, runner_label, server_rows_with_builtins, transport_chip,
+    BuiltinServerDto, ClientServerDto, Runner, RunnerFilter, ServerKind, ServerRow, display_name,
+    filter_rows, kind_label, runner_label, server_rows_with_builtins, transport_chip,
 };
 use desktop_assistant_api_model as api;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, DropDown, Label, ListBox, ListBoxRow, Orientation,
+    Align, Box as GtkBox, Button, DropDown, Label, LinkButton, ListBox, ListBoxRow, Orientation,
     ScrolledWindow, SelectionMode, Separator, StringList, Switch, glib,
 };
 
@@ -417,10 +417,20 @@ fn build_row_widget(
 
     let title_row = GtkBox::new(Orientation::Horizontal, 6);
     // Server-provided text: rendered as plain text (never markup).
-    let name_label = Label::new(Some(&row.name));
+    let name_label = Label::new(Some(display_name(row)));
     name_label.set_halign(Align::Start);
     name_label.add_css_class("heading");
     title_row.append(&name_label);
+
+    // When a server supplied its own title, keep the configured name visible
+    // beside it: the name is the identity used in config, namespacing and
+    // errors, so a server must not be able to hide it behind a chosen title.
+    if row.title.is_some() {
+        let real_name = Label::new(Some(&row.name));
+        real_name.add_css_class("dim-label");
+        real_name.set_valign(Align::Center);
+        title_row.append(&real_name);
+    }
 
     // Runner chip: "daemon"/"daemon · host"/"client".
     let runner_chip = Label::new(Some(&runner_label(row.runner, is_remote, host)));
@@ -455,6 +465,28 @@ fn build_row_widget(
     subtitle_label.set_xalign(0.0);
     subtitle_label.add_css_class("dim-label");
     text_col.append(&subtitle_label);
+
+    // What the server says it offers (SEP-973), when it declared a description.
+    // Sanitized and length-capped by `client-ui-common`, and rendered as plain
+    // text like every other server-provided string here.
+    if let Some(description) = row.description.as_deref() {
+        let description_label = Label::new(Some(description));
+        description_label.set_halign(Align::Start);
+        description_label.set_wrap(true);
+        description_label.set_xalign(0.0);
+        description_label.add_css_class("dim-label");
+        text_col.append(&description_label);
+    }
+
+    // The server's home page. `client-ui-common` has already refused anything
+    // that is not http(s), so this cannot become a javascript:/file:/data: link.
+    // Opening it stays a deliberate user click; nothing here navigates on its own.
+    if let Some(url) = row.website_url.as_deref() {
+        let link = LinkButton::with_label(url, url);
+        link.set_halign(Align::Start);
+        link.add_css_class("mcp-website-link");
+        text_col.append(&link);
+    }
 
     // Last connect error (only when a source reports one).
     if let Some(detail) = row.detail.as_ref().filter(|d| !d.is_empty()) {
@@ -806,6 +838,10 @@ mod tests {
             detail: None,
             kind: client_ui_common::ServerKind::BuiltIn,
             disabled_reason: reason.map(Into::into),
+            // A built-in has no `initialize` handshake, so it declares nothing.
+            title: None,
+            description: None,
+            website_url: None,
         }
     }
 
