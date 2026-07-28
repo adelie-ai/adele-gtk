@@ -684,6 +684,7 @@ mod tests {
                 conversation_id: "c".into(),
                 name: "child".into(),
                 session_conversation_id: String::new(),
+                notify_parent: false,
             }),
             "Subagent"
         );
