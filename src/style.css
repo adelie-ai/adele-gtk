@@ -100,6 +100,16 @@ window {
     color: #e86a6a;
 }
 
+/* Per-conversation tool-provenance-gate override toggle (daemon #1007). Same
+   red as .context-fill-red — this codebase's established danger color — with
+   a filled background rather than just colored text, since a header-bar
+   button needs to read as armed at a glance, not just on close inspection. */
+.tool-gate-toggle.tool-gate-live {
+    background-color: #e86a6a;
+    color: #1a1a1a;
+    font-weight: bold;
+}
+
 /* Advisory toast (e.g. a dangling model selection cleared by the daemon). */
 .toast-row {
     background-color: #2a2e45;
