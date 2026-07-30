@@ -134,6 +134,22 @@ pub async fn set_conversation_personality(
         .await
 }
 
+/// Set the conversation's tool-provenance-gate override (daemon #1007).
+/// `true` disables the gate for every turn in this conversation; `false`
+/// leaves it enforced (the default). Returns the stored value after the
+/// write. Routes through the `set_conversation_tool_gate` default method on
+/// the command channel, so the result-envelope handling stays in
+/// `client-common`, matching `set_conversation_personality` above.
+pub async fn set_conversation_tool_gate(
+    transport: &TransportClient,
+    conversation_id: &str,
+    disabled: bool,
+) -> Result<bool> {
+    commands(transport)?
+        .set_conversation_tool_gate(conversation_id, disabled)
+        .await
+}
+
 // --- MCP server management (issue #495) -------------------------------------
 //
 // Thin wrappers over the typed `Command`/`CommandResult` surface the daemon

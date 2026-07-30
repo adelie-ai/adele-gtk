@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -10,8 +10,8 @@ use desktop_assistant_client_common::{
 use gtk4::prelude::*;
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, Entry, Label,
-    MenuButton, Orientation, Paned, Popover, Revealer, RevealerTransitionType, Separator, Window,
-    gdk, glib,
+    MenuButton, Orientation, Paned, Popover, Revealer, RevealerTransitionType, Separator,
+    ToggleButton, Window, gdk, glib,
 };
 use tokio::sync::mpsc;
 
@@ -64,6 +64,11 @@ struct WindowWidgets {
     pending_connector: Arc<Mutex<Option<Arc<Connector>>>>,
     input_bar: Rc<InputBar>,
     model_picker: Rc<ModelPicker>,
+    /// Per-conversation tool-gate override toggle (daemon #1007), and the
+    /// suppress flag that keeps its own `set_tool_gate_toggle_state`-driven
+    /// syncs from re-triggering a save (mirrors `InputBar`'s `suppress`).
+    tool_gate_toggle: Rc<ToggleButton>,
+    tool_gate_suppress: Rc<Cell<bool>>,
     tasks_panel: Rc<TasksPanel>,
     side_pane: Rc<ConversationSidePane>,
     toast_revealer: Rc<Revealer>,
@@ -173,6 +178,23 @@ impl AdelieWindow {
         // tracks `ConversationView.model_selection` after each load.
         let model_picker = ModelPicker::new();
         header_bar.append(&model_picker.container);
+
+        // Per-conversation "live dangerously" toggle for the tool-provenance
+        // gate (daemon #1007/#741). Deliberately a direct, always-visible
+        // toggle in the header bar rather than a hamburger-menu item like
+        // Personality: this is a single boolean, not a multi-field override,
+        // and the whole point is that the person can see at a glance whether
+        // the open conversation currently has it on. `tool_gate_suppress`
+        // guards `set_tool_gate_toggle_state` below from re-triggering a save
+        // when it sets the button's state programmatically (on conversation
+        // load/switch/reload), mirroring `InputBar`'s `suppress` flag for its
+        // per-conversation voice dropdowns.
+        let tool_gate_toggle = Rc::new(ToggleButton::new());
+        tool_gate_toggle.add_css_class("flat");
+        tool_gate_toggle.add_css_class("tool-gate-toggle");
+        set_tool_gate_toggle_state(&tool_gate_toggle, false);
+        header_bar.append(&*tool_gate_toggle);
+        let tool_gate_suppress = Rc::new(Cell::new(false));
 
         // Spacer to push menu button to the right
         let spacer = GtkBox::new(Orientation::Horizontal, 0);
@@ -461,6 +483,8 @@ impl AdelieWindow {
             pending_connector: pending_connector.clone(),
             input_bar: input_bar.clone(),
             model_picker: model_picker.clone(),
+            tool_gate_toggle: tool_gate_toggle.clone(),
+            tool_gate_suppress: tool_gate_suppress.clone(),
             tasks_panel: tasks_panel.clone(),
             side_pane: side_pane.clone(),
             toast_revealer: toast_revealer.clone(),
@@ -1299,6 +1323,99 @@ impl AdelieWindow {
             }
         ));
 
+        // Tool-gate toggle (daemon #1007): a direct, one-click toggle, not a
+        // dialog — this is a single boolean, unlike Personality's multi-field
+        // override, so there is nothing to pre-fill or pick. The button's
+        // `active` state is already the requested new value by the time
+        // `toggled` fires; save it optimistically and roll back on failure so
+        // the button never claims a state the daemon didn't actually store.
+        tool_gate_toggle.connect_toggled(glib::clone!(
+            #[strong]
+            tool_gate_toggle,
+            #[strong]
+            tool_gate_suppress,
+            #[strong]
+            client,
+            #[strong]
+            status_label,
+            #[strong]
+            state,
+            move |_| {
+                // A programmatic `set_active` from the conversation-load sync
+                // fires this same signal; skip saving when that's the cause.
+                if tool_gate_suppress.get() {
+                    return;
+                }
+                let requested = tool_gate_toggle.is_active();
+                let Some(connector) = client.borrow().clone() else {
+                    tool_gate_suppress.set(true);
+                    tool_gate_toggle.set_active(!requested);
+                    tool_gate_suppress.set(false);
+                    status_label.set_text("Not connected — tool-gate override unavailable");
+                    return;
+                };
+                if connector.client().as_commands().is_none() {
+                    tool_gate_suppress.set(true);
+                    tool_gate_toggle.set_active(!requested);
+                    tool_gate_suppress.set(false);
+                    status_label.set_text(
+                        "The tool-gate override requires a local-socket or WebSocket connection (not available over D-Bus)",
+                    );
+                    return;
+                }
+                let Some(conv_id) = state.borrow().current_conversation_id.clone() else {
+                    tool_gate_suppress.set(true);
+                    tool_gate_toggle.set_active(!requested);
+                    tool_gate_suppress.set(false);
+                    status_label.set_text("Open a conversation first to set its tool-gate override");
+                    return;
+                };
+
+                set_tool_gate_toggle_state(&tool_gate_toggle, requested);
+                status_label.set_text(if requested {
+                    "Turning live-dangerously ON…"
+                } else {
+                    "Turning live-dangerously off…"
+                });
+
+                // The network call needs the tokio runtime (reqwest/tungstenite),
+                // so it runs on `spawn_on_runtime`; the result crosses back to the
+                // GTK main thread via a oneshot so the widget touches below never
+                // happen inside a `Send`-bound future — mirrors `login_screen.rs`'s
+                // connect flow, which has the same "await on tokio, then touch
+                // widgets" shape.
+                let (tx_result, rx_result) = tokio::sync::oneshot::channel();
+                crate::async_bridge::spawn_on_runtime(async move {
+                    let transport = connector.client();
+                    let result =
+                        management_client::set_conversation_tool_gate(transport, &conv_id, requested)
+                            .await;
+                    let _ = tx_result.send(result);
+                });
+                let tool_gate_toggle_for_save = tool_gate_toggle.clone();
+                let tool_gate_suppress_for_save = Rc::clone(&tool_gate_suppress);
+                let status_for_save = status_label.clone();
+                glib::spawn_future_local(async move {
+                    let outcome = match rx_result.await {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow::anyhow!("internal error")),
+                    };
+                    match outcome {
+                        Ok(_stored) => {
+                            status_for_save.set_text("");
+                        }
+                        Err(e) => {
+                            tool_gate_suppress_for_save.set(true);
+                            tool_gate_toggle_for_save.set_active(!requested);
+                            set_tool_gate_toggle_state(&tool_gate_toggle_for_save, !requested);
+                            tool_gate_suppress_for_save.set(false);
+                            status_for_save.set_text(&format!("Save tool-gate override: {e}"));
+                        }
+                    }
+                });
+            }
+        ));
+
         // Hamburger menu: Disconnect → close this window, show login screen
         disconnect_btn.connect_clicked(glib::clone!(
             #[weak]
@@ -1429,6 +1546,44 @@ fn compose_status(base: &str, queued: usize) -> String {
         base.to_string()
     } else {
         format!("{base}, {queued} queued")
+    }
+}
+
+/// Label shown on the per-conversation tool-gate toggle (daemon #1007). `false`
+/// (default, gate enforced) reads as "Safe"; `true` (gate disabled for this
+/// conversation) reads as "LIVE" so it cannot be mistaken for the safe state at
+/// a glance.
+fn tool_gate_toggle_label(disabled: bool) -> &'static str {
+    if disabled { "LIVE" } else { "Safe" }
+}
+
+/// Tooltip shown on the per-conversation tool-gate toggle, spelling out what the
+/// state actually means since the label alone is terse by design.
+fn tool_gate_toggle_tooltip(disabled: bool) -> &'static str {
+    if disabled {
+        "Live dangerously is ON for this conversation: a tool that would \
+         normally be refused after reading outside content will run anyway. \
+         Click to turn it back off."
+    } else {
+        "Live dangerously is off for this conversation (default): a tool is \
+         refused for the rest of a turn once that turn has read outside \
+         content. Click to allow it anyway for this conversation."
+    }
+}
+
+/// Push `disabled` onto the toggle button's visible state (label, tooltip, and
+/// the `tool-gate-live` CSS class that gives the ON state its unmistakable
+/// warning color) without touching its `active` property — callers that also
+/// need to change `active` (e.g. syncing to a freshly loaded conversation) set
+/// that separately, guarded by `tool_gate_suppress` so the `toggled` signal
+/// this would otherwise fire doesn't re-trigger a save.
+fn set_tool_gate_toggle_state(button: &ToggleButton, disabled: bool) {
+    button.set_label(tool_gate_toggle_label(disabled));
+    button.set_tooltip_text(Some(tool_gate_toggle_tooltip(disabled)));
+    if disabled {
+        button.add_css_class("tool-gate-live");
+    } else {
+        button.remove_css_class("tool-gate-live");
     }
 }
 
@@ -1687,6 +1842,8 @@ fn handle_ui_message(
         pending_connector,
         input_bar,
         model_picker,
+        tool_gate_toggle,
+        tool_gate_suppress,
         tasks_panel,
         side_pane,
         toast_revealer,
@@ -1801,6 +1958,21 @@ fn handle_ui_message(
                 };
                 input_bar.set_voice_in_active(voice_in);
                 input_bar.set_adele_output_active(adele_output);
+
+                // Same per-conversation refresh for the tool-gate toggle
+                // (daemon #1007): the newly-active conversation's own stored
+                // value, not whatever the previous conversation left the
+                // button showing. Suppressed so this programmatic `set_active`
+                // doesn't fire `toggled` and re-trigger a save.
+                let tool_gate_disabled = state
+                    .borrow()
+                    .current_conversation()
+                    .map(|c| c.tool_gate_disabled)
+                    .unwrap_or(false);
+                tool_gate_suppress.set(true);
+                tool_gate_toggle.set_active(tool_gate_disabled);
+                set_tool_gate_toggle_state(tool_gate_toggle, tool_gate_disabled);
+                tool_gate_suppress.set(false);
             }
             Effect::ReloadConversation(id) => {
                 // Re-fetch an already-open conversation (reconnect / debug /
@@ -2306,8 +2478,35 @@ mod tests {
     use super::{
         AssistantCommands, CHIP_PREVIEW_MAX, ChipButton, RecallDecision, RecallKey, UiMessage, api,
         chip_click_message, chip_edit_index, chip_preview, compose_status, is_user_initiated_send,
-        recall_decision, send_prompt_with_key, submit_prompt_message,
+        recall_decision, send_prompt_with_key, submit_prompt_message, tool_gate_toggle_label,
+        tool_gate_toggle_tooltip,
     };
+
+    // --- Per-conversation tool-gate override toggle (daemon #1007) -------------
+
+    #[test]
+    fn tool_gate_toggle_label_reads_safe_when_the_override_is_off() {
+        assert_eq!(tool_gate_toggle_label(false), "Safe");
+    }
+
+    #[test]
+    fn tool_gate_toggle_label_reads_live_when_the_override_is_on() {
+        assert_eq!(tool_gate_toggle_label(true), "LIVE");
+    }
+
+    #[test]
+    fn tool_gate_toggle_tooltip_explains_the_off_state_and_how_to_enable() {
+        let tooltip = tool_gate_toggle_tooltip(false);
+        assert!(tooltip.contains("off"));
+        assert!(tooltip.to_lowercase().contains("click to allow"));
+    }
+
+    #[test]
+    fn tool_gate_toggle_tooltip_explains_the_on_state_and_how_to_disable() {
+        let tooltip = tool_gate_toggle_tooltip(true);
+        assert!(tooltip.contains("ON"));
+        assert!(tooltip.to_lowercase().contains("turn it back off"));
+    }
 
     // --- AC9: a background queue flush must not wipe a fresh composer draft ----
     // The `Effect::SendPrompt` executor clears the live composer only when the
