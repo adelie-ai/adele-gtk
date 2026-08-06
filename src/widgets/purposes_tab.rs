@@ -557,6 +557,246 @@ mod tests {
         }
     }
 
+    fn conn(id: &str, connector_type: &str) -> api::ConnectionView {
+        api::ConnectionView {
+            id: id.into(),
+            connector_type: connector_type.into(),
+            display_label: format!("{id} ({connector_type})"),
+            availability: api::ConnectionAvailability::Ok,
+            has_credentials: true,
+            config: None,
+        }
+    }
+
+    fn listing(connection_id: &str, model_id: &str, display_name: &str) -> api::ModelListing {
+        api::ModelListing {
+            connection_id: connection_id.into(),
+            connection_label: connection_id.into(),
+            model: api::ModelInfoView {
+                id: model_id.into(),
+                display_name: display_name.into(),
+                context_limit: None,
+                capabilities: api::ModelCapabilitiesView::default(),
+            },
+            notices: Vec::new(),
+        }
+    }
+
+    fn loaded(connection_id: &str, models: &[(&str, &str)]) -> ModelListState {
+        ModelListState::Loaded(
+            models
+                .iter()
+                .map(|(id, name)| listing(connection_id, id, name))
+                .collect(),
+        )
+    }
+
+    // -- The hang: a rebuild must not be able to cause another rebuild. ------
+
+    /// A rebuild writes to the row's `StringList`s, and every write emits
+    /// `items-changed`, which makes the bound `DropDown` emit
+    /// `notify::selected`. A notification GTK delivers after the rebuild
+    /// returns re-enters the connection handler and rebuilds again. The cycle
+    /// terminates only if a rebuild that changes nothing writes nothing, so
+    /// the second pass emits no signal.
+    #[test]
+    fn a_rebuild_cannot_trigger_another_rebuild() {
+        let connections = vec![conn("bedrock", "bedrock"), conn("ollama", "ollama")];
+        let state = loaded("bedrock", &[("zai.glm-5", "GLM 5")]);
+
+        for purpose in api::PurposeKindApi::all() {
+            let conn_opts = connection_options(purpose, &connections);
+            assert!(
+                !list_needs_sync(&conn_opts.labels, &conn_opts.labels),
+                "{purpose:?}: rebuilding the connection list with its own contents must write nothing"
+            );
+
+            for candidate in [
+                Some(&state),
+                Some(&ModelListState::Pending),
+                Some(&ModelListState::Failed("connection is not live".into())),
+                None,
+            ] {
+                let model_opts = model_options(purpose, Some("bedrock"), candidate);
+                assert!(
+                    !list_needs_sync(&model_opts.labels, &model_opts.labels),
+                    "{purpose:?}/{candidate:?}: rebuilding the model list with its own contents must write nothing"
+                );
+            }
+        }
+    }
+
+    /// Switching the provider changes the model list exactly once: the first
+    /// rebuild writes, and recomputing for the same connection does not.
+    #[test]
+    fn changing_the_connection_rebuilds_the_model_list_once() {
+        let purpose = api::PurposeKindApi::Embedding;
+        let bedrock = loaded("bedrock", &[("zai.glm-5", "GLM 5")]);
+        let ollama = loaded("ollama", &[("nomic-embed-text", "Nomic Embed")]);
+
+        let before = model_options(purpose, Some("bedrock"), Some(&bedrock));
+        let after = model_options(purpose, Some("ollama"), Some(&ollama));
+        assert!(
+            list_needs_sync(&before.labels, &after.labels),
+            "switching bedrock -> ollama must change the model list"
+        );
+
+        let again = model_options(purpose, Some("ollama"), Some(&ollama));
+        assert!(
+            !list_needs_sync(&after.labels, &again.labels),
+            "recomputing for the same connection must not change the model list"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_connection_list_is_not_rewritten() {
+        let connections = vec![conn("bedrock", "bedrock")];
+        let first = connection_options(api::PurposeKindApi::Voice, &connections);
+        let second = connection_options(api::PurposeKindApi::Voice, &connections);
+        assert!(!list_needs_sync(&first.labels, &second.labels));
+    }
+
+    #[test]
+    fn a_genuinely_different_list_is_rewritten() {
+        assert!(list_needs_sync(
+            &["a".to_string()],
+            &["a".to_string(), "b".to_string()]
+        ));
+        assert!(list_needs_sync(&["a".to_string()], &["b".to_string()]));
+        assert!(!list_needs_sync(&["a".to_string()], &["a".to_string()]));
+    }
+
+    // -- The model-list request must not repeat. ----------------------------
+
+    /// #142's amplifier: a failed list was never cached, so every reconcile
+    /// re-fired the same doomed request. One request per connection, whatever
+    /// the outcome.
+    #[test]
+    fn failed_model_list_is_requested_once_per_connection() {
+        assert!(
+            should_request_models(Some("bedrock"), None),
+            "a connection with no recorded state must be requested once"
+        );
+        assert!(
+            !should_request_models(Some("bedrock"), Some(&ModelListState::Pending)),
+            "a request already in flight must not be repeated"
+        );
+        assert!(
+            !should_request_models(
+                Some("bedrock"),
+                Some(&ModelListState::Failed("not live".into()))
+            ),
+            "a failed list must not be re-requested on every reconcile"
+        );
+        assert!(
+            !should_request_models(
+                Some("bedrock"),
+                Some(&loaded("bedrock", &[("zai.glm-5", "GLM 5")]))
+            ),
+            "a loaded list must not be re-requested"
+        );
+    }
+
+    #[test]
+    fn the_inherit_sentinel_never_requests_a_model_list() {
+        assert!(!should_request_models(Some(PRIMARY_SENTINEL), None));
+        assert!(!should_request_models(None, None));
+    }
+
+    // -- A failed list must be visible, and must not be writable. -----------
+
+    #[test]
+    fn model_list_failure_is_surfaced_on_the_row() {
+        let opts = model_options(
+            api::PurposeKindApi::Embedding,
+            Some("bedrock"),
+            Some(&ModelListState::Failed("connection is not live".into())),
+        );
+        assert!(
+            opts.labels.iter().any(|l| l.contains("unavailable")),
+            "the row must say the list failed, not show an empty dropdown: {:?}",
+            opts.labels
+        );
+    }
+
+    #[test]
+    fn a_pending_model_list_is_surfaced_on_the_row() {
+        let opts = model_options(
+            api::PurposeKindApi::Embedding,
+            Some("bedrock"),
+            Some(&ModelListState::Pending),
+        );
+        assert!(
+            opts.labels.iter().any(|l| l.contains("Loading")),
+            "an in-flight list must show as loading: {:?}",
+            opts.labels
+        );
+    }
+
+    /// A label with no matching value cannot be turned into a binding: the
+    /// row reads it back as "nothing real selected", which `planned_write`
+    /// already refuses.
+    #[test]
+    fn purpose_row_with_unavailable_models_is_not_writable() {
+        let opts = model_options(
+            api::PurposeKindApi::Embedding,
+            Some("bedrock"),
+            Some(&ModelListState::Failed("not live".into())),
+        );
+        let notice_idx = opts
+            .labels
+            .iter()
+            .position(|l| l.contains("unavailable"))
+            .expect("the failure notice must be present");
+        let selected = opts.values.get(notice_idx).cloned();
+        assert_eq!(
+            selected, None,
+            "selecting the failure notice must not yield a model value"
+        );
+        assert_eq!(
+            planned_write(
+                api::PurposeKindApi::Embedding,
+                &sel(Some("bedrock"), selected.as_deref()),
+                None
+            ),
+            None,
+            "a row whose model list failed must not be writable"
+        );
+    }
+
+    // -- Option contents. ---------------------------------------------------
+
+    #[test]
+    fn only_non_interactive_purposes_offer_the_inherit_sentinel() {
+        let connections = vec![conn("bedrock", "bedrock")];
+
+        let interactive = connection_options(api::PurposeKindApi::Interactive, &connections);
+        assert!(
+            !interactive.values.iter().any(|v| v == PRIMARY_SENTINEL),
+            "Interactive has no primary above it, so it must not offer inherit"
+        );
+
+        let embedding = connection_options(api::PurposeKindApi::Embedding, &connections);
+        assert_eq!(embedding.values.first().map(String::as_str), Some(PRIMARY_SENTINEL));
+    }
+
+    #[test]
+    fn every_option_label_past_the_values_is_a_notice() {
+        // The mirror contract: `values[i]` names what `labels[i]` selects.
+        // Extra trailing labels are notices, which is what makes them
+        // unselectable as a binding.
+        let connections = vec![conn("bedrock", "bedrock")];
+        let opts = connection_options(api::PurposeKindApi::Embedding, &connections);
+        assert_eq!(opts.labels.len(), opts.values.len());
+
+        let loaded_opts = model_options(
+            api::PurposeKindApi::Embedding,
+            Some("bedrock"),
+            Some(&loaded("bedrock", &[("zai.glm-5", "GLM 5")])),
+        );
+        assert_eq!(loaded_opts.labels.len(), loaded_opts.values.len());
+    }
+
     #[test]
     fn reconciling_to_server_state_is_not_a_write() {
         // The loop: refresh -> reconcile -> stray notify -> emit -> refresh.
