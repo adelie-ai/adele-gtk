@@ -490,12 +490,12 @@ impl PurposesTab {
 /// Write `desired` into `list`, but only if it differs from what is there.
 ///
 /// The comparison is the point. See [`list_needs_sync`].
-fn sync_string_list(list: &StringList, desired: &[String]) -> bool {
+fn sync_string_list(list: &StringList, desired: &[String]) {
     let current: Vec<String> = (0..list.n_items())
         .map(|i| list.string(i).map(|s| s.to_string()).unwrap_or_default())
         .collect();
     if !list_needs_sync(&current, desired) {
-        return false;
+        return;
     }
     while list.n_items() > 0 {
         list.remove(0);
@@ -503,7 +503,6 @@ fn sync_string_list(list: &StringList, desired: &[String]) -> bool {
     for label in desired {
         list.append(label);
     }
-    true
 }
 
 /// Rebuild the connection/model dropdowns and request models for the
@@ -586,14 +585,17 @@ fn repopulate_models_for_purpose(
     *suppress.borrow_mut() = was_suppressed;
 
     // Record the request before making it, so a re-entrant rebuild sees
-    // `Pending` and does not ask a second time.
-    if need_request && let Some(id) = selected_conn {
+    // `Pending` and does not ask a second time. Only when a callback is there
+    // to make it: marking `Pending` without dispatching would strand the
+    // connection, because nothing would ever replace that state.
+    if need_request
+        && let Some(id) = selected_conn
+        && let Some(ref cb) = *on_request_models.borrow()
+    {
         models_by_connection
             .borrow_mut()
             .insert(id.clone(), ModelListState::Pending);
-        if let Some(ref cb) = *on_request_models.borrow() {
-            cb(id);
-        }
+        cb(id);
     }
 }
 
