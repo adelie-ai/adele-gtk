@@ -94,6 +94,118 @@ fn planned_write(
     Some(candidate)
 }
 
+/// What a row's dropdown should display, lifted out of GTK so the contents
+/// are plain data that can be compared before anything is written.
+///
+/// `values[i]` names what `labels[i]` selects. A label with no value at its
+/// index is a **notice** — "Loading models...", "Models unavailable" — which
+/// the row reads back as "nothing real selected", so it can never become a
+/// binding. That is why `labels` may be longer than `values`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DropdownOptions {
+    labels: Vec<String>,
+    values: Vec<String>,
+}
+
+/// What is known about one connection's model list.
+///
+/// Recording the outcome — not only the success — is what stops a failing
+/// connection being asked again on every reconcile. Absence of an entry means
+/// "never asked", which is the only state that starts a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelListState {
+    /// A request is in flight. A second request would be a duplicate.
+    Pending,
+    Loaded(Vec<api::ModelListing>),
+    /// The request failed. Held so the reconcile loop stops re-asking; the
+    /// user retries by reopening Settings, which builds a fresh tab.
+    Failed(String),
+}
+
+/// Whether `list` must be rewritten to show `desired`.
+///
+/// This is the whole defence against the rebuild loop. Every write to a
+/// `StringList` emits `items-changed`, which makes the bound `DropDown` emit
+/// `notify::selected`, which re-enters the handler that rebuilds. Comparing
+/// first means an unchanged list is written zero times, so the re-entrant pass
+/// emits nothing and the cascade stops. A guard flag cannot do this, because
+/// GTK delivers some of those notifications after the guard is cleared.
+fn list_needs_sync(current: &[String], desired: &[String]) -> bool {
+    current != desired
+}
+
+/// The connections a purpose may bind to. Only non-interactive purposes may
+/// inherit, because there is no primary above `Interactive`.
+fn connection_options(
+    purpose: api::PurposeKindApi,
+    connections: &[api::ConnectionView],
+) -> DropdownOptions {
+    let mut opts = DropdownOptions::default();
+    if !matches!(purpose, api::PurposeKindApi::Interactive) {
+        opts.labels.push("primary (inherit)".to_string());
+        opts.values.push(PRIMARY_SENTINEL.to_string());
+    }
+    for conn in connections {
+        opts.labels
+            .push(format!("{}  ({})", conn.id, conn.connector_type));
+        opts.values.push(conn.id.clone());
+    }
+    opts
+}
+
+/// The models a purpose may bind to, given the connection it currently shows
+/// and what is known about that connection's list.
+fn model_options(
+    purpose: api::PurposeKindApi,
+    selected_connection: Option<&str>,
+    state: Option<&ModelListState>,
+) -> DropdownOptions {
+    let mut opts = DropdownOptions::default();
+    let Some(connection) = selected_connection else {
+        return opts;
+    };
+
+    if !matches!(purpose, api::PurposeKindApi::Interactive) {
+        opts.labels.push("primary (inherit)".to_string());
+        opts.values.push(PRIMARY_SENTINEL.to_string());
+    }
+    if connection == PRIMARY_SENTINEL {
+        return opts;
+    }
+
+    match state {
+        Some(ModelListState::Loaded(listings)) => {
+            for listing in listings {
+                opts.labels.push(listing.model.display_name.clone());
+                opts.values.push(listing.model.id.clone());
+            }
+        }
+        // Notices carry no value, so selecting one yields no binding.
+        Some(ModelListState::Pending) | None => {
+            opts.labels.push("Loading models...".to_string());
+        }
+        Some(ModelListState::Failed(reason)) => {
+            opts.labels.push(format!("Models unavailable - {reason}"));
+        }
+    }
+    opts
+}
+
+/// Whether to start a model-list request for the connection a row shows.
+///
+/// True only when nothing is known about the connection yet. `Pending` means a
+/// request is already in flight, and `Failed` means the answer is known to be
+/// no — re-asking either is what saturated the daemon in #142.
+fn should_request_models(
+    selected_connection: Option<&str>,
+    state: Option<&ModelListState>,
+) -> bool {
+    match selected_connection {
+        None | Some(PRIMARY_SENTINEL) => false,
+        Some(_) => state.is_none(),
+    }
+}
+
 /// The daemon's last reported binding for `purpose`, if it has one.
 fn purpose_config(
     purposes: &api::PurposesView,
@@ -135,16 +247,24 @@ pub struct PurposesTab {
     rows: Rc<RefCell<BTreeMap<String, Row>>>,
     connections: Rc<RefCell<Vec<api::ConnectionView>>>,
     purposes: Rc<RefCell<api::PurposesView>>,
-    /// Model lists keyed by connection id.
-    models_by_connection: Rc<RefCell<BTreeMap<String, Vec<api::ModelListing>>>>,
+    /// What is known about each connection's model list, keyed by connection
+    /// id. Holds failures as well as successes, so a connection that cannot
+    /// list its models is asked once rather than on every reconcile.
+    models_by_connection: Rc<RefCell<BTreeMap<String, ModelListState>>>,
     on_set_purpose: Rc<RefCell<Option<SetPurposeCb>>>,
     on_request_models: Rc<RefCell<Option<RequestModelsCb>>>,
     /// When true, we're reconciling the UI to state. This skips the work of
     /// re-deriving a write from notifications GTK delivers synchronously — an
     /// optimization, *not* the correctness guarantee. Guarding on this flag
-    /// alone is what allowed the write loop: a notification arriving after
-    /// `reconcile` returned found it cleared. `planned_write` is the actual
-    /// guarantee, because it drops any write matching last-known server state.
+    /// alone is what allowed both loops this tab has had: a notification
+    /// arriving after `reconcile` returned found it cleared, and re-entered.
+    ///
+    /// Two pure rules carry the actual guarantees, one per loop:
+    ///
+    /// * `planned_write` drops any write matching last-known server state, so
+    ///   reconciliation cannot produce a `SetPurpose` (#142);
+    /// * `list_needs_sync` drops any dropdown write that would not change the
+    ///   contents, so a rebuild cannot produce another rebuild (#158).
     suppress: Rc<RefCell<bool>>,
 }
 
@@ -175,7 +295,7 @@ impl PurposesTab {
         let connections: Rc<RefCell<Vec<api::ConnectionView>>> = Rc::new(RefCell::new(Vec::new()));
         let purposes: Rc<RefCell<api::PurposesView>> =
             Rc::new(RefCell::new(api::PurposesView::default()));
-        let models_by_connection: Rc<RefCell<BTreeMap<String, Vec<api::ModelListing>>>> =
+        let models_by_connection: Rc<RefCell<BTreeMap<String, ModelListState>>> =
             Rc::new(RefCell::new(BTreeMap::new()));
         let on_set_purpose: Rc<RefCell<Option<SetPurposeCb>>> = Rc::new(RefCell::new(None));
         let on_request_models: Rc<RefCell<Option<RequestModelsCb>>> = Rc::new(RefCell::new(None));
@@ -241,7 +361,9 @@ impl PurposesTab {
                         return;
                     }
                     // Rebuild model dropdown to reflect the new connection.
-                    let _ = repopulate_models_for_purpose(
+                    // Safe to re-enter: a rebuild that reaches the same answer
+                    // writes nothing, so it raises no further notifications.
+                    repopulate_models_for_purpose(
                         purpose,
                         &rows,
                         &connections,
@@ -330,14 +452,28 @@ impl PurposesTab {
     pub fn set_models(&self, connection_id: &str, listings: Vec<api::ModelListing>) {
         self.models_by_connection
             .borrow_mut()
-            .insert(connection_id.to_string(), listings);
+            .insert(connection_id.to_string(), ModelListState::Loaded(listings));
+        self.reconcile();
+    }
+
+    /// Record that a connection could not list its models.
+    ///
+    /// Without this the failure is invisible to the tab, so the connection
+    /// looks un-asked and every reconcile asks again — the amplifier that made
+    /// #142 saturate the daemon. The row shows the reason, and the user retries
+    /// by reopening Settings.
+    pub fn set_models_failed(&self, connection_id: &str, reason: &str) {
+        self.models_by_connection.borrow_mut().insert(
+            connection_id.to_string(),
+            ModelListState::Failed(reason.to_string()),
+        );
         self.reconcile();
     }
 
     fn reconcile(&self) {
         *self.suppress.borrow_mut() = true;
         for purpose in api::PurposeKindApi::all() {
-            let _ = repopulate_models_for_purpose(
+            repopulate_models_for_purpose(
                 purpose,
                 &self.rows,
                 &self.connections,
@@ -351,97 +487,116 @@ impl PurposesTab {
     }
 }
 
+/// Write `desired` into `list`, but only if it differs from what is there.
+///
+/// The comparison is the point. See [`list_needs_sync`].
+fn sync_string_list(list: &StringList, desired: &[String]) {
+    let current: Vec<String> = (0..list.n_items())
+        .map(|i| list.string(i).map(|s| s.to_string()).unwrap_or_default())
+        .collect();
+    if !list_needs_sync(&current, desired) {
+        return;
+    }
+    while list.n_items() > 0 {
+        list.remove(0);
+    }
+    for label in desired {
+        list.append(label);
+    }
+}
+
 /// Rebuild the connection/model dropdowns and request models for the
-/// currently-selected connection if not already cached.
+/// currently-selected connection if nothing is known about it yet.
+///
+/// Writes to the dropdowns only where the contents actually change, so a
+/// rebuild that reaches the same answer is silent. Without that, each rebuild
+/// emits `notify::selected`, a notification delivered after this returns
+/// re-enters the connection handler, and the two rebuild each other until the
+/// main loop is starved (#158).
 fn repopulate_models_for_purpose(
     purpose: api::PurposeKindApi,
     rows: &Rc<RefCell<BTreeMap<String, Row>>>,
     connections: &Rc<RefCell<Vec<api::ConnectionView>>>,
-    models_by_connection: &Rc<RefCell<BTreeMap<String, Vec<api::ModelListing>>>>,
+    models_by_connection: &Rc<RefCell<BTreeMap<String, ModelListState>>>,
     on_request_models: &Rc<RefCell<Option<RequestModelsCb>>>,
     suppress: &Rc<RefCell<bool>>,
-) -> Option<()> {
+) {
+    let rows_borrow = rows.borrow();
+    // Taken before `suppress` is raised, so an early return cannot leave the
+    // flag stuck true and the tab inert.
+    let Some(row) = rows_borrow.get(purpose.as_key()) else {
+        return;
+    };
+
     let was_suppressed = *suppress.borrow();
     *suppress.borrow_mut() = true;
 
-    let rows_borrow = rows.borrow();
-    let row = rows_borrow.get(purpose.as_key())?;
+    let conn_opts = connection_options(purpose, &connections.borrow());
+    let prev_conn = row
+        .connection_values
+        .borrow()
+        .get(row.connection_dd.selected() as usize)
+        .cloned();
 
-    // Rebuild connection list. Interactive may not inherit from itself,
-    // so only non-interactive purposes see the "primary" sentinel.
-    let prev_conn_idx = row.connection_dd.selected() as usize;
-    let prev_conn_value = row.connection_values.borrow().get(prev_conn_idx).cloned();
+    sync_string_list(&row.connection_list, &conn_opts.labels);
+    *row.connection_values.borrow_mut() = conn_opts.values.clone();
 
-    while row.connection_list.n_items() > 0 {
-        row.connection_list.remove(0);
-    }
-    let mut conn_values: Vec<String> = Vec::new();
-    if !matches!(purpose, api::PurposeKindApi::Interactive) {
-        row.connection_list.append("primary (inherit)");
-        conn_values.push(PRIMARY_SENTINEL.to_string());
-    }
-    for conn in connections.borrow().iter() {
-        row.connection_list
-            .append(&format!("{}  ({})", conn.id, conn.connector_type));
-        conn_values.push(conn.id.clone());
-    }
-    *row.connection_values.borrow_mut() = conn_values.clone();
-
-    // Restore previous selection if still present.
-    if let Some(prev) = prev_conn_value
-        && let Some(idx) = conn_values.iter().position(|v| v == &prev)
+    // Selection is preserved by value, not index: the list may have grown or
+    // shrunk underneath it.
+    if let Some(prev) = prev_conn.as_ref()
+        && let Some(idx) = conn_opts.values.iter().position(|v| v == prev)
     {
         row.connection_dd.set_selected(idx as u32);
     }
 
-    // Which connection's models should we display in the model dropdown?
-    let selected_idx = row.connection_dd.selected() as usize;
-    let selected_conn = conn_values.get(selected_idx).cloned();
-    let cache = models_by_connection.borrow();
-    let (models, need_request): (Vec<api::ModelListing>, Option<String>) =
-        match selected_conn.as_deref() {
-            Some(PRIMARY_SENTINEL) | None => (Vec::new(), None),
-            Some(id) => match cache.get(id) {
-                Some(list) => (list.clone(), None),
-                None => (Vec::new(), Some(id.to_string())),
-            },
-        };
-    drop(cache);
+    let selected_conn = conn_opts
+        .values
+        .get(row.connection_dd.selected() as usize)
+        .cloned();
 
-    // Rebuild model dropdown.
-    let prev_model_idx = row.model_dd.selected() as usize;
-    let prev_model_value = row.model_values.borrow().get(prev_model_idx).cloned();
+    let known = models_by_connection.borrow();
+    let state = selected_conn.as_deref().and_then(|id| known.get(id));
+    let need_request = should_request_models(selected_conn.as_deref(), state);
+    // A request is about to start, so show the row as loading rather than
+    // waiting a whole reconcile to say so.
+    let display_state = if need_request {
+        Some(ModelListState::Pending)
+    } else {
+        state.cloned()
+    };
+    drop(known);
 
-    while row.model_list.n_items() > 0 {
-        row.model_list.remove(0);
-    }
-    let mut model_values: Vec<String> = Vec::new();
-    if !matches!(purpose, api::PurposeKindApi::Interactive) {
-        row.model_list.append("primary (inherit)");
-        model_values.push(PRIMARY_SENTINEL.to_string());
-    }
-    for m in &models {
-        row.model_list.append(&m.model.display_name);
-        model_values.push(m.model.id.clone());
-    }
-    *row.model_values.borrow_mut() = model_values.clone();
+    let model_opts = model_options(purpose, selected_conn.as_deref(), display_state.as_ref());
+    let prev_model = row
+        .model_values
+        .borrow()
+        .get(row.model_dd.selected() as usize)
+        .cloned();
 
-    if let Some(prev) = prev_model_value
-        && let Some(idx) = model_values.iter().position(|v| v == &prev)
+    sync_string_list(&row.model_list, &model_opts.labels);
+    *row.model_values.borrow_mut() = model_opts.values.clone();
+
+    if let Some(prev) = prev_model.as_ref()
+        && let Some(idx) = model_opts.values.iter().position(|v| v == prev)
     {
         row.model_dd.set_selected(idx as u32);
     }
 
     *suppress.borrow_mut() = was_suppressed;
 
-    // Kick off a model fetch for the newly-selected connection if we don't
-    // have it yet.
-    if let Some(id) = need_request
+    // Record the request before making it, so a re-entrant rebuild sees
+    // `Pending` and does not ask a second time. Only when a callback is there
+    // to make it: marking `Pending` without dispatching would strand the
+    // connection, because nothing would ever replace that state.
+    if need_request
+        && let Some(id) = selected_conn
         && let Some(ref cb) = *on_request_models.borrow()
     {
+        models_by_connection
+            .borrow_mut()
+            .insert(id.clone(), ModelListState::Pending);
         cb(id);
     }
-    Some(())
 }
 
 /// Apply the server-side `PurposesView` to the dropdowns. Non-existent
@@ -555,6 +710,249 @@ mod tests {
             effort: None,
             max_context_tokens: None,
         }
+    }
+
+    fn conn(id: &str, connector_type: &str) -> api::ConnectionView {
+        api::ConnectionView {
+            id: id.into(),
+            connector_type: connector_type.into(),
+            display_label: format!("{id} ({connector_type})"),
+            availability: api::ConnectionAvailability::Ok,
+            has_credentials: true,
+            config: None,
+        }
+    }
+
+    fn listing(connection_id: &str, model_id: &str, display_name: &str) -> api::ModelListing {
+        api::ModelListing {
+            connection_id: connection_id.into(),
+            connection_label: connection_id.into(),
+            model: api::ModelInfoView {
+                id: model_id.into(),
+                display_name: display_name.into(),
+                context_limit: None,
+                capabilities: api::ModelCapabilitiesView::default(),
+            },
+            notices: Vec::new(),
+        }
+    }
+
+    fn loaded(connection_id: &str, models: &[(&str, &str)]) -> ModelListState {
+        ModelListState::Loaded(
+            models
+                .iter()
+                .map(|(id, name)| listing(connection_id, id, name))
+                .collect(),
+        )
+    }
+
+    // -- The hang: a rebuild must not be able to cause another rebuild. ------
+
+    /// A rebuild writes to the row's `StringList`s, and every write emits
+    /// `items-changed`, which makes the bound `DropDown` emit
+    /// `notify::selected`. A notification GTK delivers after the rebuild
+    /// returns re-enters the connection handler and rebuilds again. The cycle
+    /// terminates only if a rebuild that changes nothing writes nothing, so
+    /// the second pass emits no signal.
+    #[test]
+    fn a_rebuild_cannot_trigger_another_rebuild() {
+        let connections = vec![conn("bedrock", "bedrock"), conn("ollama", "ollama")];
+        let state = loaded("bedrock", &[("zai.glm-5", "GLM 5")]);
+
+        for purpose in api::PurposeKindApi::all() {
+            let conn_opts = connection_options(purpose, &connections);
+            assert!(
+                !list_needs_sync(&conn_opts.labels, &conn_opts.labels),
+                "{purpose:?}: rebuilding the connection list with its own contents must write nothing"
+            );
+
+            for candidate in [
+                Some(&state),
+                Some(&ModelListState::Pending),
+                Some(&ModelListState::Failed("connection is not live".into())),
+                None,
+            ] {
+                let model_opts = model_options(purpose, Some("bedrock"), candidate);
+                assert!(
+                    !list_needs_sync(&model_opts.labels, &model_opts.labels),
+                    "{purpose:?}/{candidate:?}: rebuilding the model list with its own contents must write nothing"
+                );
+            }
+        }
+    }
+
+    /// Switching the provider changes the model list exactly once: the first
+    /// rebuild writes, and recomputing for the same connection does not.
+    #[test]
+    fn changing_the_connection_rebuilds_the_model_list_once() {
+        let purpose = api::PurposeKindApi::Embedding;
+        let bedrock = loaded("bedrock", &[("zai.glm-5", "GLM 5")]);
+        let ollama = loaded("ollama", &[("nomic-embed-text", "Nomic Embed")]);
+
+        let before = model_options(purpose, Some("bedrock"), Some(&bedrock));
+        let after = model_options(purpose, Some("ollama"), Some(&ollama));
+        assert!(
+            list_needs_sync(&before.labels, &after.labels),
+            "switching bedrock -> ollama must change the model list"
+        );
+
+        let again = model_options(purpose, Some("ollama"), Some(&ollama));
+        assert!(
+            !list_needs_sync(&after.labels, &again.labels),
+            "recomputing for the same connection must not change the model list"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_connection_list_is_not_rewritten() {
+        let connections = vec![conn("bedrock", "bedrock")];
+        let first = connection_options(api::PurposeKindApi::Voice, &connections);
+        let second = connection_options(api::PurposeKindApi::Voice, &connections);
+        assert!(!list_needs_sync(&first.labels, &second.labels));
+    }
+
+    #[test]
+    fn a_genuinely_different_list_is_rewritten() {
+        assert!(list_needs_sync(
+            &["a".to_string()],
+            &["a".to_string(), "b".to_string()]
+        ));
+        assert!(list_needs_sync(&["a".to_string()], &["b".to_string()]));
+        assert!(!list_needs_sync(&["a".to_string()], &["a".to_string()]));
+    }
+
+    // -- The model-list request must not repeat. ----------------------------
+
+    /// #142's amplifier: a failed list was never cached, so every reconcile
+    /// re-fired the same doomed request. One request per connection, whatever
+    /// the outcome.
+    #[test]
+    fn failed_model_list_is_requested_once_per_connection() {
+        assert!(
+            should_request_models(Some("bedrock"), None),
+            "a connection with no recorded state must be requested once"
+        );
+        assert!(
+            !should_request_models(Some("bedrock"), Some(&ModelListState::Pending)),
+            "a request already in flight must not be repeated"
+        );
+        assert!(
+            !should_request_models(
+                Some("bedrock"),
+                Some(&ModelListState::Failed("not live".into()))
+            ),
+            "a failed list must not be re-requested on every reconcile"
+        );
+        assert!(
+            !should_request_models(
+                Some("bedrock"),
+                Some(&loaded("bedrock", &[("zai.glm-5", "GLM 5")]))
+            ),
+            "a loaded list must not be re-requested"
+        );
+    }
+
+    #[test]
+    fn the_inherit_sentinel_never_requests_a_model_list() {
+        assert!(!should_request_models(Some(PRIMARY_SENTINEL), None));
+        assert!(!should_request_models(None, None));
+    }
+
+    // -- A failed list must be visible, and must not be writable. -----------
+
+    #[test]
+    fn model_list_failure_is_surfaced_on_the_row() {
+        let opts = model_options(
+            api::PurposeKindApi::Embedding,
+            Some("bedrock"),
+            Some(&ModelListState::Failed("connection is not live".into())),
+        );
+        assert!(
+            opts.labels.iter().any(|l| l.contains("unavailable")),
+            "the row must say the list failed, not show an empty dropdown: {:?}",
+            opts.labels
+        );
+    }
+
+    #[test]
+    fn a_pending_model_list_is_surfaced_on_the_row() {
+        let opts = model_options(
+            api::PurposeKindApi::Embedding,
+            Some("bedrock"),
+            Some(&ModelListState::Pending),
+        );
+        assert!(
+            opts.labels.iter().any(|l| l.contains("Loading")),
+            "an in-flight list must show as loading: {:?}",
+            opts.labels
+        );
+    }
+
+    /// A label with no matching value cannot be turned into a binding: the
+    /// row reads it back as "nothing real selected", which `planned_write`
+    /// already refuses.
+    #[test]
+    fn purpose_row_with_unavailable_models_is_not_writable() {
+        let opts = model_options(
+            api::PurposeKindApi::Embedding,
+            Some("bedrock"),
+            Some(&ModelListState::Failed("not live".into())),
+        );
+        let notice_idx = opts
+            .labels
+            .iter()
+            .position(|l| l.contains("unavailable"))
+            .expect("the failure notice must be present");
+        let selected = opts.values.get(notice_idx).cloned();
+        assert_eq!(
+            selected, None,
+            "selecting the failure notice must not yield a model value"
+        );
+        assert_eq!(
+            planned_write(
+                api::PurposeKindApi::Embedding,
+                &sel(Some("bedrock"), selected.as_deref()),
+                None
+            ),
+            None,
+            "a row whose model list failed must not be writable"
+        );
+    }
+
+    // -- Option contents. ---------------------------------------------------
+
+    #[test]
+    fn only_non_interactive_purposes_offer_the_inherit_sentinel() {
+        let connections = vec![conn("bedrock", "bedrock")];
+
+        let interactive = connection_options(api::PurposeKindApi::Interactive, &connections);
+        assert!(
+            !interactive.values.iter().any(|v| v == PRIMARY_SENTINEL),
+            "Interactive has no primary above it, so it must not offer inherit"
+        );
+
+        let embedding = connection_options(api::PurposeKindApi::Embedding, &connections);
+        assert_eq!(
+            embedding.values.first().map(String::as_str),
+            Some(PRIMARY_SENTINEL)
+        );
+    }
+
+    #[test]
+    fn every_option_label_past_the_values_is_a_notice() {
+        // The mirror contract: `values[i]` names what `labels[i]` selects.
+        // Extra trailing labels are notices, which is what makes them
+        // unselectable as a binding.
+        let connections = vec![conn("bedrock", "bedrock")];
+        let opts = connection_options(api::PurposeKindApi::Embedding, &connections);
+        assert_eq!(opts.labels.len(), opts.values.len());
+
+        let loaded_opts = model_options(
+            api::PurposeKindApi::Embedding,
+            Some("bedrock"),
+            Some(&loaded("bedrock", &[("zai.glm-5", "GLM 5")])),
+        );
+        assert_eq!(loaded_opts.labels.len(), loaded_opts.values.len());
     }
 
     #[test]

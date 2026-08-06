@@ -550,6 +550,10 @@ pub fn show_settings_dialog(
                             purposes_tab.set_models(&connection_id, listings);
                         }
                         Err(e) => {
+                            // Record the failure as well as reporting it. An
+                            // unrecorded failure leaves the connection looking
+                            // un-asked, so every reconcile asks again (#158).
+                            purposes_tab.set_models_failed(&connection_id, &e);
                             let _ = ui_tx.send(UiMessage::Error(format!("List models: {e}")));
                         }
                     }
