@@ -31,6 +31,7 @@ mod oauth;
 mod preferences;
 mod profile;
 mod selected_models;
+mod telemetry;
 mod theme;
 mod voice_client;
 mod voice_config;
@@ -45,7 +46,6 @@ use clap::Parser;
 use gtk4::Application;
 use gtk4::glib;
 use gtk4::prelude::*;
-use tracing_subscriber::EnvFilter;
 
 use crate::async_bridge::spawn_on_runtime;
 use crate::credential_store::CredentialStore;
@@ -144,9 +144,42 @@ fn main() -> Result<()> {
         .install_default()
         .expect("failed to install default rustls CryptoProvider");
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    // Telemetry (epic mcp-core#38, ticket #152). Two things this replaces
+    // fixed: the console writer moves off stdout (the MCP stdio transport
+    // frames JSON-RPC there, and this binary hosts built-in MCP servers in
+    // process) onto stderr, and a second install — an in-process mcp-core
+    // server library calling it too — is a no-op instead of a panic.
+    //
+    // The gRPC OTLP transport needs a Tokio runtime at the moment `init`
+    // builds the exporter pipelines (hyper-util looks for a reactor); this
+    // app has no `#[tokio::main]`, so without this the default http/protobuf
+    // transport would be the only one that worked here. `async_bridge`'s
+    // runtime is normally built lazily on first use, well after this point
+    // (inside the GTK `activate` closure); forcing it into existence and
+    // entering it for just this call makes both transports work, and the
+    // runtime is the same `'static` one the rest of the app spawns onto, so
+    // nothing is built twice.
+    // A GUI has no console on a normal desktop launch, so a failure here has
+    // nothing to print to and nothing may crash the app over it (a per-signal
+    // export failure already degrades gracefully and never reaches this
+    // point — see adelie-telemetry's own `Error` docs — but the signature
+    // still promises `Result`, and this crate had exactly this failure mode,
+    // outright, two revisions before the one pinned below). `eprintln!`
+    // rather than `tracing::error!`: no subscriber would be installed to
+    // carry the latter anywhere.
+    let _telemetry_guard = {
+        let _enter = async_bridge::runtime().enter();
+        match adelie_telemetry::init(telemetry::config()) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                eprintln!("telemetry init failed; continuing without it: {e}");
+                None
+            }
+        }
+    };
+    // Bound here rather than passed down: dropping it flushes traces,
+    // metrics and logs (D6), and it must outlive `app.run_with_args` below,
+    // which is everything this process does.
 
     CredentialStore::init_store();
 

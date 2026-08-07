@@ -23,6 +23,14 @@ mcp-terminal = ["dep:terminal-mcp"]
 mcp-tasks = ["dep:tasks-mcp"]
 mcp-web = ["dep:web-mcp"]
 
+# OTLP export, off by default (epic mcp-core#38, ticket #152). Passes through to
+# `adelie-telemetry`; with it off, the build resolves no opentelemetry crate at
+# all. TLS is NOT named here on purpose: it is a default feature of
+# `adelie-telemetry` itself, arrives with the dependency whether or not `otel`
+# is on, and costs a default (this-feature-off) build nothing because every
+# reference to it uses the `dep?/feature` form.
+otel = ["adelie-telemetry/otel"]
+
 # The "broad set" of built-in MCP servers (weather / internet-radio /
 # openstreetmap / geocode / skills) - the same fleet Adele ships on the daemon,
 # minus the core-4. They are compiled in and hosted in-process EXACTLY like the
@@ -75,8 +83,14 @@ gtk4 = { version = "0.11", features = ["v4_22"], package = "gtk4" }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustls = { version = "0.23.37", features = ["ring"] }
+# Shared telemetry setup for every Adelie Rust binary (epic mcp-core#38, ticket
+# #152): subscriber construction (console on stderr, quiet unless RUST_LOG is
+# set), the metrics facade, and trace-context helpers. Pinned by revision,
+# matching the fleet-wide pin recorded on the epic (mcp-core#44, "What actually
+# landed in Phase 0"). No `default-features = false`: the default `otel-tls`
+# feature is inert with `otel` off (see the `otel` feature comment above).
+adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "1b8166ab483174e76aa23079858b8a31aaa52ae1" }
 # Already in the dependency tree (via the D-Bus transport / secret-service
 # keyring store at 5.15.0); pinned to the same major. Used by `theme.rs` to
 # track the XDG Settings portal `color-scheme` preference live. The `tokio`
@@ -180,6 +194,10 @@ path = "../voice/crates/client-voice"
 # in the graph transitively (client-common), pinned here as a dev-only dep.
 [dev-dependencies]
 async-trait = "0.1"
+# Only a test-local capturing subscriber needs this now (D10:
+# `spans_do_not_record_prompt_or_reply_text` in `src/window/mod.rs`);
+# production code builds its subscriber through `adelie-telemetry` (#152).
+tracing-subscriber = "0.3"
 
 [patch."https://github.com/adelie-ai/mcp-core"]
 mcp-core = { path = "../mcp-core" }

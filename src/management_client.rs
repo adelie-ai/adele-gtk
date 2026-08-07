@@ -26,6 +26,27 @@ fn commands(transport: &TransportClient) -> Result<&(dyn AssistantCommands + '_)
         .ok_or_else(|| anyhow!(NO_COMMAND_CHANNEL))
 }
 
+/// The `Debug`-formatted variant name only, discarding any payload.
+///
+/// `CommandResult` carries `Messages(MessagesView)`, `Conversation(..)`,
+/// `KnowledgeEntries(..)` and other content-bearing variants alongside the
+/// bare `Ack`/typed-list ones every wrapper here actually expects. A
+/// response-correlation mismatch — a class this project has already spent
+/// work on — would otherwise `Debug`-print full conversation content into an
+/// "unexpected response" error, which a caller may then log (`drive_connection`
+/// in `async_bridge.rs` does, at WARN, for `get_purposes`'s error), putting
+/// it above the DEBUG band epic D10 reserves for content. Works for both
+/// struct-like (`Pong { value }`) and tuple (`Status(Status)`) variants: the
+/// name is whatever precedes the first `(`, `{` or space.
+pub(crate) fn variant_name(value: &impl std::fmt::Debug) -> String {
+    let formatted = format!("{value:?}");
+    formatted
+        .split(|c: char| c == '(' || c == '{' || c.is_whitespace())
+        .next()
+        .unwrap_or(&formatted)
+        .to_string()
+}
+
 /// Coerce a `CommandResult` that should be a bare `Ack` into `()`, turning
 /// any other variant into a descriptive error. Shared by the mutating
 /// wrappers so the "unexpected response" arm is uniform and unit-testable
@@ -33,7 +54,10 @@ fn commands(transport: &TransportClient) -> Result<&(dyn AssistantCommands + '_)
 fn expect_ack(command: &str, result: api::CommandResult) -> Result<()> {
     match result {
         api::CommandResult::Ack => Ok(()),
-        other => Err(anyhow!("unexpected response for {command}: {other:?}")),
+        other => Err(anyhow!(
+            "unexpected response for {command}: {}",
+            variant_name(&other)
+        )),
     }
 }
 
@@ -44,7 +68,8 @@ pub async fn list_connections(transport: &TransportClient) -> Result<Vec<api::Co
     match result {
         api::CommandResult::Connections(list) => Ok(list),
         other => Err(anyhow!(
-            "unexpected response for ListConnections: {other:?}"
+            "unexpected response for ListConnections: {}",
+            variant_name(&other)
         )),
     }
 }
@@ -92,7 +117,8 @@ pub async fn list_available_models(
     match result {
         api::CommandResult::Models(m) => Ok(m),
         other => Err(anyhow!(
-            "unexpected response for ListAvailableModels: {other:?}"
+            "unexpected response for ListAvailableModels: {}",
+            variant_name(&other)
         )),
     }
 }
@@ -103,7 +129,10 @@ pub async fn get_purposes(transport: &TransportClient) -> Result<api::PurposesVi
         .await?;
     match result {
         api::CommandResult::Purposes(p) => Ok(*p),
-        other => Err(anyhow!("unexpected response for GetPurposes: {other:?}")),
+        other => Err(anyhow!(
+            "unexpected response for GetPurposes: {}",
+            variant_name(&other)
+        )),
     }
 }
 
@@ -165,7 +194,10 @@ pub async fn list_mcp_servers(transport: &TransportClient) -> Result<Vec<api::Mc
         .await?;
     match result {
         api::CommandResult::McpServers(list) => Ok(list),
-        other => Err(anyhow!("unexpected response for ListMcpServers: {other:?}")),
+        other => Err(anyhow!(
+            "unexpected response for ListMcpServers: {}",
+            variant_name(&other)
+        )),
     }
 }
 
@@ -180,7 +212,8 @@ pub async fn list_service_accounts(
     match result {
         api::CommandResult::ServiceAccounts(list) => Ok(list),
         other => Err(anyhow!(
-            "unexpected response for ListServiceAccounts: {other:?}"
+            "unexpected response for ListServiceAccounts: {}",
+            variant_name(&other)
         )),
     }
 }
@@ -255,6 +288,49 @@ mod tests {
     #[test]
     fn expect_ack_passes_through_ack() {
         assert!(expect_ack("SetPurpose", api::CommandResult::Ack).is_ok());
+    }
+
+    // --- variant_name: the "unexpected response" arms must never carry the
+    // mismatched CommandResult's payload (epic D10) ------------------------
+
+    #[test]
+    fn variant_name_strips_a_struct_variants_payload() {
+        let value = api::CommandResult::ConversationId {
+            id: "leak-marker".to_string(),
+        };
+        assert_eq!(variant_name(&value), "ConversationId");
+    }
+
+    #[test]
+    fn variant_name_strips_a_tuple_variants_payload() {
+        // Non-empty so a naive Debug-format would carry real content.
+        let value = api::CommandResult::Conversations(vec![]);
+        assert_eq!(variant_name(&value), "Conversations");
+    }
+
+    #[test]
+    fn variant_name_passes_through_a_unit_variant() {
+        assert_eq!(variant_name(&api::CommandResult::Ack), "Ack");
+    }
+
+    #[test]
+    fn expect_ack_error_names_the_variant_not_the_payload() {
+        let err = expect_ack(
+            "CreateConnection",
+            api::CommandResult::ConversationId {
+                id: "leak-marker".to_string(),
+            },
+        )
+        .expect_err("non-Ack response must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ConversationId"),
+            "should name the variant: {msg}"
+        );
+        assert!(
+            !msg.contains("leak-marker"),
+            "must not carry the payload: {msg}"
+        );
     }
 
     /// adele-gtk#49: the gate now keys on the command channel

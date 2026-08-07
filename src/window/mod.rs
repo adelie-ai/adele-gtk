@@ -1700,6 +1700,32 @@ fn submit_prompt_message(prompt: String) -> UiMessage {
 /// on (`CancelBackgroundTask { id }`, #138), which the reducer records on the
 /// stream via `PromptSent`. The correlation `request_id` is not needed here: the
 /// reducer claims it from the first streamed frame.
+///
+/// The span here is the "streaming" half of #152's "spans on the connect and
+/// streaming path", carrying `conversation_id` (epic D13: a conversation is
+/// not a trace, but an attribute every span in it carries so one query
+/// returns every turn). Everything else is skipped: `cmds` has no `Debug`
+/// impl for `#[instrument]` to format, and `prompt` is turn content, which
+/// epic D10 forbids on a span field (see
+/// `spans_do_not_record_prompt_or_reply_text` below).
+///
+/// This span, and the `gtk.send_prompt.rpc_duration` metric it wraps, cover
+/// the RPC round-trip (submit to ack) only — not the full reply stream. A
+/// true turn-root span (open at submit, close when the reply finishes
+/// streaming, per the ticket's "Where the root span goes") needs a
+/// correlation id threaded through `client_ui_common::UiMessage::StreamComplete`
+/// / `StreamError`, which today carry only the daemon's `request_id` with no
+/// `conversation_id` or idempotency key alongside it, and the reducer method
+/// that maps one to the other (`route_stream`) is private. A background
+/// (not-in-view) completion emits no effect at all, so this executor cannot
+/// observe it either way. Closing a span here at the ack would be closing it
+/// in the wrong place — exactly what the ticket warns against — so it is
+/// intentionally left to `desktop-assistant#1152`, which already owns
+/// threading a client-minted trace id through these messages.
+#[tracing::instrument(
+    name = "send_prompt",
+    skip(cmds, prompt, override_selection, system_refinement, idempotency_key)
+)]
 async fn send_prompt_with_key(
     cmds: &dyn AssistantCommands,
     conversation_id: &str,
@@ -1708,15 +1734,22 @@ async fn send_prompt_with_key(
     system_refinement: String,
     idempotency_key: Option<String>,
 ) -> anyhow::Result<String> {
-    cmds.send_prompt_idempotent_ack(
-        conversation_id,
-        prompt,
-        override_selection,
-        system_refinement,
-        idempotency_key,
-    )
-    .await
-    .map(|ack| ack.task_id)
+    let started = std::time::Instant::now();
+    let result = cmds
+        .send_prompt_idempotent_ack(
+            conversation_id,
+            prompt,
+            override_selection,
+            system_refinement,
+            idempotency_key,
+        )
+        .await;
+    adelie_telemetry::metrics::record_duration(
+        "gtk.send_prompt.rpc_duration",
+        started.elapsed(),
+        &[],
+    );
+    result.map(|ack| ack.task_id)
 }
 
 /// Translate a *visible* chip position into the full-queue index the reducer's
@@ -2822,5 +2855,91 @@ mod tests {
             }
             other => panic!("expected Command::SendMessage, got {other:?}"),
         }
+    }
+
+    // --- #152: the level contract (epic D10) applies to spans too --------------
+    // INFO carries ids, counts, durations — never content. A span field is just
+    // as visible to an operator as a log line, so `#[instrument]`'s default of
+    // recording every argument via `Debug` is a trap: it would put the prompt
+    // text on the `send_prompt_with_key` span unless the field is skipped.
+
+    /// A `tracing_subscriber::fmt` writer that copies every formatted line into
+    /// a shared buffer a test can inspect afterward.
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn spans_do_not_record_prompt_or_reply_text() {
+        use std::sync::{Arc, Mutex};
+
+        // Every skipped field gets its own marker. A generic value (`None`,
+        // `String::new()`) would Debug-print as "None" or "\"\"" either way,
+        // so unskipping `override_selection` or `idempotency_key` would
+        // leave this test green — a distinct, greppable marker per field is
+        // what makes each one individually load-bearing.
+        let secret_prompt = "the-quick-brown-fox-must-never-reach-a-span-field";
+        let secret_override = "override-marker-must-never-reach-a-span-field";
+        let secret_refinement = "refinement-marker-must-never-reach-a-span-field";
+        let secret_idempotency_key = "idempotency-marker-must-never-reach-a-span-field";
+
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let for_writer = captured.clone();
+        // `FmtSpan::NEW` prints a span's own fields when it opens, which is
+        // exactly the content `#[instrument]` would have captured — no log
+        // line inside the function is needed to observe the leak.
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || SharedBuf(for_writer.clone()))
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW)
+            .with_ansi(false)
+            .finish();
+
+        let cmds = RecordingCommands {
+            last: std::sync::Mutex::new(None),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Runtime::new().expect("build a tokio runtime for the test");
+            rt.block_on(async {
+                let _ = send_prompt_with_key(
+                    &cmds,
+                    "conv-1",
+                    secret_prompt,
+                    Some(api::SendPromptOverride {
+                        connection_id: secret_override.to_string(),
+                        model_id: "model".to_string(),
+                        effort: None,
+                    }),
+                    secret_refinement.to_string(),
+                    Some(secret_idempotency_key.to_string()),
+                )
+                .await;
+            });
+        });
+
+        let text = String::from_utf8(captured.lock().unwrap().clone()).expect("utf8 log output");
+        for marker in [
+            secret_prompt,
+            secret_override,
+            secret_refinement,
+            secret_idempotency_key,
+        ] {
+            assert!(
+                !text.contains(marker),
+                "a skipped field reached a span field (epic D10): {marker:?} in {text:?}"
+            );
+        }
+        assert!(
+            text.contains("conv-1"),
+            "conversation_id is the one field the span SHOULD carry (epic D13): {text:?}"
+        );
     }
 }
