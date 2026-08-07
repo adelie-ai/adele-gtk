@@ -78,6 +78,63 @@ the last connection.
 cargo test
 ```
 
+## Logging
+
+Telemetry (traces, metrics and logs) goes through the shared
+[`adelie-telemetry`](https://github.com/adelie-ai/adelie-telemetry) crate.
+
+**Console.** Always stderr, never stdout — the built-in MCP servers this
+client hosts in process use stdout to frame JSON-RPC, and a stray log line
+there would corrupt that stream. Silent unless `RUST_LOG` is set; a
+desktop app has no console to read on a normal launch, so nothing is printed
+by default:
+
+```sh
+RUST_LOG=info adele-gtk       # ids, counts, durations, model names — never content
+RUST_LOG=debug adele-gtk      # also prompts, assembled context, tool arguments
+```
+
+**The `otel` feature.** Off by default; a default build resolves no
+`opentelemetry` crate at all. Turn export on with:
+
+```sh
+cargo build --features otel
+```
+
+With the feature on, traces, metrics and log records export additionally —
+console logging keeps working the same way. Configure the destination with
+the standard `OTEL_*` environment variables; there are no `adele-gtk`-specific
+flags:
+
+| Variable | Effect |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector endpoint for all three signals. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Endpoint for traces. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Endpoint for metrics. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Endpoint for log records. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc`, `http/protobuf` (default) or `http/json`, for all three. |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_PROTOCOL` | Protocol for one signal. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Headers for all three, as `key=value,key=value`. |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_HEADERS` | Headers for one signal. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | Export timeout in milliseconds, for all three. |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_TIMEOUT` | Timeout for one signal. Overrides the generic one. |
+| `OTEL_EXPORTER_OTLP_COMPRESSION` | `gzip` or `zstd`, for all three. Per-signal forms exist too. |
+| `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes, as `key=value,key=value`. |
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+  adele-gtk
+```
+
+The metrics summary that a console-only build would otherwise print
+periodically is off here — a GUI has nowhere to show it, and the daemon is
+where the fleet's aggregate numbers live.
+
+See `adelie-telemetry`'s own README for the full variable reference, the two
+transports' certificate-trust differences, and what `--features otel` costs
+in build time and binary size.
+
 ## Architecture
 
 Shared protocol types and transport clients live in the

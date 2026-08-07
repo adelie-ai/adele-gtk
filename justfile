@@ -28,12 +28,22 @@ uninstall-desktop:
     update-desktop-database ~/.local/share/applications 2>/dev/null || true
 
 # --- Local verification ("local CI") -----------------------------------------
-# We run these locally instead of GitHub Actions. `install-hooks` wires `check`
+# We run these locally instead of GitHub Actions. `install-hooks` wires `check-all`
 # into a git pre-push hook so it runs automatically before every push. fmt/clippy
 # are scoped to `-p adele-gtk` because the workspace path-deps desktop-assistant.
 
-# Full local gate: formatting, lints, build, tests (on the pinned toolchain)
-check: fmt-check lint build test
+# Full local gate, default features: formatting, lints, build, tests, and the
+# no-opentelemetry check (epic mcp-core#38 AC2) — on the pinned toolchain.
+check: fmt-check lint build test no-opentelemetry-check
+
+# The same gate with the `otel` feature on (epic mcp-core#38, ticket #152):
+# proves the OTLP-export build and its tests, not a live export. Verify a
+# live export against a real collector by hand — see the README's Logging
+# section — when the telemetry wiring itself changes.
+check-otel: fmt-check lint-otel build-otel test-otel
+
+# Both configurations. This is what the pre-push hook runs.
+check-all: check check-otel
 
 # Verify formatting without modifying files (scoped — don't touch the path-dep)
 fmt-check:
@@ -47,25 +57,54 @@ fmt:
 lint:
     cargo clippy -p adele-gtk --all-targets -- -D warnings
 
+# Clippy with the `otel` feature on; warnings are errors
+lint-otel:
+    cargo clippy -p adele-gtk --all-targets --features otel -- -D warnings
+
 # Build
 build:
     cargo build
+
+# Build with the `otel` feature on
+build-otel:
+    cargo build --features otel
 
 # Run the test suite (excludes #[ignore] integration tests)
 test:
     cargo test
 
+# Run the test suite with the `otel` feature on
+test-otel:
+    cargo test --features otel
+
 # Real-Secret-Service integration tests (needs a live session bus; mutates + cleans keyring)
 test-integration:
     cargo test -- --ignored
+
+# AC2-equivalent for this repo (epic mcp-core#38, ticket #152): a
+# default-feature build must resolve no opentelemetry crate at all.
+# `cargo tree --prefix none` lists every dependency name this feature set
+# actually resolves, one per line with no tree-drawing prefix, so a match
+# here means a default build pulled in the OTLP stack it should not have.
+no-opentelemetry-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{justfile_directory()}}"
+    hits="$(cargo tree --prefix none | grep -i '^opentelemetry' || true)"
+    if [ -n "$hits" ]; then
+        echo "default build resolves opentelemetry crate(s):" >&2
+        echo "$hits" >&2
+        exit 1
+    fi
+    echo "default build resolves no opentelemetry crate — OK"
 
 # Rebase onto latest origin/main then run the gate (catches clean-rebase-but-broken-build)
 premerge:
     git fetch origin
     git rebase origin/main
-    just check
+    just check-all
 
-# Install git hooks (pre-push runs `just check`). Local config; run once per clone.
+# Install git hooks (pre-push runs `just check-all`). Local config; run once per clone.
 install-hooks:
     git config core.hooksPath .githooks
     @echo "pre-push hook active — bypass once with: git push --no-verify"
