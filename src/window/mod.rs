@@ -1701,10 +1701,31 @@ fn submit_prompt_message(prompt: String) -> UiMessage {
 /// stream via `PromptSent`. The correlation `request_id` is not needed here: the
 /// reducer claims it from the first streamed frame.
 ///
-/// The span on this function is the "streaming" half of #152's "spans on the
-/// connect and streaming path". `cmds` is skipped because `&dyn
-/// AssistantCommands` has no `Debug` impl for `#[instrument]` to format.
-#[tracing::instrument(skip(cmds))]
+/// The span here is the "streaming" half of #152's "spans on the connect and
+/// streaming path", carrying `conversation_id` (epic D13: a conversation is
+/// not a trace, but an attribute every span in it carries so one query
+/// returns every turn). Everything else is skipped: `cmds` has no `Debug`
+/// impl for `#[instrument]` to format, and `prompt` is turn content, which
+/// epic D10 forbids on a span field (see
+/// `spans_do_not_record_prompt_or_reply_text` below).
+///
+/// This span, and the `gtk.send_prompt.rpc_duration` metric it wraps, cover
+/// the RPC round-trip (submit to ack) only — not the full reply stream. A
+/// true turn-root span (open at submit, close when the reply finishes
+/// streaming, per the ticket's "Where the root span goes") needs a
+/// correlation id threaded through `client_ui_common::UiMessage::StreamComplete`
+/// / `StreamError`, which today carry only the daemon's `request_id` with no
+/// `conversation_id` or idempotency key alongside it, and the reducer method
+/// that maps one to the other (`route_stream`) is private. A background
+/// (not-in-view) completion emits no effect at all, so this executor cannot
+/// observe it either way. Closing a span here at the ack would be closing it
+/// in the wrong place — exactly what the ticket warns against — so it is
+/// intentionally left to `desktop-assistant#1152`, which already owns
+/// threading a client-minted trace id through these messages.
+#[tracing::instrument(
+    name = "send_prompt",
+    skip(cmds, prompt, override_selection, system_refinement, idempotency_key)
+)]
 async fn send_prompt_with_key(
     cmds: &dyn AssistantCommands,
     conversation_id: &str,
@@ -1713,15 +1734,22 @@ async fn send_prompt_with_key(
     system_refinement: String,
     idempotency_key: Option<String>,
 ) -> anyhow::Result<String> {
-    cmds.send_prompt_idempotent_ack(
-        conversation_id,
-        prompt,
-        override_selection,
-        system_refinement,
-        idempotency_key,
-    )
-    .await
-    .map(|ack| ack.task_id)
+    let started = std::time::Instant::now();
+    let result = cmds
+        .send_prompt_idempotent_ack(
+            conversation_id,
+            prompt,
+            override_selection,
+            system_refinement,
+            idempotency_key,
+        )
+        .await;
+    adelie_telemetry::metrics::record_duration(
+        "gtk.send_prompt.rpc_duration",
+        started.elapsed(),
+        &[],
+    );
+    result.map(|ack| ack.task_id)
 }
 
 /// Translate a *visible* chip position into the full-queue index the reducer's
@@ -2872,8 +2900,9 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let rt = tokio::runtime::Runtime::new().expect("build a tokio runtime for the test");
             rt.block_on(async {
-                let _ = send_prompt_with_key(&cmds, "conv-1", secret_prompt, None, String::new(), None)
-                    .await;
+                let _ =
+                    send_prompt_with_key(&cmds, "conv-1", secret_prompt, None, String::new(), None)
+                        .await;
             });
         });
 

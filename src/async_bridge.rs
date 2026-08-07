@@ -12,6 +12,7 @@ use desktop_assistant_client_common::{AssistantClient, ConnectionConfig, Connect
 use gtk4::glib;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
+use tracing::Instrument;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
@@ -27,7 +28,13 @@ pub use client_ui_common::{
     UiMessage, interactive_default_from_purposes, signal_to_ui_message, voice_mode_client_tools,
 };
 
-fn runtime() -> &'static Runtime {
+/// The app's single shared Tokio runtime, built on first use.
+///
+/// `pub(crate)` so `main.rs` can `.enter()` it before installing telemetry
+/// (#152): the gRPC OTLP transport needs a runtime at that point, and this
+/// is the same `'static` runtime the rest of the app spawns onto, so calling
+/// this early does not build a second one.
+pub(crate) fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -248,10 +255,26 @@ async fn connection_loop(
         // Every await in the cycle (connect, the connected session, the
         // backoff sleep) races the shutdown signal, so a closing window can
         // interrupt the manager wherever it is.
+        //
+        // The "connect" span (#152's "spans on the connect and streaming
+        // path") covers one attempt; every iteration past the first is a
+        // reconnect after a drop, which is what the loop itself already
+        // distinguishes with `backoff_secs`.
         let connect_result = tokio::select! {
-            result = Connector::connect(&config) => result,
+            result = Connector::connect(&config).instrument(tracing::info_span!("connect")) => result,
             _ = shutdown_requested(&mut shutdown) => return,
         };
+        adelie_telemetry::metrics::increment(
+            "gtk.connection.attempts",
+            &[adelie_telemetry::metrics::Label::new(
+                "outcome",
+                if connect_result.is_ok() {
+                    "ok"
+                } else {
+                    "error"
+                },
+            )],
+        );
 
         match connect_result {
             Ok(connector) => {

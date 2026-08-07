@@ -83,10 +83,6 @@ gtk4 = { version = "0.11", features = ["v4_22"], package = "gtk4" }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
-# TODO(#152 red->green): still used by src/main.rs and the RED-phase
-# src/bin/telemetry_probe.rs while they reproduce today's bug; moves to
-# [dev-dependencies] once both switch to `adelie-telemetry`.
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustls = { version = "0.23.37", features = ["ring"] }
 # Shared telemetry setup for every Adelie Rust binary (epic mcp-core#38, ticket
 # #152): subscriber construction (console on stderr, quiet unless RUST_LOG is
@@ -95,6 +91,18 @@ rustls = { version = "0.23.37", features = ["ring"] }
 # landed in Phase 0"). No `default-features = false`: the default `otel-tls`
 # feature is inert with `otel` off (see the `otel` feature comment above).
 adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "59c152db11f22281ea2ae8f1c67e00389dbf74f8" }
+# Cargo.lock pins reqwest to 0.13.1 for the whole graph (not just the `otel`
+# feature). With `otel` on, adelie-telemetry's default `otel-tls` feature
+# reaches opentelemetry-http 0.32.0's `reqwest-rustls-webpki-roots`, which
+# asks for a `reqwest/webpki-roots` feature; reqwest removed it after 0.13.1
+# (confirmed empirically: present in 0.13.1, absent in 0.13.4, no version in
+# between kept it). The unrelated builtin-extras MCP crates (geocode-mcp,
+# weather-forecast-mcp, internet-radio-mcp, openstreetmap-mcp) pull reqwest
+# with a loose "^0.13", so without this pin the resolver is free to unify on
+# the newer, broken 0.13.4. Filed upstream against `adelie-ai/mcp-core#44`;
+# drop this note once a patched opentelemetry-http (or adelie-telemetry
+# working around it) lands and `cargo update -p reqwest` stops breaking the
+# `otel` build.
 # Already in the dependency tree (via the D-Bus transport / secret-service
 # keyring store at 5.15.0); pinned to the same major. Used by `theme.rs` to
 # track the XDG Settings portal `color-scheme` preference live. The `tokio`
@@ -198,6 +206,10 @@ path = "../voice/crates/client-voice"
 # in the graph transitively (client-common), pinned here as a dev-only dep.
 [dev-dependencies]
 async-trait = "0.1"
+# Only a test-local capturing subscriber needs this now (D10:
+# `spans_do_not_record_prompt_or_reply_text` in `src/window/mod.rs`);
+# production code builds its subscriber through `adelie-telemetry` (#152).
+tracing-subscriber = "0.3"
 
 [patch."https://github.com/adelie-ai/mcp-core"]
 mcp-core = { path = "../mcp-core" }
