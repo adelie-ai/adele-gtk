@@ -90,19 +90,7 @@ rustls = { version = "0.23.37", features = ["ring"] }
 # matching the fleet-wide pin recorded on the epic (mcp-core#44, "What actually
 # landed in Phase 0"). No `default-features = false`: the default `otel-tls`
 # feature is inert with `otel` off (see the `otel` feature comment above).
-adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "59c152db11f22281ea2ae8f1c67e00389dbf74f8" }
-# Cargo.lock pins reqwest to 0.13.1 for the whole graph (not just the `otel`
-# feature). With `otel` on, adelie-telemetry's default `otel-tls` feature
-# reaches opentelemetry-http 0.32.0's `reqwest-rustls-webpki-roots`, which
-# asks for a `reqwest/webpki-roots` feature; reqwest removed it after 0.13.1
-# (confirmed empirically: present in 0.13.1, absent in 0.13.4, no version in
-# between kept it). The unrelated builtin-extras MCP crates (geocode-mcp,
-# weather-forecast-mcp, internet-radio-mcp, openstreetmap-mcp) pull reqwest
-# with a loose "^0.13", so without this pin the resolver is free to unify on
-# the newer, broken 0.13.4. Filed upstream against `adelie-ai/mcp-core#44`;
-# drop this note once a patched opentelemetry-http (or adelie-telemetry
-# working around it) lands and `cargo update -p reqwest` stops breaking the
-# `otel` build.
+adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "1b8166ab483174e76aa23079858b8a31aaa52ae1" }
 # Already in the dependency tree (via the D-Bus transport / secret-service
 # keyring store at 5.15.0); pinned to the same major. Used by `theme.rs` to
 # track the XDG Settings portal `color-scheme` preference live. The `tokio`
