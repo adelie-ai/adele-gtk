@@ -1756,11 +1756,12 @@ async fn send_prompt_with_key(
 /// Record a turn that ended, from the reducer's `Effect::TurnFinished`
 /// (client-ui-common#51).
 ///
-/// The reducer emits this on all four paths a turn can end - the reply
-/// completes, the turn errors, the connection drops, or the client resets its
-/// streaming state - and for a conversation that is not the one on screen as
-/// well as for the one that is. The backgrounded case is the one this client
-/// could not see at all before, because that path returned no effects.
+/// The reducer emits this wherever it drops, clears or replaces a stream: the
+/// reply completes, the turn errors, the connection drops, the client resets
+/// its streaming state, the conversation is deleted, or a later ack replaces a
+/// turn still in flight. It emits for a conversation that is not the one on
+/// screen as well as for the one that is. The backgrounded case is the one this
+/// client could not see at all before, because that path returned no effects.
 ///
 /// This is the line an operator greps to find one turn, so it is INFO and it
 /// carries ids only: the conversation, the daemon's turn id, and the key this
