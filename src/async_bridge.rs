@@ -471,7 +471,15 @@ async fn drive_connection(
                 }
             }
             Ok(other) => {
-                tracing::warn!("unexpected response for ListBackgroundTasks: {other:?}");
+                // Log the variant name only, never the value (epic D10):
+                // CommandResult includes content-bearing variants like
+                // Messages/Conversation/KnowledgeEntries, and with `--features
+                // otel` this line is exported and stored, not just printed to
+                // one desktop's stdout.
+                tracing::warn!(
+                    "unexpected response for ListBackgroundTasks: {}",
+                    crate::management_client::variant_name(&other)
+                );
             }
             Err(e) => {
                 tracing::warn!("ListBackgroundTasks failed: {e}");

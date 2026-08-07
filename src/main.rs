@@ -159,12 +159,23 @@ fn main() -> Result<()> {
     // entering it for just this call makes both transports work, and the
     // runtime is the same `'static` one the rest of the app spawns onto, so
     // nothing is built twice.
+    // A GUI has no console on a normal desktop launch, so a failure here has
+    // nothing to print to and nothing may crash the app over it (a per-signal
+    // export failure already degrades gracefully and never reaches this
+    // point — see adelie-telemetry's own `Error` docs — but the signature
+    // still promises `Result`, and this crate had exactly this failure mode,
+    // outright, two revisions before the one pinned below). `eprintln!`
+    // rather than `tracing::error!`: no subscriber would be installed to
+    // carry the latter anywhere.
     let _telemetry_guard = {
         let _enter = async_bridge::runtime().enter();
-        adelie_telemetry::init(telemetry::config()).expect(
-            "telemetry init failed outright — this should not happen; a per-signal export \
-             failure degrades gracefully instead (see adelie-telemetry's Error type)",
-        )
+        match adelie_telemetry::init(telemetry::config()) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                eprintln!("telemetry init failed; continuing without it: {e}");
+                None
+            }
+        }
     };
     // Bound here rather than passed down: dropping it flushes traces,
     // metrics and logs (D6), and it must outlive `app.run_with_args` below,

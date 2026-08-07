@@ -2881,7 +2881,16 @@ mod tests {
     fn spans_do_not_record_prompt_or_reply_text() {
         use std::sync::{Arc, Mutex};
 
+        // Every skipped field gets its own marker. A generic value (`None`,
+        // `String::new()`) would Debug-print as "None" or "\"\"" either way,
+        // so unskipping `override_selection` or `idempotency_key` would
+        // leave this test green — a distinct, greppable marker per field is
+        // what makes each one individually load-bearing.
         let secret_prompt = "the-quick-brown-fox-must-never-reach-a-span-field";
+        let secret_override = "override-marker-must-never-reach-a-span-field";
+        let secret_refinement = "refinement-marker-must-never-reach-a-span-field";
+        let secret_idempotency_key = "idempotency-marker-must-never-reach-a-span-field";
+
         let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
         let for_writer = captured.clone();
         // `FmtSpan::NEW` prints a span's own fields when it opens, which is
@@ -2900,16 +2909,37 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let rt = tokio::runtime::Runtime::new().expect("build a tokio runtime for the test");
             rt.block_on(async {
-                let _ =
-                    send_prompt_with_key(&cmds, "conv-1", secret_prompt, None, String::new(), None)
-                        .await;
+                let _ = send_prompt_with_key(
+                    &cmds,
+                    "conv-1",
+                    secret_prompt,
+                    Some(api::SendPromptOverride {
+                        connection_id: secret_override.to_string(),
+                        model_id: "model".to_string(),
+                        effort: None,
+                    }),
+                    secret_refinement.to_string(),
+                    Some(secret_idempotency_key.to_string()),
+                )
+                .await;
             });
         });
 
         let text = String::from_utf8(captured.lock().unwrap().clone()).expect("utf8 log output");
+        for marker in [
+            secret_prompt,
+            secret_override,
+            secret_refinement,
+            secret_idempotency_key,
+        ] {
+            assert!(
+                !text.contains(marker),
+                "a skipped field reached a span field (epic D10): {marker:?} in {text:?}"
+            );
+        }
         assert!(
-            !text.contains(secret_prompt),
-            "the prompt text must never reach a span field (epic D10); captured: {text:?}"
+            text.contains("conv-1"),
+            "conversation_id is the one field the span SHOULD carry (epic D13): {text:?}"
         );
     }
 }

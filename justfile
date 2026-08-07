@@ -90,7 +90,15 @@ no-opentelemetry-check:
     #!/usr/bin/env bash
     set -euo pipefail
     cd "{{justfile_directory()}}"
-    hits="$(cargo tree --prefix none | grep -i '^opentelemetry' || true)"
+    # `cargo tree`'s own exit status is checked BEFORE grep runs, on its own
+    # line, under `set -e` — a manifest error, a lockfile problem, or a git
+    # dependency that fails to resolve must fail this check, not report OK
+    # with an empty (because cargo tree produced nothing) hit list.
+    tree_output="$(cargo tree --prefix none)"
+    # Only this second command may legitimately "fail": grep exits 1 when no
+    # line matches, which is the expected, passing case, so `|| true` here
+    # covers exactly that and nothing upstream of it.
+    hits="$(printf '%s\n' "$tree_output" | grep -i '^opentelemetry' || true)"
     if [ -n "$hits" ]; then
         echo "default build resolves opentelemetry crate(s):" >&2
         echo "$hits" >&2
