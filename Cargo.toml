@@ -90,7 +90,7 @@ rustls = { version = "0.23.37", features = ["ring"] }
 # matching the fleet-wide pin recorded on the epic (mcp-core#44, "What actually
 # landed in Phase 0"). No `default-features = false`: the default `otel-tls`
 # feature is inert with `otel` off (see the `otel` feature comment above).
-adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "1b8166ab483174e76aa23079858b8a31aaa52ae1" }
+adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "5c762eca14e43295dd27c5d5adaa658924f5f133" }
 # Already in the dependency tree (via the D-Bus transport / secret-service
 # keyring store at 5.15.0); pinned to the same major. Used by `theme.rs` to
 # track the XDG Settings portal `color-scheme` preference live. The `tokio`
