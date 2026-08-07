@@ -1700,6 +1700,11 @@ fn submit_prompt_message(prompt: String) -> UiMessage {
 /// on (`CancelBackgroundTask { id }`, #138), which the reducer records on the
 /// stream via `PromptSent`. The correlation `request_id` is not needed here: the
 /// reducer claims it from the first streamed frame.
+///
+/// The span on this function is the "streaming" half of #152's "spans on the
+/// connect and streaming path". `cmds` is skipped because `&dyn
+/// AssistantCommands` has no `Debug` impl for `#[instrument]` to format.
+#[tracing::instrument(skip(cmds))]
 async fn send_prompt_with_key(
     cmds: &dyn AssistantCommands,
     conversation_id: &str,
@@ -2822,5 +2827,60 @@ mod tests {
             }
             other => panic!("expected Command::SendMessage, got {other:?}"),
         }
+    }
+
+    // --- #152: the level contract (epic D10) applies to spans too --------------
+    // INFO carries ids, counts, durations — never content. A span field is just
+    // as visible to an operator as a log line, so `#[instrument]`'s default of
+    // recording every argument via `Debug` is a trap: it would put the prompt
+    // text on the `send_prompt_with_key` span unless the field is skipped.
+
+    /// A `tracing_subscriber::fmt` writer that copies every formatted line into
+    /// a shared buffer a test can inspect afterward.
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn spans_do_not_record_prompt_or_reply_text() {
+        use std::sync::{Arc, Mutex};
+
+        let secret_prompt = "the-quick-brown-fox-must-never-reach-a-span-field";
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let for_writer = captured.clone();
+        // `FmtSpan::NEW` prints a span's own fields when it opens, which is
+        // exactly the content `#[instrument]` would have captured — no log
+        // line inside the function is needed to observe the leak.
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || SharedBuf(for_writer.clone()))
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW)
+            .with_ansi(false)
+            .finish();
+
+        let cmds = RecordingCommands {
+            last: std::sync::Mutex::new(None),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Runtime::new().expect("build a tokio runtime for the test");
+            rt.block_on(async {
+                let _ = send_prompt_with_key(&cmds, "conv-1", secret_prompt, None, String::new(), None)
+                    .await;
+            });
+        });
+
+        let text = String::from_utf8(captured.lock().unwrap().clone()).expect("utf8 log output");
+        assert!(
+            !text.contains(secret_prompt),
+            "the prompt text must never reach a span field (epic D10); captured: {text:?}"
+        );
     }
 }
