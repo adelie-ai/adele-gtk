@@ -27,7 +27,7 @@ use crate::widgets::tasks_panel::TasksPanel;
 
 mod voice;
 
-use client_ui_common::{BuiltinServerDto, Effect, WindowState};
+use client_ui_common::{BuiltinServerDto, Effect, TurnOutcome, WindowState};
 use voice::{speak_text, wire_embedded_mic, wire_voice_controls};
 
 /// The window's widget handles, bundled so the bridge's UI-message executor
@@ -1710,18 +1710,19 @@ fn submit_prompt_message(prompt: String) -> UiMessage {
 /// `spans_do_not_record_prompt_or_reply_text` below).
 ///
 /// This span, and the `gtk.send_prompt.rpc_duration` metric it wraps, cover
-/// the RPC round-trip (submit to ack) only — not the full reply stream. A
-/// true turn-root span (open at submit, close when the reply finishes
-/// streaming, per the ticket's "Where the root span goes") needs a
-/// correlation id threaded through `client_ui_common::UiMessage::StreamComplete`
-/// / `StreamError`, which today carry only the daemon's `request_id` with no
-/// `conversation_id` or idempotency key alongside it, and the reducer method
-/// that maps one to the other (`route_stream`) is private. A background
-/// (not-in-view) completion emits no effect at all, so this executor cannot
-/// observe it either way. Closing a span here at the ack would be closing it
-/// in the wrong place — exactly what the ticket warns against — so it is
-/// intentionally left to `desktop-assistant#1152`, which already owns
-/// threading a client-minted trace id through these messages.
+/// the RPC round-trip (submit to ack) only — not the full reply stream. Do not
+/// close a turn-root span here: the ack says the daemon accepted the send, not
+/// that the person got their reply, so the duration would not be what they
+/// waited.
+///
+/// The close point now exists. `client_ui_common::Effect::TurnFinished`
+/// (client-ui-common#51) reports every turn that ends, backgrounded ones
+/// included, and carries the `conversation_id` and the idempotency key this
+/// function was handed — so a span opened at submit can be found again and
+/// closed in the right place. `record_turn_finished` consumes it today and logs
+/// the correlation ids. Building the span itself belongs to
+/// `desktop-assistant#1152`, which owns minting a client trace id and threading
+/// it to the daemon; this function is where that id would be attached.
 #[tracing::instrument(
     name = "send_prompt",
     skip(cmds, prompt, override_selection, system_refinement, idempotency_key)
@@ -1750,6 +1751,41 @@ async fn send_prompt_with_key(
         &[],
     );
     result.map(|ack| ack.task_id)
+}
+
+/// Record a turn that ended, from the reducer's `Effect::TurnFinished`
+/// (client-ui-common#51).
+///
+/// The reducer emits this wherever it drops, clears or replaces a stream: the
+/// reply completes, the turn errors, the connection drops, the client resets
+/// its streaming state, the conversation is deleted, or a later ack replaces a
+/// turn still in flight. It emits for a conversation that is not the one on
+/// screen as well as for the one that is. The backgrounded case is the one this
+/// client could not see at all before, because that path returned no effects.
+///
+/// This is the line an operator greps to find one turn, so it is INFO and it
+/// carries ids only: the conversation, the daemon's turn id, and the key this
+/// client minted at submit. `failed` is a flag rather than the error text.
+/// Epic D10 keeps content off an INFO line, and `TurnOutcome::Failed` is
+/// documented upstream as untrusted for telemetry - neither the daemon nor a
+/// provider promises to keep the user's own words out of a refusal message.
+///
+/// Why a function rather than a few lines in the executor arm: the executor
+/// needs live widgets, so nothing inside it is reachable from a test. This is,
+/// and the tests below hold it to the level contract.
+fn record_turn_finished(
+    conversation_id: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+    outcome: &TurnOutcome,
+) {
+    tracing::info!(
+        conversation_id,
+        request_id,
+        idempotency_key,
+        failed = matches!(outcome, TurnOutcome::Failed(_)),
+        "turn finished"
+    );
 }
 
 /// Translate a *visible* chip position into the full-queue index the reducer's
@@ -2238,6 +2274,21 @@ fn handle_ui_message(
                     tracing::warn!("no connector to submit client-tool result for task {task_id}");
                 }
             }
+            Effect::TurnFinished {
+                conversation_id,
+                request_id,
+                idempotency_key,
+                outcome,
+            } => {
+                // A turn ended. Nothing to draw: the reducer has already
+                // finalized the reply, or cleared the stream, before it reports.
+                record_turn_finished(
+                    &conversation_id,
+                    &request_id,
+                    idempotency_key.as_deref(),
+                    &outcome,
+                );
+            }
             Effect::SendPrompt {
                 conversation_id,
                 prompt,
@@ -2261,6 +2312,10 @@ fn handle_ui_message(
                     let override_selection = model_picker.current_override();
                     let refinement = system_refinement.unwrap_or_default();
                     let ui_tx = ui_tx.clone();
+                    // Kept for the ack: the send call consumes the key, and the
+                    // reducer needs it back to tie the turn to this send
+                    // (client-ui-common#51).
+                    let echoed_key = idempotency_key.clone();
                     crate::async_bridge::spawn_on_runtime(async move {
                         let client = connector.client();
                         // Socket transports (UDS/WS) carry the model override, the
@@ -2311,6 +2366,11 @@ fn handle_ui_message(
                                 let _ = ui_tx.send(UiMessage::PromptSent {
                                     task_id,
                                     conversation_id,
+                                    // Echo the key this send carried, so the
+                                    // reducer ties the turn to the send that
+                                    // started it rather than guessing which of
+                                    // several in flight it answers.
+                                    idempotency_key: echoed_key,
                                 });
                             }
                             Err(e) => {
@@ -2509,10 +2569,10 @@ pub fn install_app_icon() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssistantCommands, CHIP_PREVIEW_MAX, ChipButton, RecallDecision, RecallKey, UiMessage, api,
-        chip_click_message, chip_edit_index, chip_preview, compose_status, is_user_initiated_send,
-        recall_decision, send_prompt_with_key, submit_prompt_message, tool_gate_toggle_label,
-        tool_gate_toggle_tooltip,
+        AssistantCommands, CHIP_PREVIEW_MAX, ChipButton, RecallDecision, RecallKey, TurnOutcome,
+        UiMessage, api, chip_click_message, chip_edit_index, chip_preview, compose_status,
+        is_user_initiated_send, recall_decision, record_turn_finished, send_prompt_with_key,
+        submit_prompt_message, tool_gate_toggle_label, tool_gate_toggle_tooltip,
     };
 
     // --- Per-conversation tool-gate override toggle (daemon #1007) -------------
@@ -2940,6 +3000,95 @@ mod tests {
         assert!(
             text.contains("conv-1"),
             "conversation_id is the one field the span SHOULD carry (epic D13): {text:?}"
+        );
+    }
+
+    // --- #161: the turn report from the shared reducer -------------------------
+    // `Effect::TurnFinished` (client-ui-common#51) is how this client learns a
+    // turn ended, including one whose conversation is not in view. It is the
+    // close point a turn-root span needs, and until that span exists it is what
+    // puts a turn's correlation ids in the log.
+
+    /// Run `emit` under a capturing subscriber and return everything logged.
+    fn captured_log(emit: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let for_writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || SharedBuf(for_writer.clone()))
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        let bytes = captured.lock().unwrap().clone();
+        String::from_utf8(bytes).expect("utf8 log output")
+    }
+
+    #[test]
+    fn a_finished_turn_is_logged_with_its_correlation_ids() {
+        let text = captured_log(|| {
+            record_turn_finished(
+                "conv-1",
+                "req-7",
+                Some("submit-key-9"),
+                &TurnOutcome::Completed,
+            );
+        });
+        for id in ["conv-1", "req-7", "submit-key-9"] {
+            assert!(
+                text.contains(id),
+                "the turn report must carry {id:?} so an operator can find the turn: {text:?}"
+            );
+        }
+    }
+
+    /// A turn that ended must be visible at INFO. The whole point of the line is
+    /// that an operator running a default build finds the turn by one id, so a
+    /// DEBUG line would never fire where it is needed.
+    #[test]
+    fn a_finished_turn_is_reported_at_info() {
+        let text = captured_log(|| {
+            record_turn_finished("conv-1", "req-7", None, &TurnOutcome::Completed);
+        });
+        assert!(
+            text.contains("INFO"),
+            "the turn report must be at INFO, not below it: {text:?}"
+        );
+    }
+
+    /// Epic D10: the failure text is daemon-supplied and is documented upstream
+    /// as untrusted for telemetry, so only the fact of failure reaches the line.
+    #[test]
+    fn a_failed_turns_error_text_never_reaches_the_log() {
+        let secret = "moderation-quoted-the-users-prompt-must-never-be-logged";
+        let text = captured_log(|| {
+            record_turn_finished(
+                "conv-1",
+                "req-7",
+                None,
+                &TurnOutcome::Failed(secret.to_string()),
+            );
+        });
+        assert!(
+            !text.contains(secret),
+            "the failure text must not reach an INFO line (epic D10): {text:?}"
+        );
+        assert!(
+            text.contains("failed=true"),
+            "the fact of failure must still be recorded: {text:?}"
+        );
+    }
+
+    /// A turn nobody here sent (a voice turn, or another client) carries no key.
+    /// The line must still name the turn rather than inventing one.
+    #[test]
+    fn a_keyless_finished_turn_still_reports_its_ids() {
+        let text = captured_log(|| {
+            record_turn_finished("conv-1", "req-7", None, &TurnOutcome::Completed);
+        });
+        assert!(
+            text.contains("conv-1") && text.contains("req-7"),
+            "a keyless turn still names its conversation and request: {text:?}"
         );
     }
 }
