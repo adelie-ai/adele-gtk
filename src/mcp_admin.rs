@@ -706,4 +706,175 @@ enabled = ["files"]
         );
         assert_eq!(builtins[0].tool_count, 5, "tool count is preserved");
     }
+
+    // --- the locked config transactions (#173) --------------------------------
+
+    /// A throwaway directory plus the config path inside it. The directory is
+    /// returned as well, because dropping it deletes the tree.
+    fn temp_config() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("client-mcp.toml");
+        (dir, path)
+    }
+
+    /// A `client-mcp.toml` that `from_toml` cannot parse. Standing in for the
+    /// real hazard: a machine-wide file a person hand-edited into a broken
+    /// state, holding definitions every surface on the box depends on.
+    const DAMAGED: &str = "this is : not valid toml [[[\n";
+
+    /// The one server definition the write helpers add, as the dialog's JSON.
+    const FILES_JSON: &str = r#"{"name":"files","enabled":true,"command":"fileio-mcp"}"#;
+
+    /// Seed `path` with a valid config holding one enabled, gtk-hosted server.
+    fn seed_files(path: &std::path::Path) {
+        cfg(r#"
+[[servers]]
+name = "files"
+command = "fileio-mcp"
+[surfaces.gtk]
+enabled = ["files"]
+"#)
+        .save(path)
+        .expect("seed save");
+    }
+
+    #[test]
+    fn save_client_server_writes_definition_and_gtk_surface() {
+        let (_dir, path) = temp_config();
+
+        let server = parse_server_config(FILES_JSON).expect("parse");
+        save_client_server(&path, server, true).expect("save");
+
+        let written = ClientMcpConfig::load(&path);
+        assert_eq!(written.list_defined_servers().len(), 1);
+        assert_eq!(written.list_defined_servers()[0].name, "files");
+        assert!(client_row_enabled(&written, "files"));
+    }
+
+    #[test]
+    fn toggle_client_server_writes_the_surface_change() {
+        let (_dir, path) = temp_config();
+        seed_files(&path);
+
+        toggle_client_server(&path, "files", false).expect("toggle off");
+
+        let written = ClientMcpConfig::load(&path);
+        assert!(!client_row_enabled(&written, "files"));
+        assert!(
+            written.list_defined_servers()[0].enabled,
+            "an off-toggle is surface-scoped: the shared definition stays enabled"
+        );
+    }
+
+    #[test]
+    fn remove_client_server_writes_the_removal() {
+        let (_dir, path) = temp_config();
+        seed_files(&path);
+
+        remove_client_server(&path, "files").expect("remove");
+
+        assert!(ClientMcpConfig::load(&path).list_defined_servers().is_empty());
+    }
+
+    #[test]
+    fn set_client_builtin_disabled_writes_the_surface_set() {
+        let (_dir, path) = temp_config();
+        seed_files(&path);
+
+        set_client_builtin_disabled(&path, "web", true).expect("disable built-in");
+
+        let written = ClientMcpConfig::load(&path);
+        assert_eq!(written.surface_disabled_builtins(GTK_SURFACE), ["web"]);
+        assert_eq!(
+            written.list_defined_servers().len(),
+            1,
+            "the unrelated definition survives"
+        );
+    }
+
+    // Acceptance criterion: a config that cannot be parsed is refused, not
+    // replaced by an empty one. Each write path gets its own named test, so a
+    // failure names the path that lost the definitions.
+
+    /// Assert that `attempt` failed, named the parse failure, and left the
+    /// damaged file exactly as it was.
+    fn assert_refused(attempt: Result<(), String>, path: &std::path::Path) {
+        let err = attempt.expect_err("a damaged config must be refused");
+        assert!(
+            err.contains("parse error"),
+            "the error must name the parse failure so the person can fix the file; got: {err}"
+        );
+        assert_eq!(
+            DAMAGED,
+            std::fs::read_to_string(path).expect("read after"),
+            "a refused write must leave the file byte-identical"
+        );
+    }
+
+    #[test]
+    fn save_client_server_refuses_a_damaged_config() {
+        let (_dir, path) = temp_config();
+        std::fs::write(&path, DAMAGED).expect("write damaged config");
+
+        let server = parse_server_config(FILES_JSON).expect("parse");
+        assert_refused(save_client_server(&path, server, true), &path);
+    }
+
+    #[test]
+    fn toggle_client_server_refuses_a_damaged_config() {
+        let (_dir, path) = temp_config();
+        std::fs::write(&path, DAMAGED).expect("write damaged config");
+
+        assert_refused(toggle_client_server(&path, "files", false), &path);
+    }
+
+    #[test]
+    fn remove_client_server_refuses_a_damaged_config() {
+        let (_dir, path) = temp_config();
+        std::fs::write(&path, DAMAGED).expect("write damaged config");
+
+        assert_refused(remove_client_server(&path, "files"), &path);
+    }
+
+    #[test]
+    fn set_client_builtin_disabled_refuses_a_damaged_config() {
+        let (_dir, path) = temp_config();
+        std::fs::write(&path, DAMAGED).expect("write damaged config");
+
+        assert_refused(set_client_builtin_disabled(&path, "web", true), &path);
+    }
+
+    // Acceptance criterion: a refused edit changes nothing. The closure's own
+    // refusal (an unknown name) must abandon the transaction, not write a
+    // half-applied config.
+
+    #[test]
+    fn toggle_client_server_unknown_name_leaves_the_file_unchanged() {
+        let (_dir, path) = temp_config();
+        seed_files(&path);
+        let before = std::fs::read(&path).expect("read before");
+
+        let err = toggle_client_server(&path, "ghost", true)
+            .expect_err("an unknown name must fail the transaction");
+        assert!(err.contains("ghost"), "the error must name the server: {err}");
+        assert_eq!(
+            before,
+            std::fs::read(&path).expect("read after"),
+            "a refused change must leave the file byte-identical"
+        );
+    }
+
+    #[test]
+    fn remove_client_server_unknown_name_leaves_the_file_unchanged() {
+        let (_dir, path) = temp_config();
+        seed_files(&path);
+        let before = std::fs::read(&path).expect("read before");
+
+        remove_client_server(&path, "ghost").expect_err("an unknown name must fail");
+        assert_eq!(
+            before,
+            std::fs::read(&path).expect("read after"),
+            "a refused change must leave the file byte-identical"
+        );
+    }
 }

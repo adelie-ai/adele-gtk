@@ -198,6 +198,11 @@ async-trait = "0.1"
 # `spans_do_not_record_prompt_or_reply_text` in `src/window/mod.rs`);
 # production code builds its subscriber through `adelie-telemetry` (#152).
 tracing-subscriber = "0.3"
+# `mcp_admin`'s config-transaction tests write a real `client-mcp.toml` into a
+# throwaway directory: what they pin is that a damaged file on disk is refused
+# and left alone, which only a real file can show. Already in the graph
+# transitively, so naming it here adds no package to the lock.
+tempfile = "3.27.0"
 
 [patch."https://github.com/adelie-ai/mcp-core"]
 mcp-core = { path = "../mcp-core" }
