@@ -35,6 +35,7 @@ dependencies = [
  "serde_json",
  "skills-mcp",
  "tasks-mcp",
+ "tempfile",
  "terminal-mcp",
  "tokio",
  "toml",

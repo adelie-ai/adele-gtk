@@ -13,8 +13,15 @@
 //! - [`client_server_dtos`] — projects a loaded [`ClientMcpConfig`] into the
 //!   [`ClientServerDto`] rows the panel merges with the daemon's.
 //! - [`apply_client_save`] / [`apply_client_toggle`] / [`apply_client_remove`] —
-//!   the definition + gtk-surface mutations a client-row edit performs before
-//!   the config is written back atomically.
+//!   the definition + gtk-surface mutations a client-row edit performs. Private:
+//!   a mutation on its own is half a write, and the half that is missing is the
+//!   lock. They are reachable only through the transactions below.
+//! - [`save_client_server`] / [`toggle_client_server`] / [`remove_client_server`]
+//!   / [`set_client_builtin_disabled`] — those mutations wrapped in the locked
+//!   [`ClientMcpConfig::edit`] transaction, which is how this client writes the
+//!   file. They touch the filesystem, so they are the one part of this module
+//!   that is not pure; they still need no display, so they unit-test here beside
+//!   the mutations they carry.
 //!
 //! The gtk surface exposes a client server iff its definition is `enabled` **and**
 //! the `[surfaces.gtk]` list names it, so "enabled" in the UI means "gtk actually
@@ -24,6 +31,7 @@
 //! disables it for another surface sharing the same `client-mcp.toml`.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use client_ui_common::{BuiltinServerDto, ClientServerDto, Runner};
 use desktop_assistant_client_common::mcp_host::{ClientMcpConfig, McpServerConfig};
@@ -127,7 +135,7 @@ pub fn client_row_enabled(cfg: &ClientMcpConfig, name: &str) -> bool {
 /// so both grains agree (see the module note). When an existing definition of the
 /// same name carries `env_secrets` or a `description` the form does not surface,
 /// they are preserved rather than blanked by the round-trip.
-pub fn apply_client_save(cfg: &mut ClientMcpConfig, mut server: McpServerConfig, enabled: bool) {
+fn apply_client_save(cfg: &mut ClientMcpConfig, mut server: McpServerConfig, enabled: bool) {
     let name = server.name.clone();
     if let Some(existing) = cfg.list_defined_servers().iter().find(|s| s.name == name) {
         if server.env_secrets.is_empty() {
@@ -153,7 +161,7 @@ pub fn apply_client_save(cfg: &mut ClientMcpConfig, mut server: McpServerConfig,
 /// Errors (fail-closed) if no definition by that name exists, in either
 /// direction, rather than materializing a gtk surface entry for a phantom server
 /// (the error is surfaced to the status bar).
-pub fn apply_client_toggle(cfg: &mut ClientMcpConfig, name: &str, on: bool) -> Result<(), String> {
+fn apply_client_toggle(cfg: &mut ClientMcpConfig, name: &str, on: bool) -> Result<(), String> {
     if on {
         cfg.set_server_enabled(name, true)?;
         cfg.set_surface_enabled(GTK_SURFACE, name, true);
@@ -170,8 +178,74 @@ pub fn apply_client_toggle(cfg: &mut ClientMcpConfig, name: &str, on: bool) -> R
 }
 
 /// Remove a client-server definition (and its membership in every surface).
-pub fn apply_client_remove(cfg: &mut ClientMcpConfig, name: &str) -> Result<(), String> {
+fn apply_client_remove(cfg: &mut ClientMcpConfig, name: &str) -> Result<(), String> {
     cfg.remove_server(name)
+}
+
+// --- The write transactions (adele-gtk#173) ----------------------------------
+//
+// `client-mcp.toml` is machine-wide, so this client is one writer of several.
+// Every write below is one [`ClientMcpConfig::edit`] call: it holds an exclusive
+// lock on a sidecar file across the whole read-mutate-write, so two clients
+// editing at once queue instead of interleaving, and it re-reads the config
+// **strictly** inside the lock, so a file that cannot be parsed fails the
+// transaction instead of being replaced by an empty one. Never load-then-save
+// here: that pair erases every definition on the machine when the file is damaged.
+//
+// What the lock gives is a serialized file transaction, not a conflict-free one.
+// Each write still applies the mutation the person asked for to whatever the file
+// holds at that moment, so it lands whole: a save writes the definition it was
+// given, including any field another client changed while the form was open. The
+// form is filled from a snapshot taken when the panel last refreshed, so a stale
+// form overwrites. Reconciling that is a separate problem from the lost update
+// this lock closes.
+//
+// Each returns the error verbatim for the caller to put on the status bar. The
+// caller must not drop it - a refusal the person never sees looks like a change
+// that silently did not happen.
+//
+// These block (the lock has a bounded wait of about two seconds), so an async
+// caller runs them on a blocking thread, never on a runtime worker or the GTK
+// main loop.
+
+/// Write a client-server save (add or edit) to `path`.
+///
+/// The mutation is [`apply_client_save`]; `enabled` is the gtk surface's own
+/// choice. An absent file is a first write.
+pub fn save_client_server(
+    path: &Path,
+    server: McpServerConfig,
+    enabled: bool,
+) -> Result<(), String> {
+    ClientMcpConfig::edit(path, |cfg| {
+        apply_client_save(cfg, server, enabled);
+        Ok(())
+    })
+}
+
+/// Write a gtk-surface enable/disable for the client server `name` to `path`.
+///
+/// The mutation is [`apply_client_toggle`], which fails closed on an unknown
+/// name; that failure abandons the transaction, so nothing is written.
+pub fn toggle_client_server(path: &Path, name: &str, on: bool) -> Result<(), String> {
+    ClientMcpConfig::edit(path, |cfg| apply_client_toggle(cfg, name, on))
+}
+
+/// Write the removal of the client-server definition `name` to `path`.
+///
+/// The mutation is [`apply_client_remove`], which fails closed on an unknown
+/// name; that failure abandons the transaction, so nothing is written.
+pub fn remove_client_server(path: &Path, name: &str) -> Result<(), String> {
+    ClientMcpConfig::edit(path, |cfg| apply_client_remove(cfg, name))
+}
+
+/// Write the gtk surface's `disabled_builtins` membership for the compiled-in
+/// built-in `name` to `path`. `disabled == true` turns it off (da#538 slice 4).
+pub fn set_client_builtin_disabled(path: &Path, name: &str, disabled: bool) -> Result<(), String> {
+    ClientMcpConfig::edit(path, |cfg| {
+        cfg.set_builtin_disabled(GTK_SURFACE, name, disabled);
+        Ok(())
+    })
 }
 
 /// Overlay the client config's per-surface `disabled_builtins` set onto a snapshot
@@ -705,5 +779,205 @@ enabled = ["files"]
             "override info from the snapshot is preserved"
         );
         assert_eq!(builtins[0].tool_count, 5, "tool count is preserved");
+    }
+
+    // --- the locked config transactions (#173) --------------------------------
+
+    /// A throwaway directory plus the config path inside it. The directory is
+    /// returned as well, because dropping it deletes the tree.
+    fn temp_config() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("client-mcp.toml");
+        (dir, path)
+    }
+
+    /// A `client-mcp.toml` that `from_toml` cannot parse. Standing in for the
+    /// real hazard: a machine-wide file a person hand-edited into a broken
+    /// state, holding definitions every surface on the box depends on.
+    const DAMAGED: &str = "this is : not valid toml [[[\n";
+
+    /// The one server definition the write helpers add, as the dialog's JSON.
+    const FILES_JSON: &str = r#"{"name":"files","enabled":true,"command":"fileio-mcp"}"#;
+
+    /// Seed `path` with a valid config holding one enabled, gtk-hosted server.
+    fn seed_files(path: &std::path::Path) {
+        cfg(r#"
+[[servers]]
+name = "files"
+command = "fileio-mcp"
+[surfaces.gtk]
+enabled = ["files"]
+"#)
+        .save(path)
+        .expect("seed save");
+    }
+
+    #[test]
+    fn save_client_server_writes_definition_and_gtk_surface() {
+        let (_dir, path) = temp_config();
+
+        let server = parse_server_config(FILES_JSON).expect("parse");
+        save_client_server(&path, server, true).expect("save");
+
+        let written = ClientMcpConfig::load(&path);
+        assert_eq!(written.list_defined_servers().len(), 1);
+        assert_eq!(written.list_defined_servers()[0].name, "files");
+        assert!(client_row_enabled(&written, "files"));
+    }
+
+    /// The point of #173 is the lock, and strictness alone would satisfy every
+    /// other test here: a read-strict-mutate-save with no lock passes them all.
+    /// `edit` locks a sidecar `<config>.lock` and leaves it behind, so its
+    /// presence is the observable trace that the write went through the
+    /// transaction rather than around it. What the lock *does* under contention
+    /// is pinned across processes upstream, in client-common's
+    /// `mcp_config_edit_lock` suite; this only pins that this client takes it.
+    #[test]
+    fn a_write_goes_through_the_lock_not_around_it() {
+        let (dir, path) = temp_config();
+        let sidecar = dir.path().join("client-mcp.toml.lock");
+        assert!(!sidecar.exists(), "no lock before the first write");
+
+        let server = parse_server_config(FILES_JSON).expect("parse");
+        save_client_server(&path, server, true).expect("save");
+
+        assert!(
+            sidecar.exists(),
+            "the write must take the sidecar lock; a bare save would leave no trace of one"
+        );
+    }
+
+    #[test]
+    fn toggle_client_server_writes_the_surface_change() {
+        let (_dir, path) = temp_config();
+        seed_files(&path);
+
+        toggle_client_server(&path, "files", false).expect("toggle off");
+
+        let written = ClientMcpConfig::load(&path);
+        assert!(!client_row_enabled(&written, "files"));
+        assert!(
+            written.list_defined_servers()[0].enabled,
+            "an off-toggle is surface-scoped: the shared definition stays enabled"
+        );
+    }
+
+    #[test]
+    fn remove_client_server_writes_the_removal() {
+        let (_dir, path) = temp_config();
+        seed_files(&path);
+
+        remove_client_server(&path, "files").expect("remove");
+
+        assert!(
+            ClientMcpConfig::load(&path)
+                .list_defined_servers()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn set_client_builtin_disabled_writes_the_surface_set() {
+        let (_dir, path) = temp_config();
+        seed_files(&path);
+
+        set_client_builtin_disabled(&path, "web", true).expect("disable built-in");
+
+        let written = ClientMcpConfig::load(&path);
+        assert_eq!(written.surface_disabled_builtins(GTK_SURFACE), ["web"]);
+        assert_eq!(
+            written.list_defined_servers().len(),
+            1,
+            "the unrelated definition survives"
+        );
+    }
+
+    // Acceptance criterion: a config that cannot be parsed is refused, not
+    // replaced by an empty one. Each write path gets its own named test, so a
+    // failure names the path that lost the definitions.
+
+    /// Assert that `attempt` failed, named the parse failure, and left the
+    /// damaged file exactly as it was.
+    fn assert_refused(attempt: Result<(), String>, path: &std::path::Path) {
+        let err = attempt.expect_err("a damaged config must be refused");
+        assert!(
+            err.contains("parse error"),
+            "the error must name the parse failure so the person can fix the file; got: {err}"
+        );
+        assert_eq!(
+            DAMAGED,
+            std::fs::read_to_string(path).expect("read after"),
+            "a refused write must leave the file byte-identical"
+        );
+    }
+
+    #[test]
+    fn save_client_server_refuses_a_damaged_config() {
+        let (_dir, path) = temp_config();
+        std::fs::write(&path, DAMAGED).expect("write damaged config");
+
+        let server = parse_server_config(FILES_JSON).expect("parse");
+        assert_refused(save_client_server(&path, server, true), &path);
+    }
+
+    #[test]
+    fn toggle_client_server_refuses_a_damaged_config() {
+        let (_dir, path) = temp_config();
+        std::fs::write(&path, DAMAGED).expect("write damaged config");
+
+        assert_refused(toggle_client_server(&path, "files", false), &path);
+    }
+
+    #[test]
+    fn remove_client_server_refuses_a_damaged_config() {
+        let (_dir, path) = temp_config();
+        std::fs::write(&path, DAMAGED).expect("write damaged config");
+
+        assert_refused(remove_client_server(&path, "files"), &path);
+    }
+
+    #[test]
+    fn set_client_builtin_disabled_refuses_a_damaged_config() {
+        let (_dir, path) = temp_config();
+        std::fs::write(&path, DAMAGED).expect("write damaged config");
+
+        assert_refused(set_client_builtin_disabled(&path, "web", true), &path);
+    }
+
+    // Acceptance criterion: a refused edit changes nothing. The closure's own
+    // refusal (an unknown name) must abandon the transaction, not write a
+    // half-applied config.
+
+    #[test]
+    fn toggle_client_server_unknown_name_leaves_the_file_unchanged() {
+        let (_dir, path) = temp_config();
+        seed_files(&path);
+        let before = std::fs::read(&path).expect("read before");
+
+        let err = toggle_client_server(&path, "ghost", true)
+            .expect_err("an unknown name must fail the transaction");
+        assert!(
+            err.contains("ghost"),
+            "the error must name the server: {err}"
+        );
+        assert_eq!(
+            before,
+            std::fs::read(&path).expect("read after"),
+            "a refused change must leave the file byte-identical"
+        );
+    }
+
+    #[test]
+    fn remove_client_server_unknown_name_leaves_the_file_unchanged() {
+        let (_dir, path) = temp_config();
+        seed_files(&path);
+        let before = std::fs::read(&path).expect("read before");
+
+        remove_client_server(&path, "ghost").expect_err("an unknown name must fail");
+        assert_eq!(
+            before,
+            std::fs::read(&path).expect("read after"),
+            "a refused change must leave the file byte-identical"
+        );
     }
 }
