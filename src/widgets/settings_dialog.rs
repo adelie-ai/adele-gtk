@@ -16,6 +16,13 @@
 //! own `list_available_models` fetch (None connection_id) so the Purposes
 //! tab sees *all* models — including embedding models, which the header
 //! `ModelPicker` filters out.
+//!
+//! Writes to the machine-wide `client-mcp.toml` are the exception to the
+//! error routing above: they go through `spawn_client_config_write`, which
+//! puts a refusal on the dialog's own status row as well as the window's,
+//! because this dialog is modal and a refused write is the person's only sign
+//! that nothing changed. It also refreshes the panel on a refusal, so a row
+//! that moved itself goes back to matching the file.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -626,6 +633,8 @@ pub fn show_settings_dialog(
         client_config,
         #[strong]
         client_mcp_path,
+        #[strong]
+        status_label,
         #[strong(rename_to = mcp_tab_add)]
         mcp_tab,
         #[weak]
@@ -646,6 +655,7 @@ pub fn show_settings_dialog(
             let transport = Arc::clone(&transport);
             let bridge = Rc::clone(&bridge);
             let refresh = Rc::clone(&refresh_mcp);
+            let status = Rc::clone(&status_label);
             let path = (*client_mcp_path).clone();
             show_mcp_server_dialog(
                 &dialog,
@@ -658,6 +668,7 @@ pub fn show_settings_dialog(
                         Arc::clone(&transport),
                         Rc::clone(&bridge),
                         Rc::clone(&refresh),
+                        Rc::clone(&status),
                         path.clone(),
                         built,
                     );
@@ -682,6 +693,8 @@ pub fn show_settings_dialog(
         client_config,
         #[strong]
         client_mcp_path,
+        #[strong]
+        status_label,
         #[strong(rename_to = mcp_tab_edit)]
         mcp_tab,
         #[weak]
@@ -708,6 +721,7 @@ pub fn show_settings_dialog(
             let transport = Arc::clone(&transport);
             let bridge = Rc::clone(&bridge);
             let refresh = Rc::clone(&refresh_mcp);
+            let status = Rc::clone(&status_label);
             let path = (*client_mcp_path).clone();
             // Edit targets an existing name by design; the dup-name guard is
             // create-only, so no existing-names lists are needed here.
@@ -722,6 +736,7 @@ pub fn show_settings_dialog(
                         Arc::clone(&transport),
                         Rc::clone(&bridge),
                         Rc::clone(&refresh),
+                        Rc::clone(&status),
                         path.clone(),
                         built,
                     );
@@ -740,6 +755,8 @@ pub fn show_settings_dialog(
         refresh_mcp,
         #[strong]
         client_mcp_path,
+        #[strong]
+        status_label,
         move |name, runner, enabled| match mcp_admin::backend_for(runner) {
             McpBackend::Daemon => do_toggle_mcp(
                 Arc::clone(&transport),
@@ -751,6 +768,7 @@ pub fn show_settings_dialog(
             McpBackend::Client => do_client_toggle(
                 Rc::clone(&bridge),
                 Rc::clone(&refresh_mcp),
+                Rc::clone(&status_label),
                 (*client_mcp_path).clone(),
                 name,
                 enabled,
@@ -793,12 +811,15 @@ pub fn show_settings_dialog(
         refresh_mcp,
         #[strong]
         client_mcp_path,
+        #[strong]
+        status_label,
         #[weak]
         dialog,
         move |name, runner| {
             let transport = Arc::clone(&transport);
             let bridge = Rc::clone(&bridge);
             let refresh = Rc::clone(&refresh_mcp);
+            let status = Rc::clone(&status_label);
             let path = (*client_mcp_path).clone();
             let name_for_confirm = name.clone();
             let detail = match runner {
@@ -823,6 +844,7 @@ pub fn show_settings_dialog(
                     McpBackend::Client => do_client_remove(
                         Rc::clone(&bridge),
                         Rc::clone(&refresh),
+                        Rc::clone(&status),
                         path.clone(),
                         name_for_confirm.clone(),
                     ),
@@ -1000,85 +1022,132 @@ fn save_mcp_built(
     transport: Arc<Connector>,
     bridge: Rc<AsyncBridge>,
     refresh: Rc<dyn Fn()>,
+    status_label: Rc<Label>,
     client_path: PathBuf,
     built: BuiltMcpServer,
 ) {
     match mcp_admin::backend_for(built.runner) {
         McpBackend::Daemon => do_upsert_mcp(transport, bridge, refresh, built),
-        McpBackend::Client => do_client_save(bridge, refresh, client_path, built),
+        McpBackend::Client => do_client_save(bridge, refresh, status_label, client_path, built),
     }
 }
 
-/// Save a client-hosted server to `client-mcp.toml` off the main loop: parse the
-/// built config, load the current file, apply the definition + gtk-surface
-/// change, and write it back atomically. Then refresh. The dialog's config JSON
-/// carries no bearer secret store on the client, so any typed bearer token is
-/// dropped (client servers are stdio in practice; http-bearer on the client is a
-/// follow-up).
-fn do_client_save(
-    bridge: Rc<AsyncBridge>,
+/// Run one `client-mcp.toml` write transaction off the GTK main loop and report
+/// what it did (adele-gtk#173).
+///
+/// `write` is a whole locked transaction from [`mcp_admin`] - it re-reads the
+/// config inside the lock, applies the change and saves. It **blocks**: the
+/// sidecar lock has a bounded wait of about two seconds while another Adele
+/// client edits the same machine-wide file, so it runs on a blocking thread and
+/// never on a runtime worker.
+///
+/// A refusal has to reach the person, so it goes to two places. The dialog's own
+/// status row is the one in front of them: this dialog is modal, so an error left
+/// only on the main window's status bar sits behind it. The bar gets it too,
+/// which is where this dialog has always sent its surface errors. `what` names
+/// the action ("Save client MCP server") and prefixes the message.
+///
+/// Two refusals matter here and neither is a bug in the client: the config on
+/// disk cannot be parsed (writing anyway would erase every server definition on
+/// the machine, so the transaction refuses), and another Adele client holds the
+/// lock. Both leave the file exactly as it was, so the message is the person's
+/// only sign that nothing changed - it is never dropped, not even when the write
+/// task ends without reporting.
+///
+/// `refresh` runs on **both** outcomes, and the refusal is the reason it has to.
+/// A built-in's row is a `Switch` whose `state-set` handler proceeds, so GTK has
+/// already moved it by the time the write is refused; only a refresh re-projects
+/// the row from the file, which did not change. `on_success` is the note a
+/// successful write leaves on the status row; a write with no note clears the
+/// row, so a refusal the person has since retried does not stay on screen as
+/// though it were still true. Both are set after the refresh, which reports its
+/// own failures there.
+fn spawn_client_config_write<W>(
+    bridge: &AsyncBridge,
     refresh: Rc<dyn Fn()>,
-    client_path: PathBuf,
-    built: BuiltMcpServer,
-) {
+    status_label: Rc<Label>,
+    what: &'static str,
+    on_success: Option<String>,
+    write: W,
+) where
+    W: FnOnce() -> Result<(), String> + Send + 'static,
+{
     let ui_tx = bridge.ui_sender();
     let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), String>>();
     bridge.spawn(async move {
-        let result = (|| {
-            let server = mcp_admin::parse_server_config(&built.config_json)?;
-            let enabled = server.enabled;
-            let mut cfg = ClientMcpConfig::load(&client_path);
-            mcp_admin::apply_client_save(&mut cfg, server, enabled);
-            cfg.save(&client_path)
-        })();
+        let result = tokio::task::spawn_blocking(write)
+            .await
+            .unwrap_or_else(|e| Err(format!("the write did not run: {e}")));
         let _ = tx.send(result);
     });
     glib::spawn_future_local(async move {
-        if let Some(r) = rx.recv().await {
-            match r {
-                Ok(()) => refresh(),
-                Err(e) => {
-                    let _ = ui_tx.send(UiMessage::Error(format!("Save client MCP server: {e}")));
-                }
+        let outcome = rx
+            .recv()
+            .await
+            .unwrap_or_else(|| Err("the write ended without reporting".to_string()));
+        refresh();
+        match outcome {
+            Ok(()) => status_label.set_text(on_success.as_deref().unwrap_or("")),
+            Err(e) => {
+                let message = format!("{what}: {e}");
+                status_label.set_text(&message);
+                let _ = ui_tx.send(UiMessage::Error(message));
             }
         }
     });
 }
 
+/// Save a client-hosted server to `client-mcp.toml` off the main loop: parse the
+/// built config, then apply the definition + gtk-surface change inside the locked
+/// write transaction. Then refresh. The dialog's config JSON carries no bearer
+/// secret store on the client, so any typed bearer token is dropped (client
+/// servers are stdio in practice; http-bearer on the client is a follow-up).
+fn do_client_save(
+    bridge: Rc<AsyncBridge>,
+    refresh: Rc<dyn Fn()>,
+    status_label: Rc<Label>,
+    client_path: PathBuf,
+    built: BuiltMcpServer,
+) {
+    spawn_client_config_write(
+        &bridge,
+        refresh,
+        status_label,
+        "Save client MCP server",
+        None,
+        move || {
+            let server = mcp_admin::parse_server_config(&built.config_json)?;
+            let enabled = server.enabled;
+            mcp_admin::save_client_server(&client_path, server, enabled)
+        },
+    );
+}
+
 /// Enable/disable a client-hosted server for the gtk surface (asymmetrically:
-/// enabling sets both grains, disabling is surface-scoped) and write the config
-/// back off the main loop, then refresh.
+/// enabling sets both grains, disabling is surface-scoped) through the locked
+/// write transaction, off the main loop, then refresh.
 fn do_client_toggle(
     bridge: Rc<AsyncBridge>,
     refresh: Rc<dyn Fn()>,
+    status_label: Rc<Label>,
     client_path: PathBuf,
     name: String,
     enabled: bool,
 ) {
-    let ui_tx = bridge.ui_sender();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), String>>();
-    bridge.spawn(async move {
-        let mut cfg = ClientMcpConfig::load(&client_path);
-        let result = mcp_admin::apply_client_toggle(&mut cfg, &name, enabled)
-            .and_then(|()| cfg.save(&client_path));
-        let _ = tx.send(result);
-    });
-    glib::spawn_future_local(async move {
-        if let Some(r) = rx.recv().await {
-            match r {
-                Ok(()) => refresh(),
-                Err(e) => {
-                    let _ = ui_tx.send(UiMessage::Error(format!("Toggle client MCP server: {e}")));
-                }
-            }
-        }
-    });
+    spawn_client_config_write(
+        &bridge,
+        refresh,
+        status_label,
+        "Toggle client MCP server",
+        None,
+        move || mcp_admin::toggle_client_server(&client_path, &name, enabled),
+    );
 }
 
 /// Enable/disable a compiled-in **built-in** server for the gtk surface (da#538
-/// slice 4): load the client config off the main loop, set its per-surface
-/// `disabled_builtins` membership via [`ClientMcpConfig::set_builtin_disabled`],
-/// write it back, then refresh and note that it applies on restart.
+/// slice 4): set its per-surface `disabled_builtins` membership through the
+/// locked write transaction, off the main loop, then refresh and note that it
+/// applies on restart.
 ///
 /// The running [`McpHost`](desktop_assistant_client_common::mcp_host::McpHost)
 /// snapshots its built-in set once at start, so it does NOT drop/add the built-in
@@ -1093,59 +1162,36 @@ fn do_builtin_toggle(
     name: String,
     disabled: bool,
 ) {
-    let ui_tx = bridge.ui_sender();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), String>>();
     let name_for_task = name.clone();
-    bridge.spawn(async move {
-        let mut cfg = ClientMcpConfig::load(&client_path);
-        cfg.set_builtin_disabled(mcp_admin::GTK_SURFACE, &name_for_task, disabled);
-        let _ = tx.send(cfg.save(&client_path));
-    });
-    glib::spawn_future_local(async move {
-        if let Some(r) = rx.recv().await {
-            match r {
-                Ok(()) => {
-                    let verb = if disabled { "disabled" } else { "enabled" };
-                    status_label.set_text(&format!(
-                        "Built-in \"{name}\" {verb} - applies after the client restarts."
-                    ));
-                    refresh();
-                }
-                Err(e) => {
-                    let _ =
-                        ui_tx.send(UiMessage::Error(format!("Toggle built-in MCP server: {e}")));
-                }
-            }
-        }
-    });
+    let verb = if disabled { "disabled" } else { "enabled" };
+    let note = format!("Built-in \"{name}\" {verb} - applies after the client restarts.");
+    spawn_client_config_write(
+        &bridge,
+        refresh,
+        status_label,
+        "Toggle built-in MCP server",
+        Some(note),
+        move || mcp_admin::set_client_builtin_disabled(&client_path, &name_for_task, disabled),
+    );
 }
 
-/// Remove a client-hosted server definition and write the config back off the
-/// main loop, then refresh.
+/// Remove a client-hosted server definition through the locked write
+/// transaction, off the main loop, then refresh.
 fn do_client_remove(
     bridge: Rc<AsyncBridge>,
     refresh: Rc<dyn Fn()>,
+    status_label: Rc<Label>,
     client_path: PathBuf,
     name: String,
 ) {
-    let ui_tx = bridge.ui_sender();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), String>>();
-    bridge.spawn(async move {
-        let mut cfg = ClientMcpConfig::load(&client_path);
-        let result =
-            mcp_admin::apply_client_remove(&mut cfg, &name).and_then(|()| cfg.save(&client_path));
-        let _ = tx.send(result);
-    });
-    glib::spawn_future_local(async move {
-        if let Some(r) = rx.recv().await {
-            match r {
-                Ok(()) => refresh(),
-                Err(e) => {
-                    let _ = ui_tx.send(UiMessage::Error(format!("Remove client MCP server: {e}")));
-                }
-            }
-        }
-    });
+    spawn_client_config_write(
+        &bridge,
+        refresh,
+        status_label,
+        "Remove client MCP server",
+        None,
+        move || mcp_admin::remove_client_server(&client_path, &name),
+    );
 }
 
 /// Enable/disable an MCP server, then refresh.
