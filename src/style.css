@@ -482,9 +482,12 @@ entry:focus {
     border-color: #84dac1;
 }
 
-/* Evicted results: the row's figures are a floor, not the whole story. Same
-   amber as the other advisory markers in this app. */
-.tool-usage-warn {
-    color: #e8b860;
+/* Results the model now reads as a pointer. Deliberately NOT the advisory
+   amber: for a conversation doing long agentic work this is the normal shape,
+   and colouring it as a warning would tell the reader something is wrong when
+   nothing is. It is a note, so it reads as one. */
+.tool-usage-note {
+    color: #8f99ae;
     font-size: 12px;
+    font-style: italic;
 }

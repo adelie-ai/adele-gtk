@@ -14,7 +14,7 @@
 //! dependence on the shared reducer.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -44,6 +44,17 @@ pub const UNRESOLVED_NAMESPACE_TITLE: &str = "Server not recorded";
 /// rather than as a server that behaved oddly.
 pub const UNRESOLVED_NAMESPACE_HINT: &str =
     "The daemon did not report which server hosts these tools.";
+
+/// The line under a group whose server was read off the tool names. The
+/// grouping is then this client's inference, not the daemon's answer, and it
+/// must not be presented as the daemon's.
+pub const DERIVED_NAMESPACE_HINT: &str =
+    "Read from the tool names. The daemon did not report a server for these.";
+
+/// The separator a namespaced tool name uses: `{server}__{tool}`. Matches
+/// `NAMESPACE_SEP` in the daemon's `tool_provenance`, which is the definition
+/// this client has to agree with.
+const NAMESPACE_SEP: &str = "__";
 
 /// The sort options, in the order the control offers them. The first is the
 /// default: "what ate my context" is the question this view exists for.
@@ -89,13 +100,21 @@ impl SortAxis {
     }
 }
 
-/// The server a group of tools belongs to, with the unresolved case kept
-/// distinct from a named one instead of being folded into a placeholder name.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// The server a group of tools belongs to.
+///
+/// Three cases, kept apart because they are known to different degrees and a
+/// reader is owed the difference. Ordered so a reported server outranks a
+/// derived one and both outrank the unknown, which is the order they break a
+/// tie in.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NamespaceKey {
-    /// The daemon named the hosting server.
-    Named(String),
-    /// The daemon reported no server for these tools.
+    /// The daemon named the server that provides these tools.
+    Reported(String),
+    /// The daemon named no server, and the tool names carry a
+    /// `{server}__{tool}` prefix this client read the server off. An
+    /// inference, and labelled as one.
+    Derived(String),
+    /// The daemon named no server and the names carry no prefix.
     Unresolved,
 }
 
@@ -103,8 +122,18 @@ impl NamespaceKey {
     /// The heading text for this key.
     pub fn title(&self) -> &str {
         match self {
-            Self::Named(name) => name,
+            Self::Reported(name) | Self::Derived(name) => name,
             Self::Unresolved => UNRESOLVED_NAMESPACE_TITLE,
+        }
+    }
+
+    /// The line that says how this group's server was arrived at, where that
+    /// is not simply "the daemon said so".
+    pub fn hint(&self) -> Option<&'static str> {
+        match self {
+            Self::Reported(_) => None,
+            Self::Derived(_) => Some(DERIVED_NAMESPACE_HINT),
+            Self::Unresolved => Some(UNRESOLVED_NAMESPACE_HINT),
         }
     }
 }
@@ -136,10 +165,32 @@ enum UsageMsg {
     Error(String),
 }
 
+/// Whether the figures on screen came from an answer, and from which one.
+///
+/// The view cannot infer this from the rows. An empty list means "this
+/// conversation called no tools"; a failed read means "nobody knows what it
+/// called". Both leave the same empty `Vec` behind, and presenting the second
+/// as the first is the one reading this window must never give.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadState {
+    /// The first read has not come back yet.
+    Loading,
+    /// The daemon answered. An empty list is a real answer.
+    Loaded,
+    /// The daemon could not answer. Any rows on screen are from an earlier
+    /// read and are stale.
+    Failed(String),
+}
+
 /// What the window is currently showing.
 struct UsageState {
     rows: Vec<api::ToolUsageView>,
     axis: SortAxis,
+    load: LoadState,
+    /// Namespaces the user collapsed. Held here rather than on the widgets so
+    /// the choice survives a re-sort and a reload, both of which rebuild every
+    /// expander from scratch.
+    collapsed: HashSet<NamespaceKey>,
 }
 
 /// The tool-usage cost window for one conversation.
@@ -152,14 +203,20 @@ pub struct ToolUsageWindow {
 
 impl ToolUsageWindow {
     /// Build the window for `conversation_id`. The caller presents it.
+    ///
+    /// `conversation_title` names the conversation in the window title. The
+    /// window is bound to the conversation open when it was built and does not
+    /// follow the main window, so two of these side by side have to be
+    /// tellable apart.
     pub fn new(
         parent: &ApplicationWindow,
         conversation_id: String,
+        conversation_title: &str,
         transport: Arc<Connector>,
         bridge: Rc<AsyncBridge>,
     ) -> Self {
         let window = Window::builder()
-            .title("Tool Usage")
+            .title(window_title(conversation_title))
             .transient_for(parent)
             .modal(false)
             .default_width(900)
@@ -167,7 +224,8 @@ impl ToolUsageWindow {
             .build();
 
         let header = HeaderBar::new();
-        let title_label = Label::new(Some("Tool Usage"));
+        let title_label = Label::new(Some(&window_title(conversation_title)));
+        title_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
         title_label.add_css_class("title");
         header.set_title_widget(Some(&title_label));
         window.set_titlebar(Some(&header));
@@ -184,8 +242,8 @@ impl ToolUsageWindow {
         let sort_dropdown = DropDown::new(Some(sort_model), gtk4::Expression::NONE);
         sort_dropdown.set_selected(0);
         sort_dropdown.set_tooltip_text(Some(
-            "Token cost ranks what filled the context window. Call count ranks \
-             what the model kept going back to.",
+            "Token cost ranks what each tool still occupies in this \
+             conversation. Call count ranks what the model kept going back to.",
         ));
         sort_box.append(&sort_dropdown);
         header.pack_end(&sort_box);
@@ -231,9 +289,36 @@ impl ToolUsageWindow {
         let state = Rc::new(RefCell::new(UsageState {
             rows: Vec::new(),
             axis: SORT_AXES[0],
+            load: LoadState::Loading,
+            collapsed: HashSet::new(),
         }));
 
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<UsageMsg>();
+
+        // Repaint from whatever is in state. Called after a load and after the
+        // sort axis changes, so both routes render through one path.
+        let repaint: Rc<dyn Fn()> = Rc::new(glib::clone!(
+            #[strong]
+            state,
+            #[weak]
+            content,
+            #[weak]
+            totals_label,
+            #[weak]
+            status_label,
+            move || {
+                // Snapshot and release the borrow before rendering: the
+                // expanders built below install handlers that take a mutable
+                // borrow of this same cell.
+                let (rows, axis, collapsed, load) = {
+                    let s = state.borrow();
+                    (s.rows.clone(), s.axis, s.collapsed.clone(), s.load.clone())
+                };
+                totals_label.set_text(&totals_text(&load, &rows));
+                status_label.set_text(&status_text(&load, rows.len()));
+                render_groups(&content, &rows, axis, &collapsed, &state);
+            }
+        ));
 
         // Reload closure, shared by the initial load and the refresh button,
         // so both hold one copy of the captured transport / bridge / sender.
@@ -244,10 +329,13 @@ impl ToolUsageWindow {
             bridge,
             #[strong]
             msg_tx,
-            #[weak]
-            status_label,
+            #[strong]
+            state,
+            #[strong]
+            repaint,
             move || {
-                status_label.set_text("Loading...");
+                state.borrow_mut().load = LoadState::Loading;
+                repaint();
                 let transport = Arc::clone(&transport);
                 let msg_tx = msg_tx.clone();
                 let conversation_id = conversation_id.clone();
@@ -263,44 +351,27 @@ impl ToolUsageWindow {
             }
         ));
 
-        // Repaint from whatever is in state. Called after a load and after the
-        // sort axis changes, so both routes render through one path.
-        let repaint: Rc<dyn Fn()> = Rc::new(glib::clone!(
-            #[strong]
-            state,
-            #[weak]
-            content,
-            #[weak]
-            totals_label,
-            #[weak]
-            status_label,
-            move || {
-                let s = state.borrow();
-                totals_label.set_text(&format_totals(&totals(&s.rows)));
-                // An empty conversation is a normal outcome: the empty state
-                // replaces the list, and nothing is drawn that could read as a
-                // broken chart.
-                status_label.set_text(if s.rows.is_empty() { EMPTY_STATE } else { "" });
-                render_groups(&content, &s.rows, s.axis);
-            }
-        ));
-
         glib::spawn_future_local(glib::clone!(
             #[strong]
             state,
             #[strong]
             repaint,
-            #[weak]
-            status_label,
             async move {
                 while let Some(msg) = msg_rx.recv().await {
                     match msg {
                         UsageMsg::Loaded(rows) => {
-                            state.borrow_mut().rows = rows;
+                            let mut s = state.borrow_mut();
+                            s.rows = rows;
+                            s.load = LoadState::Loaded;
+                            drop(s);
                             repaint();
                         }
                         UsageMsg::Error(e) => {
-                            status_label.set_text(&format!("Error: {e}"));
+                            // Recorded, not just printed. A failure that lives
+                            // only in a label is erased by the next repaint,
+                            // and the view then reads as an empty conversation.
+                            state.borrow_mut().load = LoadState::Failed(e);
+                            repaint();
                         }
                     }
                 }
@@ -342,7 +413,13 @@ impl ToolUsageWindow {
 
 /// Rebuild the group list. One collapsible expander per server, each holding a
 /// grid of that server's tools.
-fn render_groups(container: &GtkBox, rows: &[api::ToolUsageView], axis: SortAxis) {
+fn render_groups(
+    container: &GtkBox,
+    rows: &[api::ToolUsageView],
+    axis: SortAxis,
+    collapsed: &HashSet<NamespaceKey>,
+    state: &Rc<RefCell<UsageState>>,
+) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
@@ -353,9 +430,27 @@ fn render_groups(container: &GtkBox, rows: &[api::ToolUsageView], axis: SortAxis
 
     for group in group_by_namespace(rows, axis) {
         let expander = Expander::new(None);
-        expander.set_expanded(true);
+        // Restore the user's choice before connecting the handler, so priming
+        // the widget does not read back as a fresh toggle.
+        expander.set_expanded(!collapsed.contains(&group.key));
+        {
+            let key = group.key.clone();
+            let state = Rc::clone(state);
+            expander.connect_expanded_notify(move |expander| {
+                let mut s = state.borrow_mut();
+                if expander.is_expanded() {
+                    s.collapsed.remove(&key);
+                } else {
+                    s.collapsed.insert(key.clone());
+                }
+            });
+        }
         let heading = Label::new(Some(&format_group_heading(&group)));
         heading.set_xalign(0.0);
+        heading.set_tooltip_text(Some(
+            "Totals for this server. Bytes are measured; tokens are estimated \
+             by the same rule the context budget uses.",
+        ));
         heading.add_css_class("tool-usage-group");
         expander.set_label_widget(Some(&heading));
 
@@ -363,8 +458,8 @@ fn render_groups(container: &GtkBox, rows: &[api::ToolUsageView], axis: SortAxis
         inner.set_margin_start(16);
         inner.set_margin_top(4);
 
-        if group.key == NamespaceKey::Unresolved {
-            let hint = Label::new(Some(UNRESOLVED_NAMESPACE_HINT));
+        if let Some(text) = group.key.hint() {
+            let hint = Label::new(Some(text));
             hint.set_xalign(0.0);
             hint.set_wrap(true);
             hint.add_css_class("dim-label");
@@ -410,11 +505,7 @@ fn attach_row(grid: &Grid, index: i32, row: &api::ToolUsageView, axis: SortAxis,
     bar.set_fraction(bar_fraction(axis.value_of(row), peak));
     bar.set_valign(Align::Center);
     bar.set_size_request(BAR_WIDTH_PX, -1);
-    bar.set_tooltip_text(Some(&format!(
-        "{}: {} of the heaviest tool in this conversation",
-        axis.label(),
-        format_percent(axis.value_of(row), peak)
-    )));
+    bar.set_tooltip_text(Some(&bar_tooltip(axis.value_of(row), peak, axis)));
     bar.add_css_class("tool-usage-bar");
     grid.attach(&bar, 1, line, 1, 1);
 
@@ -430,7 +521,9 @@ fn attach_row(grid: &Grid, index: i32, row: &api::ToolUsageView, axis: SortAxis,
         3,
         line,
         &pluralize(u64::from(row.call_count), "call"),
-        "Calls the model requested, failures included.",
+        "Calls the model requested. Failures and calls that never ran (a \
+         cancelled turn, a turn that ran out of rounds) are counted: the \
+         request is what spent the round.",
     );
     attach_figure(
         grid,
@@ -449,16 +542,18 @@ fn attach_row(grid: &Grid, index: i32, row: &api::ToolUsageView, axis: SortAxis,
     );
 
     if let Some(note) = eviction_note(row) {
-        let warn = Label::new(Some(&note));
-        warn.set_xalign(0.0);
-        warn.set_wrap(true);
-        warn.set_tooltip_text(Some(
-            "Compaction replaced these results with a pointer. Where the \
-             original bytes were overwritten their size is not recoverable, so \
-             the figures above are a floor.",
+        let note_label = Label::new(Some(&note));
+        note_label.set_xalign(0.0);
+        note_label.set_wrap(true);
+        note_label.set_tooltip_text(Some(
+            "A completed step distilled these results into a note, so the model \
+             reads a pointer while this conversation still holds the bytes \
+             counted here. A conversation compacted by an older build instead \
+             lost the original bytes, and those count zero. This view cannot \
+             tell the two apart, so it does not adjust the figures either way.",
         ));
-        warn.add_css_class("tool-usage-warn");
-        grid.attach(&warn, 0, line + 1, 6, 1);
+        note_label.add_css_class("tool-usage-note");
+        grid.attach(&note_label, 0, line + 1, 6, 1);
     }
 }
 
@@ -486,11 +581,28 @@ pub fn sort_rows(rows: &mut [api::ToolUsageView], axis: SortAxis) {
     });
 }
 
-/// The server key for a row. A namespace that is absent, empty, or only
-/// whitespace is unresolved, not a server with a blank name.
+/// The server key for a row.
+///
+/// The daemon's `namespace` wins wherever it has one: it comes from the tool
+/// registry and is already source-qualified (`mcp:<server>`, `builtin:<group>`),
+/// which a name cannot tell you. A namespace that is absent, empty, or only
+/// whitespace is not a server with a blank name, so it falls through.
+///
+/// The fallback reads the server off a `{server}__{tool}` name, splitting on
+/// the LAST separator, because that is what the daemon's own
+/// `tool_provenance::classify_tool` does. Splitting on the first would file
+/// `home__assistant__get_state` under a server called `home`, which does not
+/// exist, and would merge its subtotals with every other `home__*` server.
 pub fn namespace_key(row: &api::ToolUsageView) -> NamespaceKey {
-    match row.namespace.as_deref().map(str::trim) {
-        Some(name) if !name.is_empty() => NamespaceKey::Named(name.to_string()),
+    if let Some(name) = row.namespace.as_deref().map(str::trim)
+        && !name.is_empty()
+    {
+        return NamespaceKey::Reported(name.to_string());
+    }
+    match row.tool_name.rsplit_once(NAMESPACE_SEP) {
+        Some((server, tool)) if !server.is_empty() && !tool.is_empty() => {
+            NamespaceKey::Derived(server.to_string())
+        }
         _ => NamespaceKey::Unresolved,
     }
 }
@@ -591,24 +703,93 @@ pub fn bar_fraction(value: u64, peak: u64) -> f64 {
     (value as f64 / peak as f64).clamp(0.0, 1.0)
 }
 
-/// This figure as a percentage of the peak, for the bar's tooltip.
-fn format_percent(value: u64, peak: u64) -> String {
-    format!("{:.0}%", bar_fraction(value, peak) * 100.0)
+/// The bar's tooltip: this figure set against the heaviest tool on the axis.
+///
+/// Two readings a plain percentage gets wrong. With no peak there is no
+/// heaviest tool to compare against, so the tooltip says so rather than
+/// stating "0% of" nothing. And a small but real figure rounds to "0%", which
+/// reads as none at all, so it is named as under one percent instead.
+pub fn bar_tooltip(value: u64, peak: u64, axis: SortAxis) -> String {
+    if peak == 0 {
+        return format!("{}: nothing recorded on this axis", axis.label());
+    }
+    let share = bar_fraction(value, peak) * 100.0;
+    let reading = if value > 0 && share < 0.5 {
+        "under 1%".to_string()
+    } else {
+        format!("{share:.0}%")
+    };
+    format!(
+        "{}: {reading} of the heaviest tool in this conversation",
+        axis.label()
+    )
 }
 
-/// The under-reporting note for a row with evicted results, or `None`.
+/// The window and header title, naming the conversation the figures describe.
+pub fn window_title(conversation_title: &str) -> String {
+    let trimmed = conversation_title.trim();
+    if trimmed.is_empty() {
+        "Tool Usage".to_string()
+    } else {
+        format!("Tool Usage - {trimmed}")
+    }
+}
+
+/// The status line for a load outcome and the number of rows it left on screen.
 ///
-/// Compaction (#240) replaced these results with a pointer. The client cannot
-/// tell an eviction that kept its bytes from one that did not, and the
-/// original size of the second kind is not recoverable, so the note says the
-/// resident figures MAY under-report rather than claiming a number it does
-/// not have. Peak cost is desktop-assistant#675; nothing here estimates it.
+/// The empty state and a failed read are different answers and must never
+/// share a rendering: "this conversation called no tools" is about the
+/// conversation, and "the daemon could not answer" is not. Where a failure
+/// leaves an earlier reading on screen, the line says the figures are stale
+/// rather than letting them pass as current.
+pub fn status_text(load: &LoadState, row_count: usize) -> String {
+    match load {
+        LoadState::Loading if row_count == 0 => "Loading...".to_string(),
+        LoadState::Loading => "Reloading...".to_string(),
+        LoadState::Loaded if row_count == 0 => EMPTY_STATE.to_string(),
+        LoadState::Loaded => String::new(),
+        LoadState::Failed(error) if row_count == 0 => format!("Error: {error}"),
+        LoadState::Failed(error) => {
+            format!("Error: {error} - the figures below are from the last reading.")
+        }
+    }
+}
+
+/// The header totals line, or nothing where no reading has landed.
+///
+/// Zeros are a measured answer and are printed for a conversation that really
+/// called no tools. They are NOT printed for a read that never returned, where
+/// they would present "nobody knows" as "nothing happened".
+pub fn totals_text(load: &LoadState, rows: &[api::ToolUsageView]) -> String {
+    if rows.is_empty() && *load != LoadState::Loaded {
+        return String::new();
+    }
+    format_totals(&totals(rows))
+}
+
+/// The note for a row whose results the model reads as a pointer, or `None`.
+///
+/// `evicted_results` counts two shapes that a client cannot tell apart, and
+/// they move the figures in OPPOSITE directions:
+///
+/// - A completed agentic step distilled its results into a note. The
+///   conversation still holds every byte, so `result_bytes` counts them in
+///   full, while the model now reads a short pointer. Here the figures
+///   OVER-state what the turn costs today. This is the normal, healthy shape
+///   for long agentic work, not data loss.
+/// - A conversation compacted by an older build had the row overwritten. Those
+///   bytes are unrecoverable and count zero, so the figures UNDER-state what
+///   the tool once cost.
+///
+/// So the note names the fact and neither direction, because asserting either
+/// one would be a claim this view cannot support. It states no size: peak cost
+/// is desktop-assistant#675, and nothing here estimates it.
 pub fn eviction_note(row: &api::ToolUsageView) -> Option<String> {
     if row.evicted_results == 0 {
         return None;
     }
     Some(format!(
-        "{} evicted by compaction - the figures above may under-report what this tool cost",
+        "{} of these results are now read as a pointer",
         format_thousands(u64::from(row.evicted_results)),
     ))
 }
@@ -710,7 +891,7 @@ mod tests {
     // --- Acceptance criteria ---------------------------------------------
 
     #[test]
-    fn a_known_call_mix_renders_one_row_per_tool_with_correct_counts_and_tokens() {
+    fn a_known_call_mix_groups_one_row_per_tool_with_correct_counts_and_tokens() {
         let rows = mixed_call_mix();
         let groups = group_by_namespace(&rows, SortAxis::Tokens);
 
@@ -772,13 +953,13 @@ mod tests {
     }
 
     #[test]
-    fn namespace_grouping_shows_correct_subtotals() {
+    fn namespace_grouping_computes_correct_subtotals() {
         let groups = group_by_namespace(&mixed_call_mix(), SortAxis::Tokens);
         assert_eq!(groups.len(), 2);
 
         let fileio = groups
             .iter()
-            .find(|g| g.key == NamespaceKey::Named("fileio".into()))
+            .find(|g| g.key == NamespaceKey::Reported("fileio".into()))
             .expect("fileio group");
         assert_eq!(fileio.rows.len(), 2);
         assert_eq!(fileio.subtotal_calls, 45);
@@ -787,7 +968,7 @@ mod tests {
 
         let web = groups
             .iter()
-            .find(|g| g.key == NamespaceKey::Named("web".into()))
+            .find(|g| g.key == NamespaceKey::Reported("web".into()))
             .expect("web group");
         assert_eq!(web.rows.len(), 1);
         assert_eq!(web.subtotal_calls, 2);
@@ -796,19 +977,26 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_with_evicted_results_is_marked_as_under_reported() {
+    fn a_tool_with_evicted_results_gets_a_note_that_claims_neither_direction() {
         let mut evicted = row("fetch_page", Some("web"), 4, 8_192, 2_048);
         evicted.evicted_results = 3;
         let note = eviction_note(&evicted).expect("a row with evictions carries a note");
         assert!(note.contains('3'), "the note names how many: {note}");
         assert!(
-            note.contains("evicted"),
-            "the note names what happened: {note}"
+            note.contains("pointer"),
+            "the note names what the model now reads: {note}"
         );
-        assert!(
-            note.contains("under-report"),
-            "the note says the figures are a floor, not the whole story: {note}"
-        );
+
+        // The count covers two shapes that move the figures in OPPOSITE
+        // directions - a completed step keeps every byte, an old compaction
+        // lost them - and this view cannot tell them apart. Claiming either
+        // direction would be a claim the data does not support.
+        for direction in ["under-report", "over-report", "higher", "lower", "lost"] {
+            assert!(
+                !note.contains(direction),
+                "the note must not claim a direction it cannot know: {note}"
+            );
+        }
 
         // The original size of an overwritten result is not recoverable, so the
         // note must not carry one. Without this, a later edit could append a
@@ -825,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_conversation_shows_the_empty_state_not_an_error() {
+    fn an_empty_conversation_groups_to_nothing_and_totals_to_zero() {
         let none: Vec<api::ToolUsageView> = Vec::new();
         assert!(group_by_namespace(&none, SortAxis::Tokens).is_empty());
         assert_eq!(totals(&none), Totals::default());
@@ -839,6 +1027,70 @@ mod tests {
 
     // --- Supporting behaviour --------------------------------------------
 
+    /// The trap this fallback exists to avoid. The daemon's own
+    /// `tool_provenance::classify_tool` splits a namespaced name on the LAST
+    /// `__`. Splitting on the first files `home__assistant__get_state` under a
+    /// server called `home` that does not exist, and merges its subtotals with
+    /// every other `home__*` server.
+    #[test]
+    fn a_derived_server_comes_from_the_last_separator_not_the_first() {
+        let r = row("home__assistant__get_state", None, 1, 10, 3);
+        assert_eq!(
+            namespace_key(&r),
+            NamespaceKey::Derived("home__assistant".to_string())
+        );
+
+        let simple = row("fileio__read_file", None, 1, 10, 3);
+        assert_eq!(
+            namespace_key(&simple),
+            NamespaceKey::Derived("fileio".to_string())
+        );
+    }
+
+    #[test]
+    fn a_reported_namespace_wins_over_the_name_split() {
+        let r = row(
+            "home__assistant__get_state",
+            Some("mcp:homeassistant"),
+            1,
+            10,
+            3,
+        );
+        assert_eq!(
+            namespace_key(&r),
+            NamespaceKey::Reported("mcp:homeassistant".to_string()),
+            "the registry knows the source qualifier; a name does not"
+        );
+    }
+
+    #[test]
+    fn a_derived_group_says_the_server_was_read_off_the_names() {
+        let derived = NamespaceKey::Derived("fileio".to_string());
+        let hint = derived.hint().expect("a derived group explains itself");
+        assert!(hint.contains("Read from the tool names"), "{hint}");
+        assert_eq!(
+            NamespaceKey::Reported("mcp:fileio".to_string()).hint(),
+            None,
+            "a server the daemon reported needs no explanation"
+        );
+        assert_eq!(
+            NamespaceKey::Unresolved.hint(),
+            Some(UNRESOLVED_NAMESPACE_HINT)
+        );
+    }
+
+    #[test]
+    fn a_name_that_carries_no_server_prefix_stays_unresolved() {
+        for bare in ["get_state", "__leading", "trailing__", "__", ""] {
+            let r = row(bare, None, 1, 10, 3);
+            assert_eq!(
+                namespace_key(&r),
+                NamespaceKey::Unresolved,
+                "no server can be read off {bare:?}"
+            );
+        }
+    }
+
     #[test]
     fn an_unreported_namespace_is_not_presented_as_a_server_named_unknown() {
         for missing in [None, Some(""), Some("   ")] {
@@ -851,11 +1103,14 @@ mod tests {
             !title.to_lowercase().contains("unknown"),
             "no server is called this: {title}"
         );
-        assert_eq!(NamespaceKey::Named("web".into()).title(), "web");
+        assert_eq!(NamespaceKey::Reported("web".into()).title(), "web");
     }
 
+    /// Bare names, no reported namespace, nothing to derive: one group, and it
+    /// says the server is not recorded. This is what today's daemon produces
+    /// for a conversation whose tools are not namespaced.
     #[test]
-    fn every_row_groups_under_the_unresolved_key_when_the_daemon_reports_no_server() {
+    fn every_row_groups_under_the_unresolved_key_when_no_server_can_be_established() {
         let rows = vec![
             row("list_dir", None, 40, 20_480, 5_120),
             row("fetch_page", None, 2, 81_920, 20_480),
@@ -883,7 +1138,7 @@ mod tests {
         let groups = group_by_namespace(&rows, SortAxis::Tokens);
         assert_eq!(
             groups[0].key,
-            NamespaceKey::Named("web".into()),
+            NamespaceKey::Reported("web".into()),
             "the group holding the heaviest tool comes first"
         );
         assert_eq!(
@@ -920,6 +1175,81 @@ mod tests {
             groups[1].subtotal_calls,
             groups[0].subtotal_calls
         );
+    }
+
+    /// Acceptance: an empty conversation shows the empty state, not an error.
+    /// The branch that decides between them is what this exercises - the
+    /// earlier test only checks the constant's own wording.
+    #[test]
+    fn a_failed_read_never_renders_as_an_empty_conversation() {
+        assert_eq!(status_text(&LoadState::Loaded, 0), EMPTY_STATE);
+
+        let failed = LoadState::Failed("no tool-usage store configured".to_string());
+        let line = status_text(&failed, 0);
+        assert!(line.contains("Error"), "{line}");
+        assert!(
+            !line.contains(EMPTY_STATE),
+            "a read that failed must not read as a conversation that called no tools: {line}"
+        );
+
+        // And the header must not answer with zeros nobody measured.
+        assert_eq!(totals_text(&failed, &[]), "");
+        assert_eq!(
+            totals_text(&LoadState::Loaded, &[]),
+            "0 tools - 0 calls - 0 tokens",
+            "a conversation that really called no tools has a measured zero"
+        );
+    }
+
+    #[test]
+    fn a_failed_reload_marks_the_figures_it_leaves_on_screen_as_stale() {
+        let rows = mixed_call_mix();
+        let failed = LoadState::Failed("connection reset".to_string());
+        let line = status_text(&failed, rows.len());
+        assert!(line.contains("Error"), "{line}");
+        assert!(
+            line.contains("last reading"),
+            "stale figures must be named as stale: {line}"
+        );
+        // The stale figures are still summarised, because they were measured.
+        assert_eq!(totals_text(&failed, &rows), format_totals(&totals(&rows)));
+    }
+
+    #[test]
+    fn a_load_in_flight_says_so_and_distinguishes_a_reload() {
+        assert_eq!(status_text(&LoadState::Loading, 0), "Loading...");
+        assert_eq!(status_text(&LoadState::Loading, 3), "Reloading...");
+        assert_eq!(status_text(&LoadState::Loaded, 3), "");
+    }
+
+    #[test]
+    fn bar_tooltip_never_compares_against_a_peak_that_does_not_exist() {
+        let line = bar_tooltip(0, 0, SortAxis::Tokens);
+        assert!(
+            !line.contains('%'),
+            "with no heaviest tool there is no share to state: {line}"
+        );
+        assert!(line.contains("nothing recorded"), "{line}");
+    }
+
+    #[test]
+    fn bar_tooltip_does_not_round_a_real_figure_down_to_nothing() {
+        let line = bar_tooltip(1, 10_000, SortAxis::Tokens);
+        assert!(
+            line.contains("under 1%"),
+            "a small but real figure must not read as none: {line}"
+        );
+        assert!(!line.contains("0%"), "{line}");
+
+        assert!(bar_tooltip(0, 10_000, SortAxis::Tokens).contains("0%"));
+        assert!(bar_tooltip(5_000, 10_000, SortAxis::Tokens).contains("50%"));
+    }
+
+    #[test]
+    fn the_window_title_names_the_conversation_it_is_bound_to() {
+        assert_eq!(window_title("Trip planning"), "Tool Usage - Trip planning");
+        assert_eq!(window_title("  "), "Tool Usage");
+        assert_eq!(window_title(""), "Tool Usage");
     }
 
     #[test]
@@ -1023,7 +1353,7 @@ mod tests {
         let groups = group_by_namespace(&mixed_call_mix(), SortAxis::Tokens);
         let fileio = groups
             .iter()
-            .find(|g| g.key == NamespaceKey::Named("fileio".into()))
+            .find(|g| g.key == NamespaceKey::Reported("fileio".into()))
             .expect("fileio group");
         let heading = format_group_heading(fileio);
         assert!(heading.contains("fileio"), "{heading}");

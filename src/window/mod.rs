@@ -1246,13 +1246,23 @@ impl AdelieWindow {
                     );
                     return;
                 }
-                let Some(conv_id) = state.borrow().current_conversation_id.clone() else {
+                let (conv_id, conv_title) = {
+                    let s = state.borrow();
+                    (
+                        s.current_conversation_id.clone(),
+                        s.current_conversation()
+                            .map(|c| c.title.clone())
+                            .unwrap_or_default(),
+                    )
+                };
+                let Some(conv_id) = conv_id else {
                     status_label.set_text("Open a conversation first to see its tool usage");
                     return;
                 };
                 let view = crate::widgets::tool_usage::ToolUsageWindow::new(
                     &window,
                     conv_id,
+                    &conv_title,
                     connector,
                     Rc::clone(&bridge),
                 );
