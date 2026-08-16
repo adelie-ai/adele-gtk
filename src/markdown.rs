@@ -10,7 +10,7 @@
 //! What stays here is the part that is genuinely GTK's: turning this client's
 //! message list into the transcript markup its page expects, avatars and all.
 
-use desktop_assistant_client_common::MessageKind;
+use crate::transcript::TranscriptEntry;
 
 // Re-exported at the old paths so call sites (`markdown::html_template`,
 // `markdown::markdown_to_html`) are unchanged.
@@ -45,14 +45,26 @@ fn avatar_img(url: &str, alt: &str) -> String {
 }
 
 /// Render a full set of chat messages into an HTML document body.
+///
+/// Each message carries `data-turn-index`, its position in `messages`. That is
+/// what the transcript's right-click hit test resolves a pointer position to
+/// (gtk#169). The index, not the turn id itself: the page never needs the id,
+/// and markup a hostile reply shares a document with is the last place to put
+/// one.
 pub fn render_messages_html(
-    messages: &[(String, String, MessageKind)],
+    messages: &[TranscriptEntry],
     streaming_buffer: Option<&str>,
     avatars: &AvatarUrls,
 ) -> String {
     let mut html = String::new();
 
-    for (role, content, kind) in messages {
+    for (index, entry) in messages.iter().enumerate() {
+        let TranscriptEntry {
+            role,
+            content,
+            kind,
+            ..
+        } = entry;
         let (class, label, avatar_html) = match role.as_str() {
             "user" => (
                 "message user-message",
@@ -71,7 +83,7 @@ pub fn render_messages_html(
 
         let content_html = markdown_to_html(content);
         html.push_str(&format!(
-            r#"<div class="{class}">{avatar_html}<div class="bubble"><div class="label">{label}</div><div class="content">{content_html}</div></div></div>"#
+            r#"<div class="{class}" data-turn-index="{index}">{avatar_html}<div class="bubble"><div class="label">{label}</div><div class="content">{content_html}</div></div></div>"#
         ));
     }
 
@@ -91,6 +103,11 @@ pub fn render_messages_html(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use desktop_assistant_client_common::MessageKind;
+
+    fn msg(role: &str, content: &str) -> TranscriptEntry {
+        TranscriptEntry::new(role, content, MessageKind::Normal, None)
+    }
 
     fn test_avatars() -> AvatarUrls {
         AvatarUrls {
@@ -101,19 +118,62 @@ mod tests {
 
     #[test]
     fn render_messages_produces_html() {
-        let messages = vec![
-            ("user".to_string(), "Hello".to_string(), MessageKind::Normal),
-            (
-                "assistant".to_string(),
-                "Hi there!".to_string(),
-                MessageKind::Normal,
-            ),
-        ];
+        let messages = vec![msg("user", "Hello"), msg("assistant", "Hi there!")];
         let html = render_messages_html(&messages, None, &test_avatars());
         assert!(html.contains("user-message"));
         assert!(html.contains("assistant-message"));
         assert!(html.contains("Hello"));
         assert!(html.contains("Hi there!"));
+    }
+
+    #[test]
+    fn every_message_carries_its_transcript_index() {
+        // The transcript hit test (gtk#169) resolves a pointer position to a
+        // message by this attribute, so every message must carry its own.
+        let messages = vec![
+            msg("user", "one"),
+            msg("assistant", "two"),
+            msg("user", "three"),
+        ];
+        let html = render_messages_html(&messages, None, &test_avatars());
+        for index in 0..messages.len() {
+            assert!(
+                html.contains(&format!(r#"data-turn-index="{index}""#)),
+                "message {index} carries no transcript index: {html}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_turn_id_reaches_the_page_from_any_entry() {
+        // The page is shared with assistant and tool output. Every entry gets
+        // its index; no entry's id leaves the host side, whatever its role or
+        // presentation kind, and whether or not a reply is streaming.
+        let ids = ["turn-01234567", "turn-89abcdef", "turn-fedcba98"];
+        let messages = vec![
+            TranscriptEntry::new("user", "hi", MessageKind::Normal, Some(ids[0].to_string())),
+            TranscriptEntry::new(
+                "assistant",
+                "hello",
+                MessageKind::Normal,
+                Some(ids[1].to_string()),
+            ),
+            TranscriptEntry::new(
+                "assistant",
+                "spoken aside",
+                MessageKind::Spoken,
+                Some(ids[2].to_string()),
+            ),
+        ];
+        for streaming in [None, Some("partial")] {
+            let html = render_messages_html(&messages, streaming, &test_avatars());
+            for id in ids {
+                assert!(
+                    !html.contains(id),
+                    "the turn id {id} must not be rendered into the page: {html}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -127,14 +187,7 @@ mod tests {
 
     #[test]
     fn render_messages_includes_avatar_images() {
-        let messages = vec![
-            ("user".to_string(), "Hi".to_string(), MessageKind::Normal),
-            (
-                "assistant".to_string(),
-                "Hello".to_string(),
-                MessageKind::Normal,
-            ),
-        ];
+        let messages = vec![msg("user", "Hi"), msg("assistant", "Hello")];
         let html = render_messages_html(&messages, None, &test_avatars());
         assert!(html.contains(r#"src="file:///tmp/user.png""#));
         assert!(html.contains(r#"src="file:///tmp/adele.png""#));
@@ -146,7 +199,7 @@ mod tests {
             adele: "file:///tmp/adele.png".to_string(),
             user: String::new(),
         };
-        let messages = vec![("user".to_string(), "Hi".to_string(), MessageKind::Normal)];
+        let messages = vec![msg("user", "Hi")];
         let html = render_messages_html(&messages, None, &avatars);
         assert!(html.contains("avatar-fallback"));
         assert!(html.contains(">Y</div>")); // "Y" from "You"
@@ -189,11 +242,7 @@ mod tests {
         };
         // Role labels in render_messages_html are ASCII ("You" / "Adele"),
         // so to trigger the original bug we exercise avatar_img directly above.
-        let messages = vec![(
-            "assistant".to_string(),
-            "hi".to_string(),
-            MessageKind::Normal,
-        )];
+        let messages = vec![msg("assistant", "hi")];
         let _ = render_messages_html(&messages, None, &avatars);
     }
 
@@ -208,11 +257,7 @@ mod tests {
                        <iframe src=\"javascript:alert(1)\"></iframe>\n\n\
                        <a href=\"javascript:alert(1)\" onclick=\"alert(2)\">click</a>\n\n\
                        Bye!";
-        let messages = vec![(
-            "assistant".to_string(),
-            hostile.to_string(),
-            MessageKind::Normal,
-        )];
+        let messages = vec![msg("assistant", hostile)];
         let html = render_messages_html(&messages, None, &test_avatars());
 
         // Legitimate content survives.

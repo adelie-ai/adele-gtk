@@ -33,6 +33,9 @@ mod profile;
 mod selected_models;
 mod telemetry;
 mod theme;
+// Transcript entries and the turn-identity decisions the chat view makes
+// (gtk#169), kept free of GTK types so they are testable on their own.
+mod transcript;
 mod voice_client;
 mod voice_config;
 mod voice_embedded;

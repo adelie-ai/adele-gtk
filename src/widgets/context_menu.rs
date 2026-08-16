@@ -18,6 +18,10 @@ use gtk4::{Box as GtkBox, Button, Orientation, Popover, Widget, glib};
 pub struct MenuItem {
     pub label: String,
     pub destructive: bool,
+    /// Whether the entry can be chosen. A shown-but-unavailable entry tells a
+    /// person the action exists here and is not available for this row, which
+    /// a silently missing entry does not.
+    pub sensitive: bool,
     pub action: Box<dyn Fn()>,
 }
 
@@ -27,6 +31,7 @@ impl MenuItem {
         Self {
             label: label.into(),
             destructive: false,
+            sensitive: true,
             action: Box::new(action),
         }
     }
@@ -37,7 +42,19 @@ impl MenuItem {
         Self {
             label: label.into(),
             destructive: true,
+            sensitive: true,
             action: Box::new(action),
+        }
+    }
+
+    /// A shown-but-unavailable entry. It carries no action at all, so an entry
+    /// offered when its subject is missing cannot act on a substitute.
+    pub fn unavailable(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            destructive: false,
+            sensitive: false,
+            action: Box::new(|| {}),
         }
     }
 }
@@ -67,6 +84,7 @@ pub fn show(widget: &Widget, x: f64, y: f64, items: Vec<MenuItem>) {
         if item.destructive {
             button.add_css_class("destructive-action");
         }
+        button.set_sensitive(item.sensitive);
         let action = item.action;
         button.connect_clicked(glib::clone!(
             #[weak]
