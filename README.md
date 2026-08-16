@@ -7,6 +7,12 @@ Connects to the `desktop-assistant-daemon` over WebSocket or D-Bus.
 
 - **Streaming chat** rendered via a WebKitGTK web view (with a Label-based
   fallback when WebKit is unavailable).
+- **Copy turn id** from the transcript's right-click menu, ready to paste into
+  `adele inspect turn`. A turn's id is the idempotency key the client sends and
+  the daemon stores on the turn's user message, so the entry is shown and
+  cannot be chosen for a turn that has none - a message stored before the
+  daemon kept keys, one another client sent, or one that arrived over the D-Bus
+  conversation API.
 - **Connection profiles** with login screen, multi-window support, and
   conversation archival.
 - **Per-conversation model picker** in the chat header, plus a Select Models
