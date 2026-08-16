@@ -197,6 +197,11 @@ impl ToolUsageWindow {
         totals_label.set_margin_start(12);
         totals_label.set_margin_end(12);
         totals_label.set_margin_top(10);
+        totals_label.set_tooltip_text(Some(
+            "Counted across the whole conversation. Bytes are measured; tokens are \
+             estimated by the same rule the context budget uses, so the two figures \
+             are comparable.",
+        ));
         totals_label.add_css_class("tool-usage-totals");
         body.append(&totals_label);
 
@@ -609,20 +614,29 @@ pub fn eviction_note(row: &api::ToolUsageView) -> Option<String> {
 }
 
 /// Bytes as a person reads them: `845 B`, `1.2 KiB`, `3.4 MiB`.
+///
+/// The unit is chosen against the figure AFTER rounding to one decimal, not
+/// before, so a size just under a boundary reads as `1.0 MiB` rather than the
+/// arithmetically correct but jarring `1024.0 KiB`.
 pub fn format_bytes(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-    let value = bytes as f64;
-    if value < KIB {
-        format!("{bytes} B")
-    } else if value < MIB {
-        format!("{:.1} KiB", value / KIB)
-    } else if value < GIB {
-        format!("{:.1} MiB", value / MIB)
-    } else {
-        format!("{:.1} GiB", value / GIB)
+    /// Where one decimal place starts rounding up to `1024.0`, which is the
+    /// point at which the next unit is the honest one.
+    const PROMOTE_AT: f64 = 1023.95;
+    const UNITS: [&str; 3] = ["KiB", "MiB", "GiB"];
+
+    let mut value = bytes as f64;
+    if value < PROMOTE_AT {
+        return format!("{bytes} B");
     }
+    let mut unit = UNITS[0];
+    for next in UNITS {
+        unit = next;
+        value /= 1024.0;
+        if value < PROMOTE_AT {
+            break;
+        }
+    }
+    format!("{value:.1} {unit}")
 }
 
 /// A count with thousands separators, so a five-figure token count is legible
@@ -731,8 +745,10 @@ mod tests {
         sort_rows(&mut ranked, SortAxis::Tokens);
         assert_eq!(ranked[0].tool_name, "fetch_page");
 
-        // The grouped view is what a person actually reads, and the heaviest
-        // tool must top it even though its server has the smaller subtotal.
+        // The grouped view is what a person actually reads, so the ranking has
+        // to survive grouping. This fixture does not separate the group-order
+        // rule from ordering by subtotal; the two `stays_the_first_row` tests
+        // below are the ones built to tell those apart.
         let groups = group_by_namespace(&rows, SortAxis::Tokens);
         assert_eq!(
             flat_names(&groups),
@@ -793,6 +809,16 @@ mod tests {
             note.contains("under-report"),
             "the note says the figures are a floor, not the whole story: {note}"
         );
+
+        // The original size of an overwritten result is not recoverable, so the
+        // note must not carry one. Without this, a later edit could append a
+        // guessed size and every assertion above would still pass.
+        for invented in ["B", "KiB", "MiB", "GiB"] {
+            assert!(
+                !note.contains(invented),
+                "the note must not state a size it cannot know: {note}"
+            );
+        }
 
         let intact = row("fetch_page", Some("web"), 4, 8_192, 2_048);
         assert_eq!(eviction_note(&intact), None);
@@ -945,6 +971,18 @@ mod tests {
         assert_eq!(format_bytes(1_536), "1.5 KiB");
         assert_eq!(format_bytes(3_670_016), "3.5 MiB");
         assert_eq!(format_bytes(2_147_483_648), "2.0 GiB");
+        assert_eq!(format_bytes(1_023), "1023 B");
+        assert_eq!(format_bytes(1_024), "1.0 KiB");
+    }
+
+    /// A size just under a unit boundary rounds up to `1024.0` at one decimal.
+    /// The next unit is the honest reading, and the figure must not be printed
+    /// in a unit it has already outgrown.
+    #[test]
+    fn format_bytes_promotes_the_unit_at_a_rounding_boundary() {
+        assert_eq!(format_bytes(1_048_575), "1.0 MiB");
+        assert_eq!(format_bytes(1_073_741_823), "1.0 GiB");
+        assert_eq!(format_bytes(u64::MAX), "17179869184.0 GiB");
     }
 
     #[test]

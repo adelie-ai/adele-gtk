@@ -450,9 +450,9 @@ entry:focus {
     border-color: alpha(#88d6f0, 0.40);
 }
 
-/* Per-conversation tool-usage cost view (#144). The header totals and the
-   group headings carry the brand teal so the two reading levels - whole
-   conversation, then one server - separate at a glance. */
+/* Per-conversation tool-usage cost view (#144). The header totals take the
+   brand teal and the group headings the header blue, so the two reading
+   levels - whole conversation, then one server - separate at a glance. */
 .tool-usage-totals {
     color: #84dac1;
     font-weight: bold;
