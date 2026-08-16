@@ -56,6 +56,10 @@ pub const DERIVED_NAMESPACE_HINT: &str =
 /// this client has to agree with.
 const NAMESPACE_SEP: &str = "__";
 
+/// Said of figures still on screen from a read that has since failed. Named
+/// once so the wording cannot drift between the failed and the retrying case.
+pub const STALE_FIGURES: &str = "the figures below are from the last reading.";
+
 /// The sort options, in the order the control offers them. The first is the
 /// default: "what ate my context" is the question this view exists for.
 const SORT_AXES: [SortAxis; 2] = [SortAxis::Tokens, SortAxis::Calls];
@@ -160,12 +164,27 @@ pub struct Totals {
 }
 
 /// Internal messages from async work back to the main thread.
+///
+/// Each carries the generation of the read that produced it. Responses are
+/// correlated by id and time out independently, so a stalled read can answer
+/// after a later one already has; without the stamp the older answer would
+/// overwrite the newer, and a timeout could put an error over figures that a
+/// successful read had just refreshed.
 enum UsageMsg {
-    Loaded(Vec<api::ToolUsageView>),
-    Error(String),
+    Loaded {
+        generation: u64,
+        rows: Vec<api::ToolUsageView>,
+    },
+    Error {
+        generation: u64,
+        message: String,
+    },
 }
 
-/// Whether the figures on screen came from an answer, and from which one.
+/// How the last read ended. Whether another one is in flight is tracked
+/// separately, because the two are independent: a refresh that is still
+/// running does not undo the fact that the figures under it came from a
+/// failure.
 ///
 /// The view cannot infer this from the rows. An empty list means "this
 /// conversation called no tools"; a failed read means "nobody knows what it
@@ -173,8 +192,8 @@ enum UsageMsg {
 /// as the first is the one reading this window must never give.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadState {
-    /// The first read has not come back yet.
-    Loading,
+    /// No read has come back yet.
+    Never,
     /// The daemon answered. An empty list is a real answer.
     Loaded,
     /// The daemon could not answer. Any rows on screen are from an earlier
@@ -187,9 +206,16 @@ struct UsageState {
     rows: Vec<api::ToolUsageView>,
     axis: SortAxis,
     load: LoadState,
-    /// Namespaces the user collapsed. Held here rather than on the widgets so
-    /// the choice survives a re-sort and a reload, both of which rebuild every
-    /// expander from scratch.
+    /// A read is outstanding. Separate from `load`, which is the last outcome.
+    in_flight: bool,
+    /// Bumped on every read. A response stamped with anything older is
+    /// discarded, so the newest read is the one that decides what is shown.
+    generation: u64,
+    /// Namespaces the user collapsed. Held here rather than on the widgets
+    /// because a re-sort and a reload both rebuild every expander from
+    /// scratch, which would otherwise drop the choice. Held by construction:
+    /// this crate has no test that instantiates a GTK widget, so nothing
+    /// exercises the restore.
     collapsed: HashSet<NamespaceKey>,
 }
 
@@ -206,8 +232,10 @@ impl ToolUsageWindow {
     ///
     /// `conversation_title` names the conversation in the window title. The
     /// window is bound to the conversation open when it was built and does not
-    /// follow the main window, so two of these side by side have to be
-    /// tellable apart.
+    /// follow the main window, so the title says which conversation the
+    /// figures describe. It is the conversation's own title and is not made
+    /// unique: two conversations sharing a title, or one whose detail has not
+    /// loaded, give two windows a reader has to tell apart by position.
     pub fn new(
         parent: &ApplicationWindow,
         conversation_id: String,
@@ -256,9 +284,8 @@ impl ToolUsageWindow {
         totals_label.set_margin_end(12);
         totals_label.set_margin_top(10);
         totals_label.set_tooltip_text(Some(
-            "Counted across the whole conversation. Bytes are measured; tokens are \
-             estimated by the same rule the context budget uses, so the two figures \
-             are comparable.",
+            "Counted across the whole conversation. The token figure is an \
+             estimate, made by the same rule the context budget uses.",
         ));
         totals_label.add_css_class("tool-usage-totals");
         body.append(&totals_label);
@@ -289,7 +316,9 @@ impl ToolUsageWindow {
         let state = Rc::new(RefCell::new(UsageState {
             rows: Vec::new(),
             axis: SORT_AXES[0],
-            load: LoadState::Loading,
+            load: LoadState::Never,
+            in_flight: false,
+            generation: 0,
             collapsed: HashSet::new(),
         }));
 
@@ -310,12 +339,18 @@ impl ToolUsageWindow {
                 // Snapshot and release the borrow before rendering: the
                 // expanders built below install handlers that take a mutable
                 // borrow of this same cell.
-                let (rows, axis, collapsed, load) = {
+                let (rows, axis, collapsed, load, in_flight) = {
                     let s = state.borrow();
-                    (s.rows.clone(), s.axis, s.collapsed.clone(), s.load.clone())
+                    (
+                        s.rows.clone(),
+                        s.axis,
+                        s.collapsed.clone(),
+                        s.load.clone(),
+                        s.in_flight,
+                    )
                 };
                 totals_label.set_text(&totals_text(&load, &rows));
-                status_label.set_text(&status_text(&load, rows.len()));
+                status_label.set_text(&status_text(&load, in_flight, rows.len()));
                 render_groups(&content, &rows, axis, &collapsed, &state);
             }
         ));
@@ -334,7 +369,12 @@ impl ToolUsageWindow {
             #[strong]
             repaint,
             move || {
-                state.borrow_mut().load = LoadState::Loading;
+                let generation = {
+                    let mut s = state.borrow_mut();
+                    s.generation += 1;
+                    s.in_flight = true;
+                    s.generation
+                };
                 repaint();
                 let transport = Arc::clone(&transport);
                 let msg_tx = msg_tx.clone();
@@ -344,8 +384,11 @@ impl ToolUsageWindow {
                         management_client::get_tool_usage(transport.client(), conversation_id)
                             .await;
                     let _ = match result {
-                        Ok(rows) => msg_tx.send(UsageMsg::Loaded(rows)),
-                        Err(e) => msg_tx.send(UsageMsg::Error(e.to_string())),
+                        Ok(rows) => msg_tx.send(UsageMsg::Loaded { generation, rows }),
+                        Err(e) => msg_tx.send(UsageMsg::Error {
+                            generation,
+                            message: e.to_string(),
+                        }),
                     };
                 });
             }
@@ -358,22 +401,35 @@ impl ToolUsageWindow {
             repaint,
             async move {
                 while let Some(msg) = msg_rx.recv().await {
-                    match msg {
-                        UsageMsg::Loaded(rows) => {
-                            let mut s = state.borrow_mut();
-                            s.rows = rows;
-                            s.load = LoadState::Loaded;
-                            drop(s);
-                            repaint();
+                    let (generation, outcome) = match msg {
+                        UsageMsg::Loaded { generation, rows } => (generation, Ok(rows)),
+                        UsageMsg::Error {
+                            generation,
+                            message,
+                        } => (generation, Err(message)),
+                    };
+                    {
+                        let mut s = state.borrow_mut();
+                        // A response from a superseded read decides nothing.
+                        // Letting a late timeout land would put an error over
+                        // figures a newer read had already refreshed.
+                        if generation != s.generation {
+                            continue;
                         }
-                        UsageMsg::Error(e) => {
-                            // Recorded, not just printed. A failure that lives
-                            // only in a label is erased by the next repaint,
-                            // and the view then reads as an empty conversation.
-                            state.borrow_mut().load = LoadState::Failed(e);
-                            repaint();
+                        s.in_flight = false;
+                        // The outcome is recorded, not just printed. A failure
+                        // that lives only in a label is erased by the next
+                        // repaint, and the view then reads as an empty
+                        // conversation.
+                        match outcome {
+                            Ok(rows) => {
+                                s.rows = rows;
+                                s.load = LoadState::Loaded;
+                            }
+                            Err(message) => s.load = LoadState::Failed(message),
                         }
                     }
+                    repaint();
                 }
             }
         ));
@@ -583,10 +639,12 @@ pub fn sort_rows(rows: &mut [api::ToolUsageView], axis: SortAxis) {
 
 /// The server key for a row.
 ///
-/// The daemon's `namespace` wins wherever it has one: it comes from the tool
-/// registry and is already source-qualified (`mcp:<server>`, `builtin:<group>`),
-/// which a name cannot tell you. A namespace that is absent, empty, or only
-/// whitespace is not a server with a blank name, so it falls through.
+/// The daemon's `namespace` wins wherever it has one, because it is resolved
+/// from the tool registry rather than guessed from a string. Its documented
+/// values are `builtin` or the MCP server hosting the tool; this code does not
+/// depend on that shape, and treats whatever arrives as the server's name. A
+/// namespace that is absent, empty, or only whitespace is not a server with a
+/// blank name, so it falls through.
 ///
 /// The fallback reads the server off a `{server}__{tool}` name, splitting on
 /// the LAST separator, because that is what the daemon's own
@@ -722,7 +780,11 @@ pub fn bar_tooltip(value: u64, peak: u64, axis: SortAxis) -> String {
         return format!("{}: nothing recorded on this axis", axis.label());
     }
     let share = bar_fraction(value, peak) * 100.0;
-    let reading = if value > 0 && share < 0.5 {
+    // Anything strictly under one percent is named as such rather than
+    // rounded. The bound is 1.0, not 0.5: `{:.0}` rounds half to even, so a
+    // share of exactly 0.5 formats as "0" and a real figure would read as
+    // none at all.
+    let reading = if value > 0 && share < 1.0 {
         "under 1%".to_string()
     } else {
         format!("{share:.0}%")
@@ -743,23 +805,32 @@ pub fn window_title(conversation_title: &str) -> String {
     }
 }
 
-/// The status line for a load outcome and the number of rows it left on screen.
+/// What the status line says, given the last outcome, whether a read is in
+/// flight, and how many rows are on screen.
 ///
 /// The empty state and a failed read are different answers and must never
 /// share a rendering: "this conversation called no tools" is about the
-/// conversation, and "the daemon could not answer" is not. Where a failure
-/// leaves an earlier reading on screen, the line says the figures are stale
-/// rather than letting them pass as current.
-pub fn status_text(load: &LoadState, row_count: usize) -> String {
+/// conversation, and "the daemon could not answer" is not.
+///
+/// Figures left over from a failure stay marked as stale for as long as they
+/// are on screen, including while a retry is running. Dropping the marker for
+/// the length of the retry would let them read as current at exactly the
+/// moment nobody knows whether they are.
+pub fn status_text(load: &LoadState, in_flight: bool, row_count: usize) -> String {
+    if in_flight {
+        return match load {
+            LoadState::Never => "Loading...".to_string(),
+            LoadState::Loaded => "Reloading...".to_string(),
+            LoadState::Failed(_) if row_count == 0 => "Reloading...".to_string(),
+            LoadState::Failed(_) => format!("Reloading... - {STALE_FIGURES}"),
+        };
+    }
     match load {
-        LoadState::Loading if row_count == 0 => "Loading...".to_string(),
-        LoadState::Loading => "Reloading...".to_string(),
+        LoadState::Never => String::new(),
         LoadState::Loaded if row_count == 0 => EMPTY_STATE.to_string(),
         LoadState::Loaded => String::new(),
         LoadState::Failed(error) if row_count == 0 => format!("Error: {error}"),
-        LoadState::Failed(error) => {
-            format!("Error: {error} - the figures below are from the last reading.")
-        }
+        LoadState::Failed(error) => format!("Error: {error} - {STALE_FIGURES}"),
     }
 }
 
@@ -797,8 +868,8 @@ pub fn eviction_note(row: &api::ToolUsageView) -> Option<String> {
         return None;
     }
     Some(format!(
-        "{} of these results are now read as a pointer",
-        format_thousands(u64::from(row.evicted_results)),
+        "{} now read as a pointer",
+        pluralize(u64::from(row.evicted_results), "result"),
     ))
 }
 
@@ -1008,8 +1079,9 @@ mod tests {
 
         // The original size of an overwritten result is not recoverable, so the
         // note must not carry one. Without this, a later edit could append a
-        // guessed size and every assertion above would still pass.
-        for invented in ["B", "KiB", "MiB", "GiB"] {
+        // guessed size and every assertion above would still pass. The list is
+        // every unit `format_bytes` can emit, plus the spelled-out word.
+        for invented in ["B", "KiB", "MiB", "GiB", "byte"] {
             assert!(
                 !note.contains(invented),
                 "the note must not state a size it cannot know: {note}"
@@ -1055,20 +1127,48 @@ mod tests {
         );
     }
 
+    /// Whatever the daemon reports wins, whatever its shape. The documented
+    /// values are `builtin` or a server name, but this must not depend on
+    /// that: a resolved answer beats one guessed from a string either way.
     #[test]
     fn a_reported_namespace_wins_over_the_name_split() {
-        let r = row(
-            "home__assistant__get_state",
-            Some("mcp:homeassistant"),
-            1,
-            10,
-            3,
+        for reported in ["homeassistant", "builtin", "some:future:shape"] {
+            let r = row("home__assistant__get_state", Some(reported), 1, 10, 3);
+            assert_eq!(
+                namespace_key(&r),
+                NamespaceKey::Reported(reported.to_string()),
+                "a resolved namespace beats the name split"
+            );
+        }
+    }
+
+    /// `Reported("fileio")` and `Derived("fileio")` are different keys, so the
+    /// same server can land in two groups once the daemon starts resolving
+    /// namespaces. That is honest - one is known, one is inferred - but only
+    /// while a reader can see which is which from the heading alone.
+    #[test]
+    fn a_reported_and_a_derived_group_of_the_same_name_stay_distinguishable() {
+        let groups = group_by_namespace(
+            &[
+                row("read_file", Some("fileio"), 1, 4_096, 1_024),
+                row("fileio__list_dir", None, 1, 4_096, 1_024),
+            ],
+            SortAxis::Tokens,
         );
-        assert_eq!(
-            namespace_key(&r),
-            NamespaceKey::Reported("mcp:homeassistant".to_string()),
-            "the registry knows the source qualifier; a name does not"
+        assert_eq!(groups.len(), 2);
+        let headings: Vec<String> = groups.iter().map(format_group_heading).collect();
+        assert_ne!(
+            headings[0], headings[1],
+            "two groups for one server must not share a heading: {headings:?}"
         );
+    }
+
+    /// The tie-break between groups falls through to the key, so the variant
+    /// order is load-bearing. Nothing else would notice it being changed.
+    #[test]
+    fn a_reported_server_outranks_a_derived_one_and_both_outrank_the_unknown() {
+        assert!(NamespaceKey::Reported("zzz".into()) < NamespaceKey::Derived("aaa".into()));
+        assert!(NamespaceKey::Derived("zzz".into()) < NamespaceKey::Unresolved);
     }
 
     #[test]
@@ -1190,10 +1290,10 @@ mod tests {
     /// earlier test only checks the constant's own wording.
     #[test]
     fn a_failed_read_never_renders_as_an_empty_conversation() {
-        assert_eq!(status_text(&LoadState::Loaded, 0), EMPTY_STATE);
+        assert_eq!(status_text(&LoadState::Loaded, false, 0), EMPTY_STATE);
 
         let failed = LoadState::Failed("no tool-usage store configured".to_string());
-        let line = status_text(&failed, 0);
+        let line = status_text(&failed, false, 0);
         assert!(line.contains("Error"), "{line}");
         assert!(
             !line.contains(EMPTY_STATE),
@@ -1210,24 +1310,41 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_reload_marks_the_figures_it_leaves_on_screen_as_stale() {
+    fn a_failed_read_marks_its_leftover_figures_stale_in_the_status_line() {
         let rows = mixed_call_mix();
         let failed = LoadState::Failed("connection reset".to_string());
-        let line = status_text(&failed, rows.len());
+        let line = status_text(&failed, false, rows.len());
         assert!(line.contains("Error"), "{line}");
         assert!(
-            line.contains("last reading"),
+            line.contains(STALE_FIGURES),
             "stale figures must be named as stale: {line}"
         );
-        // The stale figures are still summarised, because they were measured.
+        // The header still summarises them, because they were measured. Only
+        // the status line carries the staleness; the figures are not annotated.
         assert_eq!(totals_text(&failed, &rows), format_totals(&totals(&rows)));
+    }
+
+    /// Retrying a failed read must not quietly un-mark the figures it is
+    /// retrying over. They are least trustworthy while nobody knows whether
+    /// the retry will succeed.
+    #[test]
+    fn figures_left_by_a_failure_stay_marked_stale_while_the_retry_runs() {
+        let failed = LoadState::Failed("connection reset".to_string());
+        let line = status_text(&failed, true, 3);
+        assert!(line.contains("Reloading"), "{line}");
+        assert!(
+            line.contains(STALE_FIGURES),
+            "a retry must not drop the stale marker: {line}"
+        );
+        // With nothing on screen there is nothing to call stale.
+        assert_eq!(status_text(&failed, true, 0), "Reloading...");
     }
 
     #[test]
     fn a_load_in_flight_says_so_and_distinguishes_a_reload() {
-        assert_eq!(status_text(&LoadState::Loading, 0), "Loading...");
-        assert_eq!(status_text(&LoadState::Loading, 3), "Reloading...");
-        assert_eq!(status_text(&LoadState::Loaded, 3), "");
+        assert_eq!(status_text(&LoadState::Never, true, 0), "Loading...");
+        assert_eq!(status_text(&LoadState::Loaded, true, 3), "Reloading...");
+        assert_eq!(status_text(&LoadState::Loaded, false, 3), "");
     }
 
     #[test]
@@ -1251,6 +1368,20 @@ mod tests {
 
         assert!(bar_tooltip(0, 10_000, SortAxis::Tokens).contains("0%"));
         assert!(bar_tooltip(5_000, 10_000, SortAxis::Tokens).contains("50%"));
+    }
+
+    /// The boundary the guard exists for. `{:.0}` rounds half to even, so a
+    /// share of exactly 0.5% formats as "0" - a real figure reading as none.
+    /// One call against a peak of 200 hits it exactly.
+    #[test]
+    fn bar_tooltip_names_a_share_of_exactly_half_a_percent_as_under_one() {
+        let line = bar_tooltip(1, 200, SortAxis::Calls);
+        assert!(
+            line.contains("under 1%"),
+            "0.5% must not round to nothing: {line}"
+        );
+        // Just above the guard, the ordinary rounding takes over.
+        assert!(bar_tooltip(1, 100, SortAxis::Calls).contains("1%"));
     }
 
     #[test]
