@@ -840,6 +840,62 @@ mod tests {
         assert_eq!(flat_names(&groups), vec!["fetch_page", "list_dir"]);
     }
 
+    /// The group order is the one decision that separates "what ate my
+    /// context" from "which server did the most work". A server with three
+    /// medium tools out-subtotals a server with one huge one, so ordering
+    /// groups by subtotal would bury the heaviest tool below three lighter
+    /// ones. This fixture is built so the two rules disagree.
+    #[test]
+    fn the_heaviest_tool_stays_the_first_row_even_when_another_server_out_subtotals_it() {
+        let rows = vec![
+            row("fetch_page", Some("web"), 1, 40_000, 10_000),
+            row("read_file", Some("fileio"), 1, 16_000, 4_000),
+            row("list_dir", Some("fileio"), 1, 16_000, 4_000),
+            row("stat_path", Some("fileio"), 1, 16_000, 4_000),
+        ];
+
+        let groups = group_by_namespace(&rows, SortAxis::Tokens);
+        assert_eq!(
+            groups[0].key,
+            NamespaceKey::Named("web".into()),
+            "the group holding the heaviest tool comes first"
+        );
+        assert_eq!(
+            flat_names(&groups)[0],
+            "fetch_page",
+            "the heaviest tool is the first row on screen"
+        );
+        assert!(
+            groups[1].subtotal_tokens > groups[0].subtotal_tokens,
+            "the fixture only proves the rule if the second group out-subtotals the first: \
+             {} vs {}",
+            groups[1].subtotal_tokens,
+            groups[0].subtotal_tokens
+        );
+    }
+
+    /// Same shape on the other axis: a chatty server out-subtotals the single
+    /// chattiest tool, and the chattiest tool still tops the view.
+    #[test]
+    fn the_chattiest_tool_stays_the_first_row_even_when_another_server_out_subtotals_it() {
+        let rows = vec![
+            row("fetch_page", Some("web"), 30, 4_000, 1_000),
+            row("read_file", Some("fileio"), 12, 4_000, 1_000),
+            row("list_dir", Some("fileio"), 12, 4_000, 1_000),
+            row("stat_path", Some("fileio"), 12, 4_000, 1_000),
+        ];
+
+        let groups = group_by_namespace(&rows, SortAxis::Calls);
+        assert_eq!(flat_names(&groups)[0], "fetch_page");
+        assert!(
+            groups[1].subtotal_calls > groups[0].subtotal_calls,
+            "the fixture only proves the rule if the second group out-subtotals the first: \
+             {} vs {}",
+            groups[1].subtotal_calls,
+            groups[0].subtotal_calls
+        );
+    }
+
     #[test]
     fn axis_value_reads_the_axis_it_names() {
         let r = row("t", None, 7, 100, 25);
