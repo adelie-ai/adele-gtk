@@ -681,9 +681,17 @@ pub fn format_totals(totals: &Totals) -> String {
 }
 
 /// The group heading: the server, its tool count, and its subtotals.
+///
+/// A derived server is qualified in the heading itself, not only in the hint
+/// line inside the group. The hint disappears when the group is collapsed, and
+/// a collapsed heading must still not read as a server the daemon reported.
 pub fn format_group_heading(group: &NamespaceGroup) -> String {
+    let qualifier = match group.key {
+        NamespaceKey::Derived(_) => " (from tool names)",
+        NamespaceKey::Reported(_) | NamespaceKey::Unresolved => "",
+    };
     format!(
-        "{} - {}, {}, {}, {}",
+        "{}{qualifier} - {}, {}, {}, {}",
         group.key.title(),
         pluralize(group.rows.len() as u64, "tool"),
         pluralize(group.subtotal_calls, "call"),
@@ -1371,6 +1379,30 @@ mod tests {
         assert!(
             !UNRESOLVED_NAMESPACE_HINT.to_lowercase().contains("unknown"),
             "the hint must not read as a server name: {UNRESOLVED_NAMESPACE_HINT}"
+        );
+    }
+
+    /// Collapsing a group hides the hint line inside it, so the heading has to
+    /// carry the qualifier on its own. Without this a collapsed derived group
+    /// is indistinguishable from a server the daemon actually reported.
+    #[test]
+    fn a_collapsed_derived_group_still_says_its_server_was_read_off_the_names() {
+        let derived = group_by_namespace(
+            &[row("fileio__read_file", None, 1, 4_096, 1_024)],
+            SortAxis::Tokens,
+        );
+        let heading = format_group_heading(&derived[0]);
+        assert!(heading.contains("fileio"), "{heading}");
+        assert!(heading.contains("from tool names"), "{heading}");
+
+        let reported = group_by_namespace(
+            &[row("read_file", Some("mcp:fileio"), 1, 4_096, 1_024)],
+            SortAxis::Tokens,
+        );
+        let heading = format_group_heading(&reported[0]);
+        assert!(
+            !heading.contains("from tool names"),
+            "a reported server is not qualified: {heading}"
         );
     }
 
