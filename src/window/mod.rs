@@ -396,6 +396,8 @@ impl AdelieWindow {
         // Wrap widgets in Rc for closures
         let sidebar = Rc::new(sidebar);
         let chat_view = Rc::new(RefCell::new(chat_view));
+        // Right-click a turn in the transcript to copy its id (gtk#169).
+        crate::widgets::chat_view::install_turn_context_menu(&chat_view);
         let input_bar = Rc::new(input_bar);
         let status_label = Rc::new(status_label);
         let base_status = Rc::new(RefCell::new("Connecting...".to_string()));
@@ -2129,7 +2131,12 @@ fn handle_ui_message(
                 }
             }
             Effect::AddUserMessage(content) => {
-                chat_view.borrow_mut().add_user_message(&content);
+                // A user message this client did not send - echoed live from a
+                // sibling client (#1). The key that started that turn stayed
+                // with the client that minted it, so the bubble carries no
+                // turn id until the conversation is reloaded and the daemon
+                // supplies the persisted one.
+                chat_view.borrow_mut().add_user_message(&content, None);
             }
             Effect::ReceiveChunk(chunk) => {
                 chat_view.borrow_mut().receive_chunk(&chunk);
@@ -2302,7 +2309,14 @@ fn handle_ui_message(
                 // the chat widget (the core is view-agnostic so it can't), clear
                 // the live composer, and run the actual RPC off the GTK loop.
                 if let Some(connector) = client.borrow().clone() {
-                    chat_view.borrow_mut().add_user_message(&prompt);
+                    // Stamp the optimistic bubble with the key this send is
+                    // about to carry (#570). It is the same value the daemon
+                    // persists as the turn's identity, so the turn is
+                    // right-clickable from the moment it is drawn rather than
+                    // only after a reload (gtk#169).
+                    chat_view
+                        .borrow_mut()
+                        .add_user_message(&prompt, idempotency_key.clone());
                     // Clear the live composer only for a direct user send; a
                     // background queue flush (same effect) must leave a fresh
                     // draft intact (see `user_initiated_send` above).

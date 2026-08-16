@@ -73,6 +73,58 @@ fn set_status_script(message: &str) -> String {
     )
 }
 
+/// Build the transcript hit-test statement for a pointer position, in CSS
+/// pixels relative to the WebView.
+///
+/// It reports the `data-turn-index` of the message under the pointer (`-1`
+/// when the pointer is over the page background) and the page's current
+/// selection, separated by the first newline. `x` and `y` are narrowed to
+/// integers before they are written into the statement, so the only thing this
+/// interpolates is two numbers.
+fn transcript_click_script(x: f64, y: f64) -> String {
+    let x = x as i32;
+    let y = y as i32;
+    format!(
+        "(function(){{\
+         var e=document.elementFromPoint({x},{y});\
+         var m=(e&&e.closest)?e.closest('[data-turn-index]'):null;\
+         var i=m?m.getAttribute('data-turn-index'):'-1';\
+         var s=window.getSelection?String(window.getSelection()):'';\
+         return i+'\\n'+s;}})()"
+    )
+}
+
+/// Resolve which transcript message is under a pointer position, and what the
+/// page has selected, then hand both to `on_result` on the GTK main loop.
+///
+/// Asynchronous because the DOM lives in the web process. A statement that
+/// fails (the page is still loading, the web process died) reports no entry
+/// and no selection rather than guessing at one.
+pub fn query_transcript_click(
+    webview: &WebView,
+    x: f64,
+    y: f64,
+    on_result: impl FnOnce(crate::transcript::TranscriptClick) + 'static,
+) {
+    let js = transcript_click_script(x, y);
+    webview.evaluate_javascript(
+        &js,
+        None,
+        None,
+        None::<&gtk4::gio::Cancellable>,
+        move |result| {
+            let click = match result {
+                Ok(value) => crate::transcript::parse_transcript_click(&value.to_str()),
+                Err(e) => {
+                    tracing::warn!("transcript hit test failed: {e}");
+                    crate::transcript::TranscriptClick::default()
+                }
+            };
+            on_result(click);
+        },
+    );
+}
+
 /// Update the webview with rendered messages HTML.
 pub fn update_messages(webview: &WebView, messages_html: &str) {
     let js = update_messages_script(messages_html);
@@ -106,6 +158,7 @@ pub fn clear_status(webview: &WebView) {
 mod tests {
     use super::*;
     use crate::markdown::{AvatarUrls, render_messages_html};
+    use crate::transcript::TranscriptEntry;
     use desktop_assistant_client_common::MessageKind;
 
     /// Every statement this module evaluates, for one message body.
@@ -137,10 +190,11 @@ mod tests {
         // transcript markup, and that markup is interpolated into the call this
         // module evaluates. It must arrive as one argument, not as code.
         let hostile = "he said \"x\");alert(document.cookie);//\n\nand <b>more</b>";
-        let messages = vec![(
-            "assistant".to_string(),
-            hostile.to_string(),
+        let messages = vec![TranscriptEntry::new(
+            "assistant",
+            hostile,
             MessageKind::Normal,
+            None,
         )];
         let body = render_messages_html(
             &messages,
@@ -182,5 +236,38 @@ mod tests {
             format!("appendChunk({encoded});")
         );
         assert_eq!(set_status_script(body), format!("setStatus({encoded});"));
+    }
+
+    // --- gtk#169: the transcript hit test ---------------------------------
+
+    #[test]
+    fn the_hit_test_statement_carries_the_pointer_position() {
+        let js = transcript_click_script(12.7, 34.2);
+        assert!(
+            js.contains("elementFromPoint(12,34)"),
+            "the pointer position must reach the statement: {js:?}"
+        );
+        assert!(js.contains("data-turn-index"), "{js:?}");
+    }
+
+    #[test]
+    fn the_hit_test_statement_interpolates_nothing_but_numbers() {
+        // The statement is evaluated host-side, which the page's pinned
+        // `script-src` does not cover, so anything interpolated into it runs
+        // as code. Only the two coordinates are, and they are integers by the
+        // time they get there.
+        for (x, y) in [(-1.0_f64, -1.0_f64), (0.0, 0.0), (4096.9, 2160.9)] {
+            let js = transcript_click_script(x, y);
+            let point = js
+                .split_once("elementFromPoint(")
+                .and_then(|(_, rest)| rest.split_once(')'))
+                .map(|(args, _)| args.to_string())
+                .unwrap_or_else(|| panic!("no hit-test call in {js:?}"));
+            for arg in point.split(',') {
+                arg.trim()
+                    .parse::<i32>()
+                    .unwrap_or_else(|e| panic!("{arg:?} is not an integer: {e}"));
+            }
+        }
     }
 }
