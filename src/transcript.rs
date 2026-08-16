@@ -89,6 +89,28 @@ pub fn turn_id_action(entries: &[TranscriptEntry], index: usize) -> TurnIdAction
     }
 }
 
+/// The turn-id action for the entry at `index`, where `index` was resolved
+/// against generation `clicked` and the transcript now stands at `current`.
+///
+/// An index is only a position, and a position means nothing once the
+/// transcript it counted into has been replaced. Resolving the pointer takes a
+/// round trip to the web process, and a reload can land inside it: a
+/// reconnect, a debug-view toggle, or the user switching conversation all
+/// replace every entry. The index would then still be in range and would name
+/// a different turn - in a different conversation, even - so the menu would
+/// offer a real id for a turn nobody pointed at. Refuse instead.
+pub fn turn_id_action_for_generation(
+    entries: &[TranscriptEntry],
+    current: u64,
+    clicked: u64,
+    index: usize,
+) -> TurnIdAction {
+    if current != clicked {
+        return TurnIdAction::Unavailable;
+    }
+    turn_id_action(entries, index)
+}
+
 /// The pointer-resolved context of one right-click in the transcript.
 #[cfg(feature = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -265,6 +287,47 @@ mod tests {
             TurnIdAction::Unavailable
         );
         assert_eq!(turn_id_action(&[], 0), TurnIdAction::Unavailable);
+    }
+
+    // --- a transcript that changed under a pending click -------------------
+
+    #[test]
+    fn a_click_resolved_against_a_replaced_transcript_offers_nothing() {
+        // The transcript was reloaded while the hit test was in flight. The
+        // index is still in range and now names a different turn, so it must
+        // not be answered.
+        let entries = vec![user("second conversation", Some("turn-b")), assistant("x")];
+        assert_eq!(
+            turn_id_action_for_generation(&entries, 7, 6, 0),
+            TurnIdAction::Unavailable
+        );
+    }
+
+    #[test]
+    fn a_click_resolved_against_the_same_transcript_is_answered() {
+        let entries = vec![user("why?", Some("turn-a")), assistant("because")];
+        assert_eq!(
+            turn_id_action_for_generation(&entries, 6, 6, 1),
+            TurnIdAction::Copy("turn-a".to_string())
+        );
+    }
+
+    #[test]
+    fn a_stale_click_is_refused_even_where_the_index_still_names_a_turn() {
+        // The failure this guard exists to stop is a real id for the wrong
+        // turn, not an out-of-range index: every entry here has an id.
+        let entries = vec![
+            user("a", Some("turn-a")),
+            assistant("x"),
+            user("b", Some("turn-b")),
+        ];
+        for index in 0..entries.len() {
+            assert_eq!(
+                turn_id_action_for_generation(&entries, 2, 1, index),
+                TurnIdAction::Unavailable,
+                "entry {index} answered a click made against an older transcript"
+            );
+        }
     }
 
     // --- resolving the pointer to an entry ---------------------------------

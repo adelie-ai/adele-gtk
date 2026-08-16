@@ -2310,24 +2310,13 @@ fn handle_ui_message(
                 // the live composer, and run the actual RPC off the GTK loop.
                 if let Some(connector) = client.borrow().clone() {
                     // Stamp the optimistic bubble with the key this send is
-                    // about to carry (#570), so the turn is right-clickable
-                    // from the moment it is drawn rather than only after a
-                    // reload (gtk#169) - but only where the send can carry
-                    // it. The D-Bus transport has no field for the key and
-                    // drops it (see the `None` arm below), so a bubble
-                    // stamped there would offer an id that no stored turn
-                    // has, which is worse than offering none. Same condition
-                    // the send itself branches on, read here because the
-                    // bubble is drawn before the send runs.
-                    let stored_turn_id = connector
-                        .client()
-                        .as_commands()
-                        .is_some()
-                        .then(|| idempotency_key.clone())
-                        .flatten();
+                    // about to carry (#570). Every transport carries it to
+                    // the daemon, which persists it as the turn's identity,
+                    // so the turn is right-clickable from the moment it is
+                    // drawn rather than only after a reload (gtk#169).
                     chat_view
                         .borrow_mut()
-                        .add_user_message(&prompt, stored_turn_id);
+                        .add_user_message(&prompt, idempotency_key.clone());
                     // Clear the live composer only for a direct user send; a
                     // background queue flush (same effect) must leave a fresh
                     // draft intact (see `user_initiated_send` above).

@@ -5,7 +5,7 @@ use desktop_assistant_client_common::{ConversationDetail, MessageKind};
 use gtk4::prelude::*;
 use gtk4::{Box as GtkBox, GestureClick, Orientation, Widget, glib};
 
-use crate::transcript::{TranscriptEntry, TurnIdAction, turn_id_action};
+use crate::transcript::{TranscriptEntry, TurnIdAction, turn_id_action_for_generation};
 use crate::widgets::context_menu;
 
 #[cfg(feature = "linux")]
@@ -37,6 +37,11 @@ pub struct ChatView {
     /// right-click menu copies (gtk#169), so neither has to be recovered by
     /// parsing the content back out.
     messages: Vec<TranscriptEntry>,
+    /// Bumped every time the entries are replaced wholesale, so a click whose
+    /// resolution is still in flight can tell that the positions it counted
+    /// into are gone. Appending a message does not bump it: an append leaves
+    /// every existing position where it was.
+    generation: u64,
     /// Where each entry begins in the `TextView` fallback's buffer, in
     /// ascending order. The fallback has no DOM to hit-test, so a right-click
     /// is resolved against these marks instead.
@@ -122,6 +127,7 @@ impl ChatView {
             #[cfg(not(feature = "linux"))]
             tags,
             messages: Vec::new(),
+            generation: 0,
             #[cfg(not(feature = "linux"))]
             entry_starts: Vec::new(),
             #[cfg(not(feature = "linux"))]
@@ -133,6 +139,7 @@ impl ChatView {
 
     /// Load a conversation's messages into the view.
     pub fn load_conversation(&mut self, detail: &ConversationDetail) {
+        self.generation = self.generation.wrapping_add(1);
         self.messages = detail
             .messages
             .iter()
@@ -211,9 +218,17 @@ impl ChatView {
         self.render();
     }
 
-    /// The turn-id action for the transcript entry at `index`.
-    pub fn turn_id_action(&self, index: usize) -> TurnIdAction {
-        turn_id_action(&self.messages, index)
+    /// Which transcript the entries currently belong to. Read when a click is
+    /// made, and handed back with the resolved index so a reload that lands in
+    /// between is caught.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The turn-id action for the entry at `index`, as resolved against
+    /// generation `clicked`.
+    pub fn turn_id_action_at(&self, clicked: u64, index: usize) -> TurnIdAction {
+        turn_id_action_for_generation(&self.messages, self.generation, clicked, index)
     }
 
     /// Append a client-local `say_this` line (issue #76, voice#126). Rendered in
@@ -228,6 +243,7 @@ impl ChatView {
 
     /// Clear the view.
     pub fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
         self.messages.clear();
         #[cfg(not(feature = "linux"))]
         self.entry_starts.clear();
@@ -299,14 +315,26 @@ pub fn install_turn_context_menu(chat: &Rc<RefCell<ChatView>>) {
     #[cfg(feature = "linux")]
     {
         let webview = chat.borrow().webview.clone();
-        // Take the transcript's secondary click over from WebKit. Its own menu
+        // Take the transcript's secondary CLICK over from WebKit. Its own menu
         // offers page actions - reload, navigation, view source - that mean
         // nothing in a transcript, and it cannot carry a turn entry, because
         // which turn the pointer is over is only answerable by the web
         // process, and the answer arrives after the menu would have to be
         // built. `Copy` is the one entry worth keeping, so the menu below
         // offers it whenever there is a selection to copy.
-        webview.connect_context_menu(|_webview, _menu, _hit| true);
+        //
+        // A keyboard request (Shift+F10, the Menu key) is left alone. It
+        // reaches no pointer gesture and carries no position to hit-test, so
+        // suppressing it too would leave the keyboard with no menu at all
+        // rather than with a lesser one. Anything this cannot positively
+        // identify as a keyboard request is suppressed, so an unrecognised
+        // trigger shows one menu rather than two.
+        webview.connect_context_menu(|_webview, menu, _hit| {
+            let from_keyboard = menu
+                .event()
+                .is_some_and(|event| matches!(event.event_type(), gtk4::gdk::EventType::KeyPress));
+            !from_keyboard
+        });
 
         let gesture = GestureClick::new();
         gesture.set_button(3);
@@ -326,10 +354,14 @@ pub fn install_turn_context_menu(chat: &Rc<RefCell<ChatView>>) {
                 let Some(widget) = gesture.widget() else {
                     return;
                 };
+                // Read now, checked when the answer comes back: the pointer is
+                // over THIS transcript, and the round trip below is long enough
+                // for a reload to replace it.
+                let clicked = chat.borrow().generation();
                 crate::webview::query_transcript_click(&webview, x, y, move |click| {
                     let action = click
                         .entry_index
-                        .map(|index| chat.borrow().turn_id_action(index))
+                        .map(|index| chat.borrow().turn_id_action_at(clicked, index))
                         .unwrap_or(TurnIdAction::Unavailable);
                     show_turn_menu(&widget, x, y, action, &click.selection);
                 });
@@ -370,7 +402,7 @@ pub fn install_turn_context_menu(chat: &Rc<RefCell<ChatView>>) {
                             iter.offset(),
                         )
                     })
-                    .map(|index| chat_ref.turn_id_action(index))
+                    .map(|index| chat_ref.turn_id_action_at(chat_ref.generation(), index))
                     .unwrap_or(TurnIdAction::Unavailable);
                 drop(chat_ref);
                 let selection = text_view
@@ -393,6 +425,14 @@ pub fn install_turn_context_menu(chat: &Rc<RefCell<ChatView>>) {
 /// person can see the action exists and is not offered here, instead of
 /// wondering whether they missed the target.
 fn show_turn_menu(widget: &Widget, x: f64, y: f64, action: TurnIdAction, selection: &str) {
+    // The WebView path answers the hit test after a round trip to the web
+    // process, and the window can close inside it. Parenting a popover to a
+    // widget that is no longer in a window is a GTK error, so drop the menu
+    // for a click whose target has gone.
+    if widget.root().is_none() {
+        return;
+    }
+
     let mut items = Vec::new();
 
     if !selection.is_empty() {
