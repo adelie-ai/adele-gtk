@@ -69,14 +69,19 @@ pub enum TurnIdAction {
 /// older turn's id is not this turn's id, and offering it would copy an id that
 /// points at the wrong turn - a worse failure than offering none.
 pub fn turn_id_action(entries: &[TranscriptEntry], index: usize) -> TurnIdAction {
-    let _ = index;
-    match entries
-        .iter()
-        .find(|entry| entry.is_user())
-        .and_then(|entry| entry.turn_id.clone())
-    {
-        Some(id) => TurnIdAction::Copy(id),
-        None => TurnIdAction::Unavailable,
+    let Some(window) = entries.get(..=index) else {
+        return TurnIdAction::Unavailable;
+    };
+    let Some(start) = window.iter().rposition(TranscriptEntry::is_user) else {
+        return TurnIdAction::Unavailable;
+    };
+    // Trimmed because what reaches the clipboard has to paste as it stands: a
+    // stored id padded with whitespace would otherwise carry invisible
+    // characters into `adele inspect turn`. An id that is only whitespace is
+    // no id at all.
+    match entries[start].turn_id.as_deref().map(str::trim) {
+        Some(id) if !id.is_empty() => TurnIdAction::Copy(id.to_string()),
+        _ => TurnIdAction::Unavailable,
     }
 }
 
@@ -99,9 +104,12 @@ pub struct TranscriptClick {
 /// selection describe different moments.
 #[cfg(feature = "linux")]
 pub fn parse_transcript_click(raw: &str) -> TranscriptClick {
+    let (head, selection) = raw.split_once('\n').unwrap_or((raw, ""));
     TranscriptClick {
-        entry_index: raw.trim().parse::<usize>().ok(),
-        selection: String::new(),
+        // Anything the page could not answer - `-1` for the background, an
+        // empty reply from a page that is still loading - parses to no entry.
+        entry_index: head.trim().parse::<usize>().ok(),
+        selection: selection.to_string(),
     }
 }
 
@@ -113,7 +121,7 @@ pub fn parse_transcript_click(raw: &str) -> TranscriptClick {
 /// marks instead.
 #[cfg(not(feature = "linux"))]
 pub fn entry_index_at_offset(starts: &[i32], offset: i32) -> Option<usize> {
-    starts.iter().position(|start| *start >= offset)
+    starts.iter().rposition(|start| *start <= offset)
 }
 
 #[cfg(test)]
