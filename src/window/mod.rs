@@ -250,6 +250,11 @@ impl AdelieWindow {
         tasks_btn.set_halign(Align::Fill);
         menu_box.append(&tasks_btn);
 
+        let tool_usage_btn = Button::with_label("Tool Usage");
+        tool_usage_btn.add_css_class("context-button");
+        tool_usage_btn.set_halign(Align::Fill);
+        menu_box.append(&tool_usage_btn);
+
         // Per-conversation personality override (#70). Opens a modal picker
         // pre-filled from the active conversation's stored override.
         let personality_btn = Button::with_label("Personality…");
@@ -1210,6 +1215,58 @@ impl AdelieWindow {
                     Rc::clone(&bridge),
                 );
                 browser.present();
+            }
+        ));
+
+        // Hamburger menu: Tool Usage -> what the tools cost this conversation
+        // (#144). Scoped to the open conversation, so it needs one; and it
+        // rides the command channel, which the D-Bus surface does not expose.
+        tool_usage_btn.connect_clicked(glib::clone!(
+            #[weak]
+            menu_popover,
+            #[weak]
+            window,
+            #[strong]
+            client,
+            #[strong]
+            bridge,
+            #[strong]
+            status_label,
+            #[strong]
+            state,
+            move |_| {
+                menu_popover.popdown();
+                let Some(connector) = client.borrow().clone() else {
+                    status_label.set_text("Not connected - tool usage unavailable");
+                    return;
+                };
+                if connector.client().as_commands().is_none() {
+                    status_label.set_text(
+                        "Tool usage requires a local-socket or WebSocket connection (not available over D-Bus)",
+                    );
+                    return;
+                }
+                let (conv_id, conv_title) = {
+                    let s = state.borrow();
+                    (
+                        s.current_conversation_id.clone(),
+                        s.current_conversation()
+                            .map(|c| c.title.clone())
+                            .unwrap_or_default(),
+                    )
+                };
+                let Some(conv_id) = conv_id else {
+                    status_label.set_text("Open a conversation first to see its tool usage");
+                    return;
+                };
+                let view = crate::widgets::tool_usage::ToolUsageWindow::new(
+                    &window,
+                    conv_id,
+                    &conv_title,
+                    connector,
+                    Rc::clone(&bridge),
+                );
+                view.present();
             }
         ));
 

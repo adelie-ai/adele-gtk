@@ -330,3 +330,25 @@ entry:focus {
     background-color: alpha(#1f6f97, 0.12);
     border-color: alpha(#1f6f97, 0.38);
 }
+
+/* Tool-usage cost view (#144), darkened for the light theme. */
+.tool-usage-totals {
+    color: #178a6e;
+}
+
+.tool-usage-group {
+    color: #1f6f97;
+}
+
+.tool-usage-figure {
+    color: #5b6473;
+}
+
+.tool-usage-bar > trough > progress {
+    background-color: #178a6e;
+    border-color: #178a6e;
+}
+
+.tool-usage-note {
+    color: #5b6473;
+}

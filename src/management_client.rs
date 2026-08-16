@@ -123,6 +123,25 @@ pub async fn list_available_models(
     }
 }
 
+/// Per-tool cost for one conversation (desktop-assistant#599): what each tool
+/// was called for, how often, and what its results still occupy. Read-only and
+/// derived, so it is safe to call at any time and works on old conversations.
+pub async fn get_tool_usage(
+    transport: &TransportClient,
+    conversation_id: String,
+) -> Result<Vec<api::ToolUsageView>> {
+    let result = commands(transport)?
+        .send_command(api::Command::GetToolUsage { conversation_id })
+        .await?;
+    match result {
+        api::CommandResult::ToolUsage(rows) => Ok(rows),
+        other => Err(anyhow!(
+            "unexpected response for GetToolUsage: {}",
+            variant_name(&other)
+        )),
+    }
+}
+
 pub async fn get_purposes(transport: &TransportClient) -> Result<api::PurposesView> {
     let result = commands(transport)?
         .send_command(api::Command::GetPurposes)

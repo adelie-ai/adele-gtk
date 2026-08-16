@@ -12,6 +12,13 @@ Connects to the `desktop-assistant-daemon` over WebSocket or D-Bus.
 - **Per-conversation model picker** in the chat header, plus a Select Models
   dialog for filtering the dropdown.
 - **Knowledge base browser/editor** from the hamburger menu.
+- **Tool-usage cost view** from the hamburger menu, scoped to the open
+  conversation: per-tool call counts and resident token cost, ranked by
+  either axis. Tools group under the server that provides them, with
+  per-server subtotals. Where the daemon reports no server the group falls
+  back to the `server__tool` prefix on the names and says it was read from
+  them; where there is no prefix either, the group says the server is not
+  recorded rather than inventing a name for it.
 - **Process manager view** as a sidebar `GtkStack` page with a status dot per
   task and toolbar buttons for Cancel / Open Conversation. Currently polls
   every 5s — streaming via `SignalEvent::Task*` is tracked in

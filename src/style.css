@@ -449,3 +449,45 @@ entry:focus {
     background-color: alpha(#88d6f0, 0.14);
     border-color: alpha(#88d6f0, 0.40);
 }
+
+/* Per-conversation tool-usage cost view (#144). The header totals take the
+   brand teal and the group headings the header blue, so the two reading
+   levels - whole conversation, then one server - separate at a glance. */
+.tool-usage-totals {
+    color: #84dac1;
+    font-weight: bold;
+}
+
+.tool-usage-group {
+    color: #88d6f0;
+    font-weight: bold;
+}
+
+.tool-usage-name {
+    font-weight: bold;
+}
+
+/* Figures sit beside the bar, so they share its dimmer weight; monospace keeps
+   the columns aligned as the view re-sorts. */
+.tool-usage-figure {
+    color: #8f99ae;
+    font-family: monospace;
+    font-size: 12px;
+}
+
+/* The bar is a proportion of the heaviest tool on the sorted axis, not a
+   progress reading, so it takes the brand teal rather than the accent blue. */
+.tool-usage-bar > trough > progress {
+    background-color: #84dac1;
+    border-color: #84dac1;
+}
+
+/* Results the model now reads as a pointer. Deliberately NOT the advisory
+   amber: for a conversation doing long agentic work this is the normal shape,
+   and colouring it as a warning would tell the reader something is wrong when
+   nothing is. It is a note, so it reads as one. */
+.tool-usage-note {
+    color: #8f99ae;
+    font-size: 12px;
+    font-style: italic;
+}
