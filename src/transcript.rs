@@ -64,10 +64,14 @@ pub enum TurnIdAction {
 /// The turn-id action for the transcript entry at `index`.
 ///
 /// A turn starts at its user message; the reply and any client-local line that
-/// follows belong to the same turn, so a right-click anywhere in the turn
-/// resolves to the same id. The walk back stops at the nearest user message: an
-/// older turn's id is not this turn's id, and offering it would copy an id that
-/// points at the wrong turn - a worse failure than offering none.
+/// follows belong to the same turn, so a right-click on any entry of the turn
+/// resolves to the same id. A reply still streaming is not an entry yet - it is
+/// appended to the page directly and joins the transcript when it completes -
+/// so it resolves to no entry and the menu reports no id until then.
+///
+/// The walk back stops at the nearest user message: an older turn's id is not
+/// this turn's id, and offering it would copy an id that points at the wrong
+/// turn - a worse failure than offering none.
 pub fn turn_id_action(entries: &[TranscriptEntry], index: usize) -> TurnIdAction {
     let Some(window) = entries.get(..=index) else {
         return TurnIdAction::Unavailable;

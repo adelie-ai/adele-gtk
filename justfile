@@ -34,7 +34,7 @@ uninstall-desktop:
 
 # Full local gate, default features: formatting, lints, build, tests, and the
 # no-opentelemetry check (epic mcp-core#38 AC2) — on the pinned toolchain.
-check: fmt-check lint build test no-opentelemetry-check
+check: fmt-check lint build test fallback-check no-opentelemetry-check
 
 # The same gate with the `otel` feature on (epic mcp-core#38, ticket #152):
 # proves the OTLP-export build and its tests, not a live export. Verify a
@@ -68,6 +68,17 @@ build:
 # Build with the `otel` feature on
 build-otel:
     cargo build --features otel
+
+# The WebKit-free chat pane (`--no-default-features`) is a second render path,
+# not a smaller build of the first: it draws the transcript into a `TextView`
+# and resolves a right-click against recorded buffer offsets rather than the
+# DOM. Nothing else in the gate compiles it - `mcp_base_features` keeps `linux`
+# on even for `just mcp-args none` - so a `#[cfg(not(feature = "linux"))]` block
+# could rot unnoticed. Lint and test it, not just build it: the tests for that
+# path are behind the same cfg.
+fallback-check:
+    cargo clippy -p adele-gtk --all-targets --no-default-features -- -D warnings
+    cargo test --no-default-features
 
 # Run the test suite (excludes #[ignore] integration tests)
 test:

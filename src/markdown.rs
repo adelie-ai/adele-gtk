@@ -145,20 +145,35 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_id_never_reaches_the_page() {
-        // The page is shared with assistant and tool output. It gets the
-        // index; the id stays on the host side.
-        let messages = vec![TranscriptEntry::new(
-            "user",
-            "hi",
-            MessageKind::Normal,
-            Some("turn-01234567".to_string()),
-        )];
-        let html = render_messages_html(&messages, None, &test_avatars());
-        assert!(
-            !html.contains("turn-01234567"),
-            "the turn id must not be rendered into the page: {html}"
-        );
+    fn no_turn_id_reaches_the_page_from_any_entry() {
+        // The page is shared with assistant and tool output. Every entry gets
+        // its index; no entry's id leaves the host side, whatever its role or
+        // presentation kind, and whether or not a reply is streaming.
+        let ids = ["turn-01234567", "turn-89abcdef", "turn-fedcba98"];
+        let messages = vec![
+            TranscriptEntry::new("user", "hi", MessageKind::Normal, Some(ids[0].to_string())),
+            TranscriptEntry::new(
+                "assistant",
+                "hello",
+                MessageKind::Normal,
+                Some(ids[1].to_string()),
+            ),
+            TranscriptEntry::new(
+                "assistant",
+                "spoken aside",
+                MessageKind::Spoken,
+                Some(ids[2].to_string()),
+            ),
+        ];
+        for streaming in [None, Some("partial")] {
+            let html = render_messages_html(&messages, streaming, &test_avatars());
+            for id in ids {
+                assert!(
+                    !html.contains(id),
+                    "the turn id {id} must not be rendered into the page: {html}"
+                );
+            }
+        }
     }
 
     #[test]

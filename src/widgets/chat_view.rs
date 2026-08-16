@@ -312,17 +312,20 @@ pub fn install_turn_context_menu(chat: &Rc<RefCell<ChatView>>) {
         gesture.set_button(3);
         // Capture, so the press is seen before the WebView acts on it.
         gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        // Weak on both sides. The controller lives on the WebView, and the
+        // WebView is owned by the `ChatView` this closure reads, so a strong
+        // capture of either would close a cycle that outlives the window and
+        // keep a closed window's transcript alive.
         gesture.connect_pressed(glib::clone!(
-            #[strong]
+            #[weak]
             chat,
-            #[strong]
+            #[weak]
             webview,
             move |gesture, _n_press, x, y| {
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
                 let Some(widget) = gesture.widget() else {
                     return;
                 };
-                let chat = chat.clone();
                 crate::webview::query_transcript_click(&webview, x, y, move |click| {
                     let action = click
                         .entry_index
@@ -341,10 +344,12 @@ pub fn install_turn_context_menu(chat: &Rc<RefCell<ChatView>>) {
         let gesture = GestureClick::new();
         gesture.set_button(3);
         gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        // Weak for the same reason as the WebView path above: the controller
+        // sits on a widget the `ChatView` owns.
         gesture.connect_pressed(glib::clone!(
-            #[strong]
+            #[weak]
             chat,
-            #[strong]
+            #[weak]
             text_view,
             move |gesture, _n_press, x, y| {
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
